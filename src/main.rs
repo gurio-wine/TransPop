@@ -20,13 +20,14 @@ use windows_sys::Win32::{
     Graphics::Gdi::{
         BeginPaint, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
         EndPaint, GetStockObject, InvalidateRect, RoundRect, SelectObject, SetBkMode,
+        UpdateWindow,
         SetTextColor, SetWindowRgn, PAINTSTRUCT, DEFAULT_GUI_FONT, TRANSPARENT,
         DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
     },
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetMessageW, GetSystemMetrics, PostQuitMessage, UpdateWindow,
+        GetMessageW, GetSystemMetrics, PostQuitMessage,
         RegisterClassW, SetLayeredWindowAttributes, SetProcessDPIAware, SetTimer,
         SetWindowPos, ShowWindow, TranslateMessage, WNDCLASSW, MSG,
         HWND_TOPMOST, LWA_ALPHA, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,

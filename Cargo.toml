@@ -1,6 +1,6 @@
 [package]
 name = "transpop"
-version = "0.6.4"
+version = "0.6.5"
 edition = "2024"
 description = "Minimal Microsoft Pinyin candidate preview bubble for Windows 10/11"
 license = "MIT"
