@@ -1,12 +1,12 @@
 [package]
 name = "transpop"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 description = "Minimal Microsoft Pinyin candidate preview bubble for Windows 10/11"
 license = "MIT"
 
 [dependencies]
-uiautomation = { version = "=0.25.1", default-features = false }
+uiautomation = { version = "=0.25.1", default-features = false, features = ["input"] }
 windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
