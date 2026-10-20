@@ -33,7 +33,7 @@ public sealed class CandidateScanner
         var windowsInspected = 0;
         try
         {
-            var windows = AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition);
+            var windows = AutomationElement.RootElement.FindAll(TreeScope.Children, System.Windows.Automation.Condition.TrueCondition);
             windowsFound = windows.Count;
 
             foreach (AutomationElement window in windows)
@@ -115,7 +115,7 @@ public sealed class CandidateScanner
         }
 
         // 某些提供程序把候选直接挂在 Pane 节点上。
-        var immediate = list.FindAll(TreeScope.Children, Condition.TrueCondition);
+        var immediate = list.FindAll(TreeScope.Children, System.Windows.Automation.Condition.TrueCondition);
         foreach (AutomationElement item in immediate)
         {
             try
