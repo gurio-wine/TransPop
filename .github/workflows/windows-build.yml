@@ -1,0 +1,40 @@
+name: Build Windows prototype
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish portable Windows application
+        shell: pwsh
+        run: |
+          dotnet publish ./PinyinCandidateProbe/PinyinCandidateProbe.csproj `
+            --configuration Release --runtime win-x64 --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:DebugType=None `
+            --output ./publish
+          if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed' }
+          Compress-Archive -Path ./publish/* -DestinationPath ./PinyinCandidateProbe-win-x64.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PinyinCandidateProbe-win-x64
+          path: PinyinCandidateProbe-win-x64.zip
+          if-no-files-found: error

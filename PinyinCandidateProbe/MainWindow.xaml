@@ -1,0 +1,58 @@
+<Window x:Class="PinyinCandidateProbe.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="微软拼音候选侦测 · 第一阶段" Width="550" Height="510"
+        MinWidth="500" MinHeight="470" WindowStartupLocation="CenterScreen"
+        Background="#F7F9FC" FontFamily="Microsoft YaHei UI">
+    <Grid Margin="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0">
+            <TextBlock Text="微软拼音候选侦测" FontSize="22" FontWeight="SemiBold" Foreground="#17253F"/>
+            <TextBlock Margin="0,8,0,0" Foreground="#64748B" TextWrapping="Wrap"
+                       Text="仅观察微软拼音候选、显示独立浮窗。不会写入文本框，不联网，不修改系统输入法。"/>
+        </StackPanel>
+
+        <Border Grid.Row="1" Margin="0,20,0,0" Padding="16" CornerRadius="12"
+                Background="White" BorderBrush="#E5EAF0" BorderThickness="1">
+            <StackPanel>
+                <TextBlock Text="当前状态" FontSize="12" Foreground="#6B7280"/>
+                <TextBlock x:Name="StatusText" Margin="0,6,0,0" Text="准备扫描…" FontSize="15"
+                           FontWeight="SemiBold" Foreground="#17253F" TextWrapping="Wrap"/>
+                <TextBlock x:Name="CandidateText" Margin="0,8,0,0" Foreground="#2563EB"
+                           FontSize="16" Text="第一候选：尚未检测到" TextWrapping="Wrap"/>
+                <TextBlock x:Name="LastSeenText" Margin="0,6,0,0" Foreground="#047857" FontSize="11" Text="最近检测记录：无" TextWrapping="Wrap"/>
+                <TextBlock x:Name="BoundsText" Margin="0,6,0,0" Foreground="#64748B"
+                           FontSize="11" Text="位置：—"/>
+            </StackPanel>
+        </Border>
+
+        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,16,0,0">
+            <Button x:Name="DeepScanButton" Width="140" Height="34" Click="DeepScanButton_Click"
+                    Background="#2563EB" Foreground="White" BorderThickness="0" Cursor="Hand"
+                    Content="延时深度扫描"/>
+            <TextBlock Margin="12,7,0,0" Foreground="#64748B" FontSize="12"
+                       Text="点击后 4 秒内切回记事本并输入拼音"/>
+        </StackPanel>
+
+        <Border Grid.Row="3" Margin="0,18,0,0" Background="White" CornerRadius="12"
+                BorderBrush="#E5EAF0" BorderThickness="1" Padding="16">
+            <StackPanel>
+                <TextBlock Text="测试方法" FontSize="14" FontWeight="SemiBold"/>
+                <TextBlock Margin="0,10,0,0" TextWrapping="Wrap" Foreground="#475569"
+                           Text="① 切换到「中文（简体）· 微软拼音」。&#10;② 打开记事本，输入 nihao，不要按空格。&#10;③ 若候选窗口对 UI Automation 可见，蓝色浮窗会出现在候选栏下方。&#10;④ 若无结果，保持候选栏打开，点击「延时深度扫描」，再切回记事本。"/>
+                <TextBlock Margin="0,12,0,0" FontSize="11" Foreground="#9A3412" TextWrapping="Wrap"
+                           Text="注意：某些 Win11 版本的微软拼音可能不公开候选文本；这是原型要验证的系统限制，并非必须安装新的输入法。"/>
+            </StackPanel>
+        </Border>
+
+        <TextBlock Grid.Row="4" Margin="0,14,0,0" Foreground="#94A3B8" FontSize="11"
+                   Text="第一阶段 · UI Automation 实验版 · 关闭此窗口即可退出程序"/>
+    </Grid>
+</Window>
