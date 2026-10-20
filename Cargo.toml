@@ -6,7 +6,7 @@ description = "Minimal Microsoft Pinyin candidate preview bubble for Windows 10/
 license = "MIT"
 
 [dependencies]
-uiautomation = { version = "=0.25.1", default-features = false, features = ["input"] }
+uiautomation = { version = "=0.25.1", default-features = false, features = ["input", "control"] }
 windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
