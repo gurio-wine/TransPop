@@ -18,16 +18,15 @@ use uiautomation::core::UIAutomation;
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
     Graphics::Gdi::{
-        BeginPaint, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, EndPaint,
-        GetStockObject, RoundRect, SelectObject, SetBkMode, SetTextColor, PAINTSTRUCT,
-        DrawTextW, InvalidateRect, SetWindowRgn,
+        BeginPaint, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
+        EndPaint, GetStockObject, InvalidateRect, RoundRect, SelectObject, SetBkMode,
+        SetTextColor, SetWindowRgn, PAINTSTRUCT, DEFAULT_GUI_FONT, TRANSPARENT,
         DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-        DEFAULT_GUI_FONT, TRANSPARENT,
     },
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetMessageW, GetSystemMetrics, PostQuitMessage,
+        GetMessageW, GetSystemMetrics, PostQuitMessage, UpdateWindow,
         RegisterClassW, SetLayeredWindowAttributes, SetProcessDPIAware, SetTimer,
         SetWindowPos, ShowWindow, TranslateMessage, WNDCLASSW, MSG,
         HWND_TOPMOST, LWA_ALPHA, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
@@ -45,6 +44,7 @@ const TICK_MS: u32 = 150;
 
 static RECEIVER: OnceLock<Mutex<mpsc::Receiver<ScanReport>>> = OnceLock::new();
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+static STARTED: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Default)]
 struct State {
@@ -94,7 +94,7 @@ fn spawn_scanner(sender: mpsc::Sender<ScanReport>) {
                 return;
             }
         };
-        log_status("TransPop Rust v0.6: UIA initialized, HWND top+child enumeration enabled");
+        log_status("UIA initialized; scanning top and child HWNDs");
         let mut last_log = Instant::now() - Duration::from_secs(10);
         loop {
             let start = Instant::now();
@@ -129,20 +129,26 @@ unsafe fn update(hwnd: HWND) {
     if let Ok(rx) = receiver.lock() {
         while let Ok(report) = rx.try_recv() { latest = Some(report); }
     }
-    let Some(report) = latest else { return; };
     let Some(global) = STATE.get() else { return; };
     let Ok(mut state) = global.lock() else { return; };
     let previous_text = state.text.clone();
-    let new_status = fmt_status(&report);
     let previous_status = state.status.clone();
-    state.status = new_status;
-    state.candidate = report.candidate;
-    let showing = state.candidate.is_some() || state.debug;
-    state.text = match &state.candidate {
-        Some(candidate) => candidate.text.clone(),
-        None => "等待微软拼音候选…".to_string(),
-    };
+    if let Some(report) = latest {
+        state.status = fmt_status(&report);
+        state.candidate = report.candidate;
+        state.text = match &state.candidate {
+            Some(candidate) => candidate.text.clone(),
+            None => "等待微软拼音候选…".to_string(),
+        };
+    } else if state.debug {
+        // The UI must remain responsive even if a cross-process UIA query hangs.
+        let seconds = STARTED.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        if seconds >= 3 && state.candidate.is_none() {
+            state.status = format!("尚无扫描结果 · {} 秒 · 请检查日志", seconds);
+        }
+    }
 
+    let showing = state.candidate.is_some() || state.debug;
     if showing {
         let (mut x, mut y) = match &state.candidate {
             Some(c) => (c.x, c.bottom + 9),
@@ -219,17 +225,26 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         WM_ERASEBKGND => 1,
         WM_NCHITTEST => -1, // HTTRANSPARENT: don't steal mouse input from the IME.
         WM_CLOSE => { unsafe { DestroyWindow(hwnd) }; 0 }
-        WM_DESTROY => { unsafe { PostQuitMessage(0) }; 0 }
+        WM_DESTROY => { log_status("window: WM_DESTROY received"); unsafe { PostQuitMessage(0) }; 0 }
         _ => unsafe { DefWindowProcW(hwnd, msg, w, l) },
     }
 }
 
 fn main() {
     let debug = std::env::args().any(|arg| arg == "--debug");
-    STATE.set(Mutex::new(State { debug, status: "正在扫描窗口…".into(), ..State::default() })).ok();
+    STARTED.set(Instant::now()).ok();
+    STATE.set(Mutex::new(State {
+        debug,
+        text: "等待微软拼音候选…".into(),
+        status: "正在扫描输入法窗口…".into(),
+        ..State::default()
+    })).ok();
     let (sender, receiver) = mpsc::channel();
     RECEIVER.set(Mutex::new(receiver)).ok();
-    log_status("---- TransPop startup (no keyboard hooks, no typing, no network) ----");
+    std::panic::set_hook(Box::new(|info| {
+        log_status(&format!("PANIC: {info}"));
+    }));
+    log_status(&format!("---- TransPop v0.6.4 start | debug={} ----", debug));
 
     unsafe {
         // Match the physical coordinates returned by UIA even at non-100% display scaling.
@@ -260,11 +275,24 @@ fn main() {
         SetLayeredWindowAttributes(window, 0, 248, LWA_ALPHA);
         let region = CreateRoundRectRgn(0, 0, WIDTH, HEIGHT, 25, 25);
         if !region.is_null() { SetWindowRgn(window, region, 1); }
-        SetTimer(window, TICK_ID, TICK_MS, None);
-        if debug { ShowWindow(window, SW_SHOWNOACTIVATE); }
+        if SetTimer(window, TICK_ID, TICK_MS, None) == 0 {
+            log_status("ERROR: SetTimer failed; no UI status updates are possible");
+        }
+        if debug {
+            SetWindowPos(window, HWND_TOPMOST, 24, 24, WIDTH, HEIGHT,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            ShowWindow(window, SW_SHOWNOACTIVATE);
+            UpdateWindow(window); // Render the initial message *before* the first UIA query.
+            log_status("debug bubble displayed at (24,24)");
+        }
         spawn_scanner(sender);
         let mut msg: MSG = mem::zeroed();
-        while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
+        loop {
+            let result = GetMessageW(&mut msg, ptr::null_mut(), 0, 0);
+            if result <= 0 {
+                log_status(&format!("message loop stopped; GetMessageW={result}"));
+                break;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
