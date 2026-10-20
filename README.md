@@ -1,58 +1,32 @@
-# TransPop · 翻译气泡
+# TransPop（翻译气泡）v0.3｜Windows 10/11 输入法窗口诊断
 
-Windows 10 / Windows 11 微软拼音候选检测原型（v0.2，尚未接入翻译）。
+本次针对 Windows 10 Build 19045 实测线索修复检测方法：`WindowFromPoint` 返回了 `TextInputHost` 的 `Windows.UI.Core.CoreWindow`，但 `AutomationElement.FromPoint` 返回背后的记事本。这说明两者命中的是不同层级，**并不能证明候选已经可以被读取**。
 
-> 当前目的只有一个：检测微软拼音是否向独立桌面程序暴露候选框、第一候选的文字和坐标。**不修改输入法，不上屏，不录屏，不联网，不申请管理员权限。**
->
-> 代码尚未在 Windows 10/11 真机验证；是否能读到候选取决于微软拼音版本及其无障碍接口。
+v0.3 新增对鼠标下原生 HWND 的 `AutomationElement.FromHandle` **定向读取**，以及有限层级的 Raw View 子元素遍历、窗口矩形与原生子窗口枚举。这些额外诊断仅查询窗口，不修改任何输入法、也不捕获/发送按键、不截图、不联网。
 
-## 使用说明
+## 运行方式
 
-### 方式 A：GitHub Actions
+GitHub Actions：把压缩包内文件放到仓库根目录，进入 **Actions → Build TransPop Windows diagnostic → Run workflow**，在成功的工作流运行页面下载 `TransPop-win-x64` 工件，解压运行 `TransPop.exe`。
 
-1. 新建 GitHub 仓库（例如 `TransPop`），将本压缩包**内部**全部文件上传到仓库根目录；不要再额外套一层目录。
-2. 进入 Actions → **Build TransPop Windows diagnostic** → Run workflow。
-3. 构建成功后下载 `TransPop-win-x64` artifact，解压 ZIP，运行 `TransPop.exe`。
+本机：安装 .NET 10 SDK，运行 `dotnet run --project ./TransPop/TransPop.csproj`。
 
-构建命令已在 `.github/workflows/windows-build.yml` 中配置。产物是自包含便携 Windows x64 程序，无须安装 .NET Runtime。GitHub Windows 运行器没有在这次制作环境中实际运行过，故不保证首次 CI 成功。
+## 复现 Windows 10/11 的候选读取
 
-### 方式 B：Windows 本地开发
+1. 开启微软拼音，在记事本输入 `nihao`（不要按空格或回车）。
+2. 在 TransPop 里点击“5 秒后鼠标定位检测”，切回记事本并重新打开候选框。
+3. 把鼠标指针移到**可见的第一条候选词**上，并保持候选列表可见，直到倒计时结束。
+4. 返回 TransPop，复制诊断详情，尤其是 `1) UI Automation FromPoint` 与 `2) UI Automation FromHandle` 两段；分享前请检查其中是否有隐私文本。
 
-安装 [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)，在项目根目录运行：
+### 怎么解读
 
-```powershell
-dotnet run --project .\TransPop\TransPop.csproj
-```
+- **FromHandle 里有 `IME_Candidate_Window` / 汉字**：有希望直接以 UIA 获取第一候选，下一步做稳定监听和气泡定位。
+- **FromHandle 仅有无名 `Pane` / `Window`**：该版本宿主窗口可能没有暴露可用的候选内容；下一步验证 Windows Accessibility/MSAA 或尝试显式启用的候选框局部 OCR。不能凭这条报告断言所有 Windows 10/11 都不支持。
+- **FromPoint 是记事本，FromHandle 是 TextInputHost**：证实两个 API 的命中结果不同。原版基于 FromPoint/顶层窗口的逻辑需要改造。
 
-## 怎么测试（优先用鼠标定位）
+## 状态与兼容性
 
-1. 确认在用 **微软拼音**，打开**记事本**。
-2. 启动 `TransPop.exe`，单击 **5 秒后鼠标定位检测**。
-3. 在 5 秒内切回记事本并输入 `nihao`，**先不要按空格或回车**。
-4. **把鼠标移动到候选窗口里的第 1 个汉字候选词上方**，保持候选框展开直到倒计时结束。只移动鼠标，不要点击候选词。
-5. 返回 TransPop，查看诊断信息。
+- 保持 Windows 10 / Windows 11 共用代码路径；不依赖 Windows 11 独占 API。
+- 尚未在此环境的 Windows/.NET 工具链下编译测试；最终效果取决于实际微软拼音版本。
+- 不修改候选列表、不自动上屏；Bing 和自定义 AI 还未接入。
 
-如果自动扫描没有显示气泡，**不能推断 Windows 10 不兼容**。本版新增的鼠标定位诊断会同时采集：
-
-- 鼠标下 Win32 窗口的 `HWND`、类名与进程名。
-- 鼠标下 UI Automation 元素的 `AutomationId`、`ControlType`、`Name` 与外接矩形。
-- 元素的向上父级路径和部分子控件层级。
-
-如果鼠标下能读到汉字但没有 `IME_Candidate_Window`，说明我们之前基于固定 ID 的检测存在漏报，**不意味着系统不给读**。如果连 UIA `Name` 都读不到，也可能需要改用 Win32/MSAA（或者用户主动触发 OCR）路径；这尚未实现。
-
-按钮 **延时深度扫描**仍然存在，但在某些 Windows 10 / 11 输入法候选实现中它可能漏报，优先用**鼠标定位诊断**。
-
-## 分享诊断结果时要注意隐私
-
-报告可能包含光标下控件的文字、汉字候选，以及 Windows 用户的界面信息。点击“复制诊断”之后，**请先删除私人文本、用户名及应用内容**再分享。程序不会上传任何内容。
-
-## 不在本原型范围内
-
-- Bing / Azure Translator、OpenAI 兼容接口（下一阶段）。
-- 输入法候选列表注入、复制候选到编辑框、自动上屏。
-- 捕获按键、读取剪贴板、全屏 OCR。
-
-技术参考：
-
-- [Microsoft IME accessibility conventions](https://learn.microsoft.com/en-us/windows/apps/develop/input/input-method-editor-requirements)
-- [UI Automation AutomationElement.FromPoint](https://learn.microsoft.com/en-us/dotnet/api/system.windows.automation.automationelement.frompoint)
+参考：https://learn.microsoft.com/en-us/dotnet/api/system.windows.automation.automationelement.fromhandle 以及 https://learn.microsoft.com/en-us/windows/apps/develop/input/input-method-editor-requirements

@@ -31,7 +31,7 @@
                 </Border>
                 <StackPanel>
                     <TextBlock Text="TransPop" FontSize="23" FontWeight="Bold" Foreground="#1E293B" />
-                    <TextBlock Text="翻译气泡 · Windows 10 / 11 候选检测版" FontSize="12" Foreground="#64748B" />
+                    <TextBlock Text="翻译气泡 · Windows 10 / 11 HWND 定向诊断 v0.3" FontSize="12" Foreground="#64748B" />
                 </StackPanel>
             </StackPanel>
             <TextBlock Margin="0,13,0,0" Foreground="#475569" TextWrapping="Wrap"
@@ -57,13 +57,13 @@
             <WrapPanel>
                 <Button x:Name="PointerScanButton" Width="178" Click="PointerScanButton_Click"
                         Background="#2563EB" Foreground="White"
-                        Content="5 秒后鼠标定位检测" />
+                        Content="5 秒后 HWND 定向检测" />
                 <Button x:Name="DeepScanButton" Width="125" Click="DeepScanButton_Click"
                         Content="延时深度扫描" />
                 <Button Width="100" Click="CopyReportButton_Click" Content="复制诊断" />
             </WrapPanel>
             <TextBlock Margin="0,10,0,0" TextWrapping="Wrap" FontSize="12" Foreground="#475569"
-                       Text="推荐：点击「5 秒后鼠标定位检测」，切回记事本输入 nihao（先不要上屏），把鼠标指针移到第一个中文候选词上，保持候选框展开。" />
+                       Text="推荐：点击「5 秒后 HWND 定向检测」，切回记事本输入 nihao（先不要上屏），把鼠标指针移到第一个中文候选词上，保持候选框展开。" />
         </StackPanel>
 
         <Border Grid.Row="3" Margin="0,15,0,0" Padding="12" CornerRadius="14"
@@ -74,7 +74,7 @@
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
                 </Grid.RowDefinitions>
-                <TextBlock Grid.Row="0" FontWeight="SemiBold" Text="鼠标定位诊断结果" Foreground="#23334F" />
+                <TextBlock Grid.Row="0" FontWeight="SemiBold" Text="候选窗口诊断结果" Foreground="#23334F" />
                 <TextBlock Grid.Row="1" x:Name="PointerSummaryText" Margin="0,8,0,6"
                            Foreground="#64748B" Text="尚未进行鼠标定位检测" TextWrapping="Wrap" />
                 <TextBox Grid.Row="2" x:Name="ReportBox" Text="暂无诊断信息"

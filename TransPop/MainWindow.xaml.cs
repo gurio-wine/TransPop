@@ -58,7 +58,7 @@ public partial class MainWindow : Window
                 if (_isClosing) return;
                 PointerSummaryText.Text = report.Summary;
                 ReportBox.Text = report.Details;
-                StatusText.Text = "已完成鼠标定位诊断；请检查下方窗口类名和 UIA 节点。";
+                StatusText.Text = "已完成 HWND 定向诊断；对比 FromPoint 和 FromHandle 的节点。";
             }
             else
             {
