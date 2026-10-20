@@ -4,26 +4,27 @@
         WindowStyle="None" ResizeMode="NoResize" ShowInTaskbar="False"
         ShowActivated="False" Focusable="False" Topmost="True"
         AllowsTransparency="True" Background="Transparent"
-        Width="330" Height="92" FontFamily="Microsoft YaHei UI">
+        Width="308" Height="93" FontFamily="Microsoft YaHei UI">
     <Grid>
         <Grid.RowDefinitions>
-            <RowDefinition Height="8" />
-            <RowDefinition Height="*" />
+            <RowDefinition Height="9"/>
+            <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
-        <Path Grid.Row="0" Data="M 0,8 L 8,0 L 16,8 Z" Fill="White"
-              HorizontalAlignment="Left" Margin="22,0,0,0" />
-        <Border Grid.Row="1" Background="White" BorderBrush="#C7DBFF" BorderThickness="1"
-                CornerRadius="17" Padding="15,10">
+        <Path Grid.Row="0" Data="M 0,9 L 9,0 L 18,9 Z" Fill="White"
+              HorizontalAlignment="Left" Margin="25,0,0,0" />
+        <Border Grid.Row="1" Background="White" BorderBrush="#C9DCFA" BorderThickness="1"
+                CornerRadius="19" Padding="15,11">
             <Border.Effect>
-                <DropShadowEffect Color="#28466C" BlurRadius="18" Opacity="0.18" ShadowDepth="3" />
+                <DropShadowEffect Color="#21406E" BlurRadius="20" Opacity="0.16" ShadowDepth="3" />
             </Border.Effect>
             <StackPanel>
                 <StackPanel Orientation="Horizontal">
-                    <TextBlock Text="● " Foreground="#4384EA" FontSize="11" />
-                    <TextBlock Text="TransPop · 候选预览" FontWeight="SemiBold" Foreground="#64748B" FontSize="11" />
+                    <Ellipse Width="7" Height="7" Fill="#4C8DF6" Margin="0,0,8,0" VerticalAlignment="Center" />
+                    <TextBlock Text="TransPop · 首选候选" Foreground="#64748B" FontSize="11" FontWeight="SemiBold" />
+                    <TextBlock Text="  · 读取测试" Foreground="#94A3B8" FontSize="10" />
                 </StackPanel>
-                <TextBlock x:Name="CandidateLabel" Margin="0,7,0,0" Foreground="#153C73"
-                           FontSize="17" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                <TextBlock x:Name="CandidateLabel" Margin="0,9,0,0" Foreground="#154179"
+                           FontSize="18" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
             </StackPanel>
         </Border>
     </Grid>

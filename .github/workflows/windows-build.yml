@@ -1,4 +1,4 @@
-name: Build TransPop Windows diagnostic
+name: Build TransPop Windows auto-candidate
 
 on:
   push:

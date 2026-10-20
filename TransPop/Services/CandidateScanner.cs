@@ -1,195 +1,231 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
-using System.Text.RegularExpressions;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Automation;
 
 namespace TransPop.Services;
 
-public sealed record CandidateHit(string FirstCandidate, Rect Bounds, string Source);
-public sealed record ScanResult(CandidateHit? Hit, int WindowCount, int Inspected, string Note);
+public sealed record CandidateHit(string FirstCandidate, Rect Anchor, string Source);
+public sealed record ScanResult(CandidateHit? Hit, int Hosts, int Windows, int Inspected, int Panes, string Note);
 
 /// <summary>
-/// 只找系统通过 UI Automation 公布的 IME 候选列表，不读取普通编辑框、不模拟输入。
-/// 在 ThreadPool 的 MTA 线程执行，避免 UI Automation 阻塞 WPF 界面。
+/// Mouse-free, read-only Microsoft Pinyin probe. Find HWNDs owned by the
+/// Windows text input processes, then examine ONLY their UIA subtrees.
+/// This deliberately never reads the user's editor, clipboard or keystrokes.
+/// Run Scan on a thread-pool (MTA) worker, not the WPF dispatcher thread.
 /// </summary>
 public sealed class CandidateScanner
 {
-    private const string CandidateAutomationId = "IME_Candidate_Window";
-    private static readonly PropertyCondition CandidateCondition = new(
-        AutomationElement.AutomationIdProperty, CandidateAutomationId);
-
-    // 仅扫描疑似输入法窗口；当 UIA 自动识别不到时，用户可手动触发全量扫描。
-    private static readonly string[] ImeHints =
-    [
-        "ime", "candidate", "textinput", "inputmethod", "msctf",
-        "拼音", "候选", "chinese", "chsime", "inputapp", "popuphost"
-    ];
-
-    public ScanResult Scan(bool thorough)
+    private static readonly string[] HostProcesses = ["TextInputHost", "InputApp", "ctfmon"];
+    public ScanResult Scan()
     {
-        var windowsFound = 0;
-        var windowsInspected = 0;
-        try
+        HashSet<uint> pids = FindHostProcesses();
+        if (pids.Count == 0)
+            return new(null, 0, 0, 0, 0, "没有找到微软输入法宿主进程（TextInputHost/InputApp）");
+
+        List<IntPtr> hwnds = FindWindowsOwnedBy(pids);
+        int inspected = 0;
+        int panes = 0;
+        foreach (IntPtr hwnd in hwnds)
         {
-            var windows = AutomationElement.RootElement.FindAll(TreeScope.Children, System.Windows.Automation.Condition.TrueCondition);
-            windowsFound = windows.Count;
+            if (!IsWindowVisible(hwnd) || !GetWindowRect(hwnd, out NativeRect r) ||
+                r.Right <= r.Left || r.Bottom <= r.Top)
+                continue;
 
-            foreach (AutomationElement window in windows)
-            {
-                if (!IsVisible(window) || IsOwnWindow(window))
-                    continue;
-
-                if (!thorough && !LooksLikeIme(window))
-                    continue;
-
-                windowsInspected++;
-                if (TryGetHit(window, out var hit))
-                    return new ScanResult(hit, windowsFound, windowsInspected, "检测到候选列表");
-            }
-
-            return new ScanResult(null, windowsFound, windowsInspected,
-                thorough
-                    ? "深度扫描结束：没有找到可读取的 IME_Candidate_Window"
-                    : "等待候选窗口；必要时点击「手动深度扫描」");
-        }
-        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException
-                                       or System.Runtime.InteropServices.COMException)
-        {
-            return new ScanResult(null, windowsFound, windowsInspected,
-                $"UI Automation 访问失败：{ex.GetType().Name}");
-        }
-    }
-
-    private static bool TryGetHit(AutomationElement root, out CandidateHit? hit)
-    {
-        hit = null;
-        try
-        {
-            // Root 自己有可能就是候选列表。
-            AutomationElement? list = root.Current.AutomationId == CandidateAutomationId
-                ? root
-                : root.FindFirst(TreeScope.Descendants, CandidateCondition);
-
-            if (list is null || !IsVisible(list))
-                return false;
-
-            var rect = list.Current.BoundingRectangle;
-            if (rect.IsEmpty || rect.Width < 20 || rect.Height < 10)
-                rect = root.Current.BoundingRectangle;
-            if (rect.IsEmpty || rect.Width < 20 || rect.Height < 10)
-                return false;
-
-            string? candidate = ReadFirstChineseCandidate(list);
-            if (string.IsNullOrWhiteSpace(candidate))
-                return false;
-
-            hit = new CandidateHit(candidate, rect, root.Current.ClassName);
-            return true;
-        }
-        catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException
-                                       or System.Runtime.InteropServices.COMException)
-        {
-            return false;
-        }
-    }
-
-    private static string? ReadFirstChineseCandidate(AutomationElement list)
-    {
-        // 优先读取候选项控件；只有未公开候选项时，才回退到普通 Text 控件。
-        foreach (var type in new[] { ControlType.ListItem, ControlType.DataItem, ControlType.Text })
-        {
-            var items = list.FindAll(TreeScope.Descendants,
-                new PropertyCondition(AutomationElement.ControlTypeProperty, type));
-            foreach (AutomationElement item in items)
-            {
-                try
-                {
-                    if (item.Current.IsOffscreen) continue;
-                    var text = NormalizeCandidate(item.Current.Name);
-                    if (ContainsChinese(text) && !IsGenericLabel(text)) return text;
-                }
-                catch (ElementNotAvailableException) { }
-            }
-        }
-
-        // 某些提供程序把候选直接挂在 Pane 节点上。
-        var immediate = list.FindAll(TreeScope.Children, System.Windows.Automation.Condition.TrueCondition);
-        foreach (AutomationElement item in immediate)
-        {
+            inspected++;
             try
             {
-                if (item.Current.IsOffscreen) continue;
-                var text = NormalizeCandidate(item.Current.Name);
-                if (ContainsChinese(text) && !IsGenericLabel(text)) return text;
+                if (TryRead(hwnd, out CandidateHit? hit, out bool paneSeen))
+                {
+                    panes++;
+                    return new(hit, pids.Count, hwnds.Count, inspected, panes, "已识别微软拼音第一候选");
+                }
+                if (paneSeen) panes++;
             }
-            catch (ElementNotAvailableException) { }
+            catch (Exception ex) when (ex is COMException or ElementNotAvailableException or
+                                       InvalidOperationException or UnauthorizedAccessException)
+            {
+                // UIA elements are transient while composing: try again on next tick.
+            }
+        }
+        string note = panes > 0
+            ? "找到了候选容器，但没有可读的中文候选"
+            : inspected > 0
+                ? "已找到输入法宿主窗口，等待候选框出现"
+                : "找到输入法进程，但没有可见的候选窗口";
+        return new(null, pids.Count, hwnds.Count, inspected, panes, note);
+    }
+
+    private static bool TryRead(IntPtr hwnd, out CandidateHit? hit, out bool paneSeen)
+    {
+        hit = null;
+        paneSeen = false;
+        AutomationElement? root = AutomationElement.FromHandle(hwnd);
+        if (root is null) return false;
+
+        // Usually fast: Window 10 19045: root CoreWindow -> IME_Prediction_Window.
+        AutomationElement? pane = IsCandidatePane(root)
+            ? root
+            : root.FindFirst(TreeScope.Descendants, new OrCondition(
+                new PropertyCondition(AutomationElement.AutomationIdProperty, "IME_Prediction_Window"),
+                new PropertyCondition(AutomationElement.AutomationIdProperty, "IME_Candidate_Window")));
+
+        // Important fallback: some UIA providers expose the pane in RAW view only.
+        pane ??= FindPaneInRawTree(root);
+        if (pane is null) return false;
+        paneSeen = true;
+        if (pane.Current.IsOffscreen) return false;
+        Rect paneRect = pane.Current.BoundingRectangle;
+        if (!Valid(paneRect)) return false;
+
+        var itemCondition = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem);
+        AutomationElement? first = pane.FindFirst(TreeScope.Children, itemCondition)
+            ?? pane.FindFirst(TreeScope.Descendants, itemCondition);
+        first ??= FindFirstItemInRawTree(pane);
+        if (first is null || first.Current.IsOffscreen) return false;
+
+        // The first ListItem.Name is '你好' in the real Windows 10 report.
+        string text = first.Current.Name?.Trim() ?? "";
+        if (!HasHan(text))
+        {
+            // Some providers leave the ListItem.Name blank but expose child TextBlock.
+            var child = first.FindFirst(TreeScope.Descendants,
+                new PropertyCondition(AutomationElement.AutomationIdProperty,
+                    "TEMPLATE_PART_CandidateItemText"));
+            text = child?.Current.Name?.Trim() ?? "";
+        }
+        if (!HasHan(text)) return false;
+
+        Rect firstRect = first.Current.BoundingRectangle;
+        double x = Valid(firstRect) ? firstRect.Left : paneRect.Left;
+        // Bubble below entire IME candidate popup, aligned with candidate #1.
+        var anchor = new Rect(x, paneRect.Top, Math.Max(20, paneRect.Right - x), paneRect.Height);
+        hit = new CandidateHit(text, anchor,
+            $"{pane.Current.AutomationId} · HWND 0x{hwnd.ToInt64():X}");
+        return true;
+    }
+
+    private static bool IsCandidatePane(AutomationElement element)
+    {
+        string? id = element.Current.AutomationId;
+        return id is "IME_Prediction_Window" or "IME_Candidate_Window";
+    }
+
+    private static AutomationElement? FindPaneInRawTree(AutomationElement root)
+    {
+        var walker = TreeWalker.RawViewWalker;
+        var queue = new Queue<(AutomationElement Element, int Depth)>();
+        queue.Enqueue((root, 0));
+        int visited = 0;
+        while (queue.Count > 0 && visited++ < 90)
+        {
+            var (element, depth) = queue.Dequeue();
+            if (IsCandidatePane(element)) return element;
+            if (depth >= 4) continue;
+            EnqueueChildren(walker, element, depth, queue);
         }
         return null;
     }
 
-    private static bool IsGenericLabel(string text) =>
-        text is "候选" or "候选词" or "候选窗口" or "拼音" or "微软拼音";
-
-    private static string NormalizeCandidate(string? name)
+    private static AutomationElement? FindFirstItemInRawTree(AutomationElement pane)
     {
-        if (string.IsNullOrWhiteSpace(name)) return "";
-        // 例如 UIA 名称 "1. 你好" -> "你好"。不更改实际输入法候选。
-        return Regex.Replace(name.Trim(), @"^\s*[1-9]\s*[.．、:：)]\s*", "").Trim();
-    }
-
-    private static bool ContainsChinese(string text) =>
-        Regex.IsMatch(text, @"[\u3400-\u9FFF]");
-
-    private static bool IsOwnWindow(AutomationElement element)
-    {
-        try { return element.Current.ProcessId == Environment.ProcessId; }
-        catch { return false; }
-    }
-
-    private static bool IsVisible(AutomationElement element)
-    {
-        try
+        var walker = TreeWalker.RawViewWalker;
+        var queue = new Queue<(AutomationElement Element, int Depth)>();
+        queue.Enqueue((pane, 0));
+        int visited = 0;
+        while (queue.Count > 0 && visited++ < 90)
         {
-            return !element.Current.IsOffscreen &&
-                !element.Current.BoundingRectangle.IsEmpty;
+            var (element, depth) = queue.Dequeue();
+            if (depth > 0 && element.Current.ControlType == ControlType.ListItem) return element;
+            if (depth >= 3) continue;
+            EnqueueChildren(walker, element, depth, queue);
         }
-        catch (ElementNotAvailableException) { return false; }
-        catch (System.Runtime.InteropServices.COMException) { return false; }
+        return null;
     }
 
-    private static bool LooksLikeIme(AutomationElement element)
+    private static void EnqueueChildren(TreeWalker walker, AutomationElement parent, int parentDepth,
+        Queue<(AutomationElement Element, int Depth)> queue)
     {
-        try
+        AutomationElement? child = walker.GetFirstChild(parent);
+        for (int i = 0; child is not null && i < 24; i++)
         {
-            var info = element.Current;
-            if (HasHint(info.AutomationId) || HasHint(info.ClassName) || HasHint(info.Name))
-                return true;
+            queue.Enqueue((child, parentDepth + 1));
+            child = walker.GetNextSibling(child);
+        }
+    }
 
-            if (info.ProcessId > 0)
+    private static HashSet<uint> FindHostProcesses()
+    {
+        var ids = new HashSet<uint>();
+        foreach (string name in HostProcesses)
+        {
+            Process[] processes;
+            try { processes = Process.GetProcessesByName(name); }
+            catch (Exception ex) when (ex is Win32Exception or InvalidOperationException) { continue; }
+            foreach (var process in processes)
             {
-                using var process = Process.GetProcessById(info.ProcessId);
-                return HasHint(process.ProcessName);
+                using (process)
+                {
+                    try { ids.Add(checked((uint)process.Id)); }
+                    catch (InvalidOperationException) { }
+                }
             }
         }
-        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException
-                                       or System.ComponentModel.Win32Exception
-                                       or ElementNotAvailableException
-                                       or System.Runtime.InteropServices.COMException)
+        return ids;
+    }
+
+    private static List<IntPtr> FindWindowsOwnedBy(HashSet<uint> pids)
+    {
+        var found = new List<IntPtr>();
+        var seen = new HashSet<IntPtr>();
+        void AddIfMatch(IntPtr hwnd)
         {
+            _ = GetWindowThreadProcessId(hwnd, out uint pid);
+            if (pids.Contains(pid) && seen.Add(hwnd)) found.Add(hwnd);
         }
+        // Win10's CoreWindow can be under explorer's ApplicationFrameWindow.
+        // Enumerate all NATIVE child HWNDs, but inspect UIA only for host PIDs.
+        EnumWindows((root, _) =>
+        {
+            AddIfMatch(root);
+            EnumChildWindows(root, (child, _) => { AddIfMatch(child); return true; }, IntPtr.Zero);
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    private static bool HasHan(string text)
+    {
+        foreach (char c in text)
+            if (c is >= '\u3400' and <= '\u9FFF') return true;
         return false;
     }
 
-    private static bool HasHint(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value)) return false;
-        foreach (var hint in ImeHints)
-        {
-            if (value.Contains(hint, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-        return false;
-    }
+    private static bool Valid(Rect r) => !r.IsEmpty && r.Width >= 10 && r.Height >= 10;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeRect { public int Left, Top, Right, Bottom; }
+    private delegate bool WindowCallback(IntPtr hwnd, IntPtr lparam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumWindows(WindowCallback callback, IntPtr lparam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumChildWindows(IntPtr parent, WindowCallback callback, IntPtr lparam);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowVisible(IntPtr hwnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetWindowRect(IntPtr hwnd, out NativeRect rect);
 }
