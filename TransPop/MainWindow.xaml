@@ -30,11 +30,11 @@
                 </Border>
                 <StackPanel>
                     <TextBlock Text="TransPop" FontSize="24" FontWeight="Bold" Foreground="#1E293B" />
-                    <TextBlock Text="翻译气泡 · Windows 10/11 · 自动候选读取 v0.4" FontSize="12" Foreground="#64748B" />
+                    <TextBlock Text="翻译气泡 · Windows 10/11 · 自动候选读取 v0.5" FontSize="12" Foreground="#64748B" />
                 </StackPanel>
             </StackPanel>
             <TextBlock Margin="0,14,0,0" Foreground="#475569" TextWrapping="Wrap"
-                       Text="正常使用微软拼音即可。程序会自动定位候选框、读取第一个中文候选，并显示跟随气泡；不需要移动鼠标，也不会修改或提交输入内容。" />
+                       Text="正常使用微软拼音即可。程序会优先查找 Windows.UI.Core.CoreWindow，自动定位候选框、读取第一个中文候选，并显示跟随气泡；不需要移动鼠标，也不会修改或提交输入内容。" />
         </StackPanel>
         <Border Grid.Row="1" Margin="0,18,0,0" Padding="17" CornerRadius="17"
                 Background="White" BorderBrush="#E2E8F0" BorderThickness="1">

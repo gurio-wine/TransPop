@@ -1,4 +1,4 @@
-name: Build TransPop Windows auto-candidate
+name: Build TransPop v0.5 Windows auto-candidate
 
 on:
   push:

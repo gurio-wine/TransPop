@@ -15,6 +15,8 @@ public partial class MainWindow : Window
     private readonly CandidateOverlay _bubble = new();
     private readonly StringBuilder _events = new();
     private int _busy;
+    private DateTime _scanStartedUtc = DateTime.MinValue;
+    private bool _slowScanReported;
     private bool _closing;
     private bool _paused;
     private string _lastState = "";
@@ -23,11 +25,11 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+        _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(350) };
         _timer.Tick += async (_, _) => await ScanAsync();
         Loaded += (_, _) =>
         {
-            Log("程序启动；后台每 500ms 自动读取微软拼音候选。");
+            Log("程序启动；后台每 350ms 自动定位 CoreWindow 并检查候选。");
             _timer.Start();
         };
         Closed += (_, _) =>
@@ -66,7 +68,20 @@ public partial class MainWindow : Window
 
     private async Task ScanAsync()
     {
-        if (_closing || _paused || Interlocked.Exchange(ref _busy, 1) != 0) return;
+        if (_closing || _paused) return;
+        if (Interlocked.CompareExchange(ref _busy, 1, 0) != 0)
+        {
+            if (!_slowScanReported && (DateTime.UtcNow - _scanStartedUtc).TotalSeconds > 3)
+            {
+                _slowScanReported = true;
+                StatusText.Text = "UI Automation 查询超过 3 秒；请复制下方诊断信息";
+                Log("本次 UIA 查询超过 3 秒，还没有返回。可能遇到不响应的候选窗口。 ");
+            }
+            return;
+        }
+        _scanStartedUtc = DateTime.UtcNow;
+        _slowScanReported = false;
+        StatusText.Text = "正在检查原生候选窗口…";
         try
         {
             // UI Automation must run off the WPF UI thread; cursor location is
@@ -74,7 +89,7 @@ public partial class MainWindow : Window
             ScanResult result = await Task.Run(() => _scanner.Scan());
             if (_closing || _paused) return;
 
-            string stats = $"宿主进程 {result.Hosts} / HWND {result.Windows} / 可见 {result.Inspected} / 候选容器 {result.Panes}";
+            string stats = $"宿主进程 {result.Hosts} / 候选目标 {result.Windows} / 已检查 {result.Inspected} / 命中容器 {result.Panes}";
             if (result.Hit is { } hit)
             {
                 StatusText.Text = "检测成功 · " + stats;
@@ -129,7 +144,7 @@ public partial class MainWindow : Window
             _events.Clear();
             _events.Append(tail[^12000..]);
         }
-        ReportBox.Text = $"TransPop v0.4 | Windows build {Environment.OSVersion.Version.Build}\n" +
+        ReportBox.Text = $"TransPop v0.5 | Windows build {Environment.OSVersion.Version.Build}\n" +
                          _events;
         ReportBox.ScrollToEnd();
     }
