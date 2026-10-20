@@ -1,4 +1,4 @@
-name: Build Windows prototype
+name: Build TransPop Windows diagnostic
 
 on:
   push:
@@ -22,7 +22,7 @@ jobs:
       - name: Publish portable Windows application
         shell: pwsh
         run: |
-          dotnet publish ./PinyinCandidateProbe/PinyinCandidateProbe.csproj `
+          dotnet publish ./TransPop/TransPop.csproj `
             --configuration Release --runtime win-x64 --self-contained true `
             -p:PublishSingleFile=true `
             -p:IncludeNativeLibrariesForSelfExtract=true `
@@ -30,11 +30,11 @@ jobs:
             -p:DebugType=None `
             --output ./publish
           if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed' }
-          Compress-Archive -Path ./publish/* -DestinationPath ./PinyinCandidateProbe-win-x64.zip -Force
+          Compress-Archive -Path ./publish/* -DestinationPath ./TransPop-win-x64.zip -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PinyinCandidateProbe-win-x64
-          path: PinyinCandidateProbe-win-x64.zip
+          name: TransPop-win-x64
+          path: TransPop-win-x64.zip
           if-no-files-found: error

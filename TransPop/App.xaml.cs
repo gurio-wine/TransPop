@@ -1,6 +1,6 @@
 using System.Windows;
 
-namespace PinyinCandidateProbe;
+namespace TransPop;
 
 public partial class App : Application
 {

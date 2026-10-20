@@ -5,7 +5,7 @@ using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Automation;
 
-namespace PinyinCandidateProbe.Services;
+namespace TransPop.Services;
 
 public sealed record CandidateHit(string FirstCandidate, Rect Bounds, string Source);
 public sealed record ScanResult(CandidateHit? Hit, int WindowCount, int Inspected, string Note);

@@ -1,0 +1,91 @@
+<Window x:Class="TransPop.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="TransPop · 翻译气泡｜候选兼容性检测" Width="650" Height="680"
+        MinWidth="590" MinHeight="590" WindowStartupLocation="CenterScreen"
+        Background="#F6F8FC" FontFamily="Microsoft YaHei UI">
+    <Window.Resources>
+        <Style TargetType="Button">
+            <Setter Property="Padding" Value="12,8" />
+            <Setter Property="Margin" Value="0,0,8,0" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Background" Value="#DBEAFE" />
+            <Setter Property="Foreground" Value="#183E73" />
+        </Style>
+    </Window.Resources>
+    <Grid Margin="22">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0">
+            <StackPanel Orientation="Horizontal">
+                <Border Background="#2563EB" CornerRadius="13" Width="44" Height="44" Margin="0,0,12,0">
+                    <TextBlock Text="译" Foreground="White" FontSize="22" FontWeight="Bold"
+                               HorizontalAlignment="Center" VerticalAlignment="Center" />
+                </Border>
+                <StackPanel>
+                    <TextBlock Text="TransPop" FontSize="23" FontWeight="Bold" Foreground="#1E293B" />
+                    <TextBlock Text="翻译气泡 · Windows 10 / 11 候选检测版" FontSize="12" Foreground="#64748B" />
+                </StackPanel>
+            </StackPanel>
+            <TextBlock Margin="0,13,0,0" Foreground="#475569" TextWrapping="Wrap"
+                       Text="当前版本只验证微软拼音第一候选的可访问性，并展示气泡预览。不会翻译、联网、自动输入或修改输入法。"/>
+        </StackPanel>
+
+        <Border Grid.Row="1" Margin="0,18,0,0" Padding="15" CornerRadius="15"
+                Background="White" BorderBrush="#E2E8F0" BorderThickness="1">
+            <StackPanel>
+                <TextBlock Text="自动扫描状态" Foreground="#64748B" FontSize="12" />
+                <TextBlock x:Name="StatusText" Margin="0,7,0,0" Text="准备扫描…"
+                           FontSize="14" FontWeight="SemiBold" Foreground="#1F3657" TextWrapping="Wrap" />
+                <TextBlock x:Name="CandidateText" Margin="0,8,0,0" Text="第一候选：尚未检测到"
+                           FontSize="17" Foreground="#2563EB" TextWrapping="Wrap" />
+                <TextBlock x:Name="LastSeenText" Margin="0,6,0,0" FontSize="11"
+                           Foreground="#047857" Text="最近检测记录：无" TextWrapping="Wrap" />
+                <TextBlock x:Name="BoundsText" Margin="0,5,0,0" Foreground="#64748B"
+                           FontSize="11" Text="位置：—" />
+            </StackPanel>
+        </Border>
+
+        <StackPanel Grid.Row="2" Margin="0,15,0,0">
+            <WrapPanel>
+                <Button x:Name="PointerScanButton" Width="178" Click="PointerScanButton_Click"
+                        Background="#2563EB" Foreground="White"
+                        Content="5 秒后鼠标定位检测" />
+                <Button x:Name="DeepScanButton" Width="125" Click="DeepScanButton_Click"
+                        Content="延时深度扫描" />
+                <Button Width="100" Click="CopyReportButton_Click" Content="复制诊断" />
+            </WrapPanel>
+            <TextBlock Margin="0,10,0,0" TextWrapping="Wrap" FontSize="12" Foreground="#475569"
+                       Text="推荐：点击「5 秒后鼠标定位检测」，切回记事本输入 nihao（先不要上屏），把鼠标指针移到第一个中文候选词上，保持候选框展开。" />
+        </StackPanel>
+
+        <Border Grid.Row="3" Margin="0,15,0,0" Padding="12" CornerRadius="14"
+                Background="White" BorderBrush="#E2E8F0" BorderThickness="1">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" FontWeight="SemiBold" Text="鼠标定位诊断结果" Foreground="#23334F" />
+                <TextBlock Grid.Row="1" x:Name="PointerSummaryText" Margin="0,8,0,6"
+                           Foreground="#64748B" Text="尚未进行鼠标定位检测" TextWrapping="Wrap" />
+                <TextBox Grid.Row="2" x:Name="ReportBox" Text="暂无诊断信息"
+                         FontFamily="Consolas" FontSize="11" Background="#F8FAFC" Foreground="#334155"
+                         BorderBrush="#E2E8F0" TextWrapping="NoWrap"
+                         HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"
+                         IsReadOnly="True" AcceptsReturn="True" Padding="10" />
+            </Grid>
+        </Border>
+
+        <TextBlock Grid.Row="4" Margin="0,10,0,0" TextWrapping="Wrap" FontSize="11" Foreground="#64748B"
+                   Text="注意：诊断可能包含鼠标下的文字或候选词；分享日志之前请先删除隐私内容。没有截图、录屏或上传功能。" />
+    </Grid>
+</Window>

@@ -1,0 +1,30 @@
+<Window x:Class="TransPop.CandidateOverlay"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        WindowStyle="None" ResizeMode="NoResize" ShowInTaskbar="False"
+        ShowActivated="False" Focusable="False" Topmost="True"
+        AllowsTransparency="True" Background="Transparent"
+        Width="330" Height="92" FontFamily="Microsoft YaHei UI">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="8" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <Path Grid.Row="0" Data="M 0,8 L 8,0 L 16,8 Z" Fill="White"
+              HorizontalAlignment="Left" Margin="22,0,0,0" />
+        <Border Grid.Row="1" Background="White" BorderBrush="#C7DBFF" BorderThickness="1"
+                CornerRadius="17" Padding="15,10">
+            <Border.Effect>
+                <DropShadowEffect Color="#28466C" BlurRadius="18" Opacity="0.18" ShadowDepth="3" />
+            </Border.Effect>
+            <StackPanel>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="● " Foreground="#4384EA" FontSize="11" />
+                    <TextBlock Text="TransPop · 候选预览" FontWeight="SemiBold" Foreground="#64748B" FontSize="11" />
+                </StackPanel>
+                <TextBlock x:Name="CandidateLabel" Margin="0,7,0,0" Foreground="#153C73"
+                           FontSize="17" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+            </StackPanel>
+        </Border>
+    </Grid>
+</Window>
