@@ -20,15 +20,16 @@ use windows_sys::Win32::{
     Graphics::Gdi::{
         BeginPaint, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, EndPaint,
         GetStockObject, RoundRect, SelectObject, SetBkMode, SetTextColor, PAINTSTRUCT,
+        DrawTextW, InvalidateRect, SetWindowRgn,
+        DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
         DEFAULT_GUI_FONT, TRANSPARENT,
     },
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        DrawTextW, GetMessageW, GetSystemMetrics, InvalidateRect, PostQuitMessage,
+        GetMessageW, GetSystemMetrics, PostQuitMessage,
         RegisterClassW, SetLayeredWindowAttributes, SetProcessDPIAware, SetTimer,
-        SetWindowPos, SetWindowRgn, ShowWindow, TranslateMessage, WNDCLASSW, MSG,
-        DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+        SetWindowPos, ShowWindow, TranslateMessage, WNDCLASSW, MSG,
         HWND_TOPMOST, LWA_ALPHA, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
         SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOWNOACTIVATE,
         SWP_NOACTIVATE, SWP_SHOWWINDOW, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND,
@@ -188,7 +189,7 @@ unsafe fn paint(hwnd: HWND) {
         SelectObject(dc, old_brush);
         DeleteObject(brush);
         DeleteObject(rim);
-        SetBkMode(dc, TRANSPARENT);
+        SetBkMode(dc, TRANSPARENT as i32);
         let font = GetStockObject(DEFAULT_GUI_FONT);
         let previous_font = SelectObject(dc, font);
 

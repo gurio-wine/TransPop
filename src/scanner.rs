@@ -7,7 +7,7 @@ use uiautomation::{
     types::{ControlType, Handle},
 };
 use windows_sys::Win32::{
-    Foundation::{BOOL, HWND, LPARAM, RECT},
+    Foundation::{HWND, LPARAM, RECT},
     UI::WindowsAndMessaging::{EnumChildWindows, EnumWindows, GetClassNameW, GetWindowRect, IsWindowVisible},
 };
 
@@ -38,7 +38,7 @@ struct Enumerated {
     handles: Vec<isize>,
 }
 
-unsafe extern "system" fn child_cb(hwnd: HWND, param: LPARAM) -> BOOL {
+unsafe extern "system" fn child_cb(hwnd: HWND, param: LPARAM) -> i32 {
     // The parameter points into a Vec that lives for the duration of EnumChildWindows.
     let state = unsafe { &mut *(param as *mut Enumerated) };
     state.children += 1;
@@ -46,7 +46,7 @@ unsafe extern "system" fn child_cb(hwnd: HWND, param: LPARAM) -> BOOL {
     1
 }
 
-unsafe extern "system" fn top_cb(hwnd: HWND, param: LPARAM) -> BOOL {
+unsafe extern "system" fn top_cb(hwnd: HWND, param: LPARAM) -> i32 {
     let state = unsafe { &mut *(param as *mut Enumerated) };
     state.top += 1;
     add_candidate_hwnd(hwnd, state);

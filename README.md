@@ -1,4 +1,4 @@
-# TransPop / 翻译气泡 — Rust v0.6
+# TransPop / 翻译气泡 — Rust v0.6.2
 
 A **Rust-only**, non-invasive Microsoft Pinyin first-candidate preview bubble for Windows 10/11.
 No C#, .NET, WPF, TypeScript, Tauri or Electron. No installer, driver or IME registration.
@@ -71,3 +71,25 @@ To uninstall, exit and delete the program exe and `%LOCALAPPDATA%\TransPop` if y
 - `.github/workflows/windows.yml`: Windows MSVC GitHub Actions release EXE artifact
 
 The Win10 observed UIA panel ID is `IME_Prediction_Window`; Microsoft also documents `IME_Candidate_Window` for conversion candidates.
+
+## v0.6.2 build fix
+
+Pinned `uiautomation = 0.25.1` requires the Cargo `input` feature even when this
+application never simulates keyboard or mouse events. Disabling default features
+without enabling `input` causes `error[E0432]: unresolved import crate::inputs`
+inside the upstream `uiautomation` crate. This patch enables only the `input`
+feature while leaving `control` and other unnecessary optional features off.
+
+This does not add any keyboard hooks or input simulation to TransPop.
+
+**Build validation:** Cargo.toml syntax checked; Windows compilation still needs
+GitHub Actions. The `uiautomation` crate source feature mismatch is the specific
+error addressed here; subsequent compiler errors may still require fixes.
+
+
+## v0.6.2 Cargo feature 修复
+
+- `uiautomation` 保留 `input`，并显式启用 `control`。
+- `control` 进一步启用 `windows/Win32_UI_WindowsAndMessaging`，修复 v0.6.1 的 E0432。
+- 已确认 TOML 结构；需要 GitHub Actions 上的 Windows MSVC runner 实际编译与运行验证。
+- 仅修复 Cargo feature；不会改变 UIA 扫描逻辑，不会自动输入文字。
