@@ -1,42 +1,73 @@
-# TransPop（翻译气泡）v0.5 · Windows 10/11 自动候选修复版
+# TransPop / 翻译气泡 — Rust v0.6
 
-**这一版仍是候选检测原型，不会请求网络翻译，不会把候选上屏。** 目前气泡只显示微软拼音的第一个中文候选，用于验证自动发现是否稳定。
+A **Rust-only**, non-invasive Microsoft Pinyin first-candidate preview bubble for Windows 10/11.
+No C#, .NET, WPF, TypeScript, Tauri or Electron. No installer, driver or IME registration.
 
-## 修复内容
+> **Prototype**: displays the original Chinese first candidate in the bubble to verify automatic discovery. Translation with Bing / custom AI will be added after discovery is verified. Does not insert text or modify the candidate list.
 
-v0.4 在你的 Windows 10 上一直显示“等待输入”。与之前 v0.3 鼠标定向诊断成功的结果对照，我们发现 v0.4 的自动发现逻辑过于宽泛：它先枚举 `TextInputHost/InputApp/ctfmon` 的大量窗口，并对它们执行 UI Automation 子树查询，没有优先定位 v0.3 已验证的窗口类型。这有可能导致遗漏或查询过慢，但**未获取 v0.4 的完整诊断日志前，无法百分之百确定具体原因**。
+## How to build without installing Rust
 
-v0.5 做了如下修订：
+1. Create a GitHub repository (e.g., `TransPop`), and upload these files **including** `.github/workflows/windows.yml`.
+2. Open **Actions → Build TransPop Rust Windows → Run workflow**.
+3. After success, download artifact `TransPop-Rust-win-x64`, unzip twice and run `TransPop.exe`.
+4. In **Microsoft Pinyin** in Notepad, type `nihao` without hitting Space. The candidate bubble should appear **without touching the mouse**.
 
-1. 原生 `EnumWindows` + `EnumChildWindows` 枚举桌面主窗口及其**所有原生子窗口**，不需要鼠标位置。
-2. 优先检查 Win10 19045 实测的 `Windows.UI.Core.CoreWindow`，包括位于 Explorer `ApplicationFrameWindow` 下的宿主子窗口。其他 `TextInputHost/InputApp` 窗口作为兼容回退。
-3. `AutomationElement.FromHandle(hwnd)` 直接读取 UIA **Raw View**，查找 `IME_Prediction_Window` / `IME_Candidate_Window`，读取其第一个 `ListItem.Name`。
-4. 不再先对不相关窗口运行深层 `FindFirst(TreeScope.Descendants)`；最多检查 24 个候选目标窗口，优先处理最像候选框的短窗口。
-5. 把 `CoreWindow`、宿主 HWND、检查数量、面板命中数以及 UIA 异常写入程序日志。如果超过 3 秒无结果，状态会显示“UI Automation 查询超过 3 秒”。
-6. 背景扫描约每 350 毫秒执行一次；泡泡继续在候选窗口下方显示，不需要鼠标移动。
+For local build: `cargo build --release --target x86_64-pc-windows-msvc` on Windows with Rust MSVC tools.
 
-## 用 GitHub Actions 构建
+## Changes vs C# prototype
 
-上传 ZIP 内的 **`TransPop/` 和 `.github/`** 至你现有 GitHub 仓库根目录，覆盖原来的文件。打开 Actions → **Build TransPop v0.5 Windows auto-candidate** → Run workflow，下载 Artifact 内的 `TransPop-win-x64.zip`，解压运行 `TransPop.exe`。
+- Scans **top-level AND child HWNDs**. Win10 Build 19045 uses `Windows.UI.Core.CoreWindow` of `TextInputHost` nested inside `ApplicationFrameWindow`. **Enumerating top-level windows alone misses it.**
+- Only inspects visible, plausible-sized `CoreWindow` / IME windows; UIA is queried using `ElementFromHandle`, never `ElementFromPoint`.
+- Reads UIA **Raw View** and both `IME_Prediction_Window` and `IME_Candidate_Window`.
+- Reads first `ListItem.Name` and panel bounding rectangle, positions the preview just beneath it.
+- UIA is on a dedicated background MTA thread. Bubble is Win32/GDI, transparent to input, always on top, not activated.
+- **No keyboard hooks, no screenshot, no OCR, no input modification, no network requests.**
 
-如果需要本地编译：在安装了 .NET 10 SDK 的 Windows 上，运行 `dotnet run --project TransPop/TransPop.csproj`。
+## Diagnostic mode
 
-## 实测方式
+Run from PowerShell:
 
-1. 退出旧版 TransPop.exe，启动 v0.5。
-2. 打开记事本、切到微软拼音，输入 `nihao`，不要按空格，让候选框保持展开。
-3. 稍等，程序界面应显示“第一候选：你好”，气泡也应出现。**不需要移动鼠标。**
-4. 如果仍然等待，请回到 TransPop，点击“复制诊断”，把日志发过来。特别留意类似这行：
+```powershell
+.\TransPop.exe --debug
+```
 
-   `CoreWindow=1 / 宿主HWND=2 / UIA检查=1` 
+Debug mode shows a small fixed **status bubble** even when no candidate is found.
+The status line reports `Top`, `Child`, `Core`, `UIA`, `Panel`, `Err`.
 
-   - CoreWindow=0：没有枚举到已验证类型的原生窗口，重点检查系统宿主窗口或权限。
-   - CoreWindow>0 但候选面板=0：已找到窗口，Raw View 中没有读到候选面板。
-   - 候选面板>0 但未读到中文：候选项访问、可见性、元素变化需要进一步分析。
-   - UIA 查询超过 3 秒：可能有 Windows UIA 提供程序响应缓慢。
+A log is also written every ~5 seconds to:
 
-诊断日志可能包含正在输入的候选词。分享前请确认其中没有敏感文字。
+```
+%LOCALAPPDATA%\TransPop\diagnostics.log
+```
 
-## 当前验证状态
+To view it:
 
-代码与配置文件已做静态检查；无法在这个环境直接运行 Windows UIA，因此本版**尚未完成 Win10/Win11 实机运行确认**。目前已实测成功的仍是你在 Win10 19045 使用 v0.3 从 HWND 读取第一候选。Windows 11 自动识别仍待测试。
+```powershell
+Get-Content "$env:LOCALAPPDATA\TransPop\diagnostics.log" -Tail 20
+```
+
+If the program remains waiting, send the status line and last 20 log lines. **Candidate text itself is never stored in the log.**
+
+To exit (prototype has no tray UI yet): close from Task Manager or run:
+
+```powershell
+taskkill /IM TransPop.exe /F
+```
+
+To uninstall, exit and delete the program exe and `%LOCALAPPDATA%\TransPop` if you also wish to delete logs. No registry keys are created.
+
+## Compatibility / limits
+
+- The exact UIA tree has been **confirmed on one Win10 Build 19045 system** using the older C# diagnostic, but **this new Rust automatic scanner has not yet been built or run on a Windows computer**.
+- Windows 11 is a compatibility target, not yet verified.
+- UI Automation can be slow or unavailable with some protected applications/secure desktop; this program does not bypass those boundaries.
+- Using an input method other than Microsoft Pinyin is not guaranteed to work.
+- No translation engine or settings UI yet. First objective is to eliminate permanent “waiting for input”.
+
+## Implementation notes
+
+- `src/scanner.rs`: EnumWindows + EnumChildWindows; RawView walker; candidate extraction
+- `src/main.rs`: dedicated MTA scanner, Win32 click-through bubble, privacy-preserving log
+- `.github/workflows/windows.yml`: Windows MSVC GitHub Actions release EXE artifact
+
+The Win10 observed UIA panel ID is `IME_Prediction_Window`; Microsoft also documents `IME_Candidate_Window` for conversion candidates.
