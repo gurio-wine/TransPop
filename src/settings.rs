@@ -127,10 +127,10 @@ impl SettingsValues {
             provider: get("provider", "off").to_ascii_lowercase(),
             azure_url: get("azure_url", "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=en"),
             azure_region: get("azure_region", ""),
-            azure_key: get("azure_key", ""),
+            azure_key: super::secret::open(&get("azure_key", "")),
             openai_url: get("openai_url", "https://api.openai.com/v1/chat/completions"),
             openai_model: get("openai_model", "gpt-4o-mini"),
-            openai_key: get("openai_key", ""),
+            openai_key: super::secret::open(&get("openai_key", "")),
             timeout_seconds: get("timeout_seconds", "8"),
             debounce_ms: get("debounce_ms", "300"),
             alt_output: get("alt_output", "false").eq_ignore_ascii_case("true"),
@@ -180,17 +180,23 @@ impl SettingsValues {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(format!("无法读取 translator.conf，已取消保存（{e}）")),
         };
+        // Keys are sealed with DPAPI for the current Windows user before they
+        // reach the file; a seal failure keeps the old file untouched.
+        let sealed_azure = super::secret::seal(&self.azure_key)
+            .map_err(|e| format!("无法加密保存 Azure API Key（{e}）"))?;
+        let sealed_openai = super::secret::seal(&self.openai_key)
+            .map_err(|e| format!("无法加密保存 OpenAI API Key（{e}）"))?;
         let entries = [
-            ("provider", self.provider.as_str()),
-            ("azure_url", self.azure_url.as_str()),
-            ("azure_region", self.azure_region.as_str()),
-            ("azure_key", self.azure_key.as_str()),
-            ("openai_url", self.openai_url.as_str()),
-            ("openai_model", self.openai_model.as_str()),
-            ("openai_key", self.openai_key.as_str()),
-            ("timeout_seconds", self.timeout_seconds.as_str()),
-            ("debounce_ms", self.debounce_ms.as_str()),
-            ("alt_output", if self.alt_output { "true" } else { "false" }),
+            ("provider", self.provider.clone()),
+            ("azure_url", self.azure_url.clone()),
+            ("azure_region", self.azure_region.clone()),
+            ("azure_key", sealed_azure),
+            ("openai_url", self.openai_url.clone()),
+            ("openai_model", self.openai_model.clone()),
+            ("openai_key", sealed_openai),
+            ("timeout_seconds", self.timeout_seconds.clone()),
+            ("debounce_ms", self.debounce_ms.clone()),
+            ("alt_output", if self.alt_output { "true".to_string() } else { "false".to_string() }),
         ];
         let mut seen = std::collections::HashSet::<String>::new();
         let mut result = String::new();
@@ -206,8 +212,8 @@ impl SettingsValues {
             result.push_str(line);
             result.push('\n');
         }
-        for (key, value) in entries {
-            if !seen.contains(key) { result.push_str(&format!("{key}={value}\n")); }
+        for (key, value) in &entries {
+            if !seen.contains(*key) { result.push_str(&format!("{key}={value}\n")); }
         }
         // Normal Windows files are short; an error here must keep the form open.
         // Write a sibling temp file, flush it, then rename it into place, so a
@@ -224,6 +230,27 @@ impl SettingsValues {
             return Err("无法保存 translator.conf，请检查文件权限".to_string());
         }
         Ok(())
+    }
+}
+
+// Legacy translator.conf files stored API keys as plaintext. Re-save once at
+// startup so no upgrade leaves a cleartext secret on disk; a rejected save is
+// logged and the app keeps working with the old file until the next save.
+pub fn migrate_plaintext_secrets(base: &Path) {
+    let Ok(content) = fs::read_to_string(base.join("translator.conf")) else { return };
+    let has_plaintext = content.lines().any(|line| {
+        let line = line.trim();
+        if line.starts_with('#') { return false; }
+        let Some((key, value)) = line.split_once('=') else { return false };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        matches!(key.as_str(), "azure_key" | "openai_key")
+            && !value.is_empty() && !super::secret::is_sealed(value)
+    });
+    if !has_plaintext { return; }
+    match SettingsValues::from_file(base).save(base) {
+        Ok(()) => super::log_global("SECRETS_ENCRYPTED"),
+        Err(reason) => super::log_global(format!("SECRETS_ENCRYPT_SKIPPED {reason}")),
     }
 }
 
@@ -535,6 +562,46 @@ mod tests {
         let base = temp_base("provider");
         fs::write(base.join("translator.conf"), "provider=Bing\n").unwrap();
         assert_eq!(SettingsValues::from_file(&base).provider, "bing");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn save_seals_keys_and_from_file_decrypts_them() {
+        let base = temp_base("sealed");
+        let path = base.join("translator.conf");
+        fs::write(&path, "provider=openai\nopenai_key=sk-plain-123\n").unwrap();
+        let values = SettingsValues::from_file(&base);
+        assert_eq!(values.openai_key, "sk-plain-123");
+        values.save(&base).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("openai_key=dpapi:"), "key not sealed: {text}");
+        assert!(!text.contains("sk-plain-123"), "plaintext key left on disk");
+        assert_eq!(SettingsValues::from_file(&base).openai_key, "sk-plain-123");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn startup_migration_encrypts_legacy_plaintext_keys() {
+        let base = temp_base("migrate");
+        let path = base.join("translator.conf");
+        fs::write(&path, "# keep me\nprovider=bing\nazure_key=legacy-azure\n").unwrap();
+        migrate_plaintext_secrets(&base);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("azure_key=dpapi:"), "key not migrated: {text}");
+        assert!(!text.contains("legacy-azure"), "plaintext key left on disk");
+        assert!(text.contains("# keep me"), "comment lost: {text}");
+        assert_eq!(SettingsValues::from_file(&base).azure_key, "legacy-azure");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn startup_migration_leaves_sealed_files_untouched() {
+        let base = temp_base("sealed-untouched");
+        let path = base.join("translator.conf");
+        let original = "provider=bing\nazure_key=dpapi:00112233\n";
+        fs::write(&path, original).unwrap();
+        migrate_plaintext_secrets(&base);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
         let _ = fs::remove_dir_all(&base);
     }
 }

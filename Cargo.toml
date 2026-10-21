@@ -1,6 +1,6 @@
 [package]
 name = "transpop"
-version = "0.6.7"
+version = "0.6.8"
 edition = "2021"
 description = "Translate the highlighted Chinese IME candidate to English in real time on Windows"
 license = "MIT"
@@ -20,6 +20,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
+    "Win32_Security_Cryptography",
 ] }
 
 [profile.release]

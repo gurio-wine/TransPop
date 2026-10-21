@@ -36,7 +36,7 @@ cargo build --release
 
 也可以用环境变量覆盖（仅运行时生效，不会写回文件）：`TRANSPOP_PROVIDER`、`TRANSPOP_AZURE_KEY`、`TRANSPOP_AZURE_URL`、`TRANSPOP_AZURE_REGION`、`TRANSPOP_OPENAI_KEY`、`TRANSPOP_OPENAI_URL`、`TRANSPOP_OPENAI_MODEL`。
 
-> API Key 以明文保存在配置文件中，公共机器上建议改用环境变量。
+> API Key 保存时使用 Windows DPAPI 加密（`dpapi:` 前缀，仅当前 Windows 用户可解密）；旧版遗留的明文密钥会在启动时自动重新加密。公共机器上仍建议改用环境变量。
 
 ## 日志
 
@@ -46,5 +46,6 @@ cargo build --release
 
 - `bing` 使用微软 Edge 的非公开网页端点，可能随时失效或限流
 - 仅支持微软拼音的候选窗（UIAutomation `IME_Candidate_Window` / `IME_Prediction_Window`）
+- API Key 由 DPAPI 绑定当前 Windows 用户，更换用户或重装系统后需要重新填写
 - exe 未嵌入版本资源，资源管理器属性页不显示版本号
 - 暂停状态、气泡位置不跨重启保存

@@ -1,6 +1,7 @@
 #![cfg(windows)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod secret;
 mod settings;
 mod startup;
 
@@ -520,7 +521,8 @@ impl TranslatorConfig {
 # provider=bing uses an undocumented Edge/Microsoft webpage endpoint; no API key.\n\
 # The Bing mode may change, block automated calls, or enforce rate limits without notice.\n\
 # Other choices: provider=azure or provider=openai; provider=off sends nothing.\n\
-# Keys are secrets; environment variables TRANSPOP_AZURE_KEY / TRANSPOP_OPENAI_KEY are safer.\n\
+# API keys saved from Settings are encrypted with Windows DPAPI for the current user.\n\
+# Environment variables TRANSPOP_AZURE_KEY / TRANSPOP_OPENAI_KEY remain safer.\n\
 provider=off\n\
 azure_url=https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=en\n\
 azure_region=\n\
@@ -550,8 +552,8 @@ debounce_ms=300\n";
             .ok().filter(|value| !value.is_empty()).unwrap_or(fallback);
         let provider = env_or("TRANSPOP_PROVIDER", get("provider", "off"))
             .to_ascii_lowercase();
-        let azure_key = env_or("TRANSPOP_AZURE_KEY", get("azure_key", ""));
-        let openai_key = env_or("TRANSPOP_OPENAI_KEY", get("openai_key", ""));
+        let azure_key = env_or("TRANSPOP_AZURE_KEY", secret::open(&get("azure_key", "")));
+        let openai_key = env_or("TRANSPOP_OPENAI_KEY", secret::open(&get("openai_key", "")));
         let azure_url = env_or("TRANSPOP_AZURE_URL", get("azure_url",
             "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=en"));
         let openai_url = env_or("TRANSPOP_OPENAI_URL", get("openai_url",
@@ -2013,6 +2015,9 @@ fn main() {
     let log_probe_tx = probe_tx.clone();
     let uia_probe_tx = probe_tx.clone();
     thread::spawn(move || log_worker(log_rx, logfile, log_probe_tx));
+    // Legacy plaintext keys must not survive an upgrade; failures are logged
+    // and deliberately keep the app running.
+    settings::migrate_plaintext_secrets(&base);
     let config = TranslatorConfig::load(&base);
     ALT_OUTPUT_ENABLED.store(settings::SettingsValues::from_file(&base).alt_output, Ordering::Release);
     let configuration_status = config.readiness();
