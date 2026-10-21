@@ -19,7 +19,7 @@ cargo build --release
 
 ## 使用
 
-- 托盘图标：左键暂停 / 恢复，右键菜单可打开设置、暂停或退出
+- 托盘图标：左键暂停 / 恢复，右键菜单可打开设置、检查更新、暂停或退出
 - 快捷键：`Ctrl+Alt+Q` 退出
 - 命令行：`--settings`、`--pause`、`--resume`、`--quit`
 
@@ -33,10 +33,17 @@ cargo build --release
 | `timeout_seconds` | 请求超时，2–30 秒 |
 | `debounce_ms` | 翻译防抖，100–1000 毫秒 |
 | `alt_output` | `true` 时启用轻按左 Alt 直接输入英文 |
+| `auto_update` | `on`（默认）时自动检查并安装 GitHub 新版本，`off` 关闭 |
 
-也可以用环境变量覆盖（仅运行时生效，不会写回文件）：`TRANSPOP_PROVIDER`、`TRANSPOP_AZURE_KEY`、`TRANSPOP_AZURE_URL`、`TRANSPOP_AZURE_REGION`、`TRANSPOP_OPENAI_KEY`、`TRANSPOP_OPENAI_URL`、`TRANSPOP_OPENAI_MODEL`。
+也可以用环境变量覆盖（仅运行时生效，不会写回文件）：`TRANSPOP_PROVIDER`、`TRANSPOP_AZURE_KEY`、`TRANSPOP_AZURE_URL`、`TRANSPOP_AZURE_REGION`、`TRANSPOP_OPENAI_KEY`、`TRANSPOP_OPENAI_URL`、`TRANSPOP_OPENAI_MODEL`、`TRANSPOP_AUTO_UPDATE`。
 
 > API Key 保存时使用 Windows DPAPI 加密（`dpapi:` 前缀，仅当前 Windows 用户可解密）；旧版遗留的明文密钥会在启动时自动重新加密。公共机器上仍建议改用环境变量。
+
+暂停状态保存在 `%LOCALAPPDATA%\TransPop\state.conf`，重启后自动恢复。
+
+## 自动更新
+
+启动 20 秒后以及之后每 6 小时，TransPop 会查询 GitHub Releases 的最新版本（`auto_update=on`，默认）。发现新版本时下载 `transpop.exe`，用 GitHub 公布的 `sha256` 摘要校验后再替换自身并重启；校验失败不会安装。托盘右键「检查更新...」可手动触发并显示结果。更新文件存放在 `%LOCALAPPDATA%\TransPop\update\`。
 
 ## 日志
 
@@ -47,5 +54,5 @@ cargo build --release
 - `bing` 使用微软 Edge 的非公开网页端点，可能随时失效或限流
 - 仅支持微软拼音的候选窗（UIAutomation `IME_Candidate_Window` / `IME_Prediction_Window`）
 - API Key 由 DPAPI 绑定当前 Windows 用户，更换用户或重装系统后需要重新填写
-- exe 未嵌入版本资源，资源管理器属性页不显示版本号
-- 暂停状态、气泡位置不跨重启保存
+- 气泡位置跟随输入法候选窗计算，不支持拖动或跨重启记住位置
+- 自动更新需要能访问 GitHub；若安装目录不可写（例如 Program Files），替换会失败并只记录日志（手动检查时会弹窗提示）

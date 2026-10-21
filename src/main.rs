@@ -4,6 +4,7 @@
 mod secret;
 mod settings;
 mod startup;
+mod update;
 
 /// Single source of truth for every version string in logs and CLI output.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -18,7 +19,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{BufWriter, Write},
     mem,
-    path::PathBuf,
+    path::{Path, PathBuf},
     ptr,
     panic,
     sync::{
@@ -156,6 +157,7 @@ const TRAY_MENU_TOGGLE: u32 = 3001;
 const TRAY_MENU_SETTINGS: u32 = 3003;
 const WM_APP_SETTINGS: u32 = WM_APP + 23;
 const TRAY_MENU_EXIT: u32 = 3002;
+const TRAY_MENU_UPDATE: u32 = 3004;
 const TIMER_ID: usize = 1;
 const EXIT_HOTKEY_ID: i32 = 0x4341;
 const GCS_COMPSTR: u32 = 0x0008;
@@ -199,6 +201,9 @@ const ACTIVE_RECHECK_WAKE: Duration = Duration::from_millis(40);
 // Bound diagnostics for unattended sessions; keep at most two 2 MiB files.
 const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const HEALTH_INTERVAL: Duration = Duration::from_secs(60);
+// Give the first update check time to lose to interactive startup work.
+const UPDATE_CHECK_DELAY: Duration = Duration::from_secs(20);
+const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 // None of these structures exposes typed characters, clipboard contents, or keys
 // in logs. The keyboard callback only recognizes an isolated physical LAlt tap.
@@ -512,6 +517,7 @@ struct TranslatorConfig {
     openai_key: String,
     timeout_seconds: u64,
     debounce_ms: u64,
+    auto_update: bool,
 }
 
 impl TranslatorConfig {
@@ -532,7 +538,10 @@ openai_model=gpt-4o-mini\n\
 openai_key=\n\
 # A local OpenAI-compatible endpoint can use http://127.0.0.1:PORT/v1/chat/completions.\n\
 timeout_seconds=8\n\
-debounce_ms=300\n";
+debounce_ms=300\n\
+# auto_update=on checks GitHub Releases at startup and every 6 hours and installs\n\
+# a newer release after verifying the digest GitHub publishes for its asset.\n\
+auto_update=on\n";
         if let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(&path) {
             let _ = file.write_all(sample.as_bytes());
         }
@@ -566,6 +575,10 @@ debounce_ms=300\n";
                 .unwrap_or(8).clamp(2, 30),
             debounce_ms: get("debounce_ms", "300").parse::<u64>()
                 .unwrap_or(300).clamp(100, 1000),
+            auto_update: !matches!(
+                env_or("TRANSPOP_AUTO_UPDATE", get("auto_update", "on"))
+                    .to_ascii_lowercase().as_str(),
+                "off" | "false" | "0" | "no"),
         }
     }
 
@@ -975,9 +988,11 @@ unsafe fn tray_popup_menu(receiver: HWND, paused: bool) -> u32 {
     if menu.is_null() { return 0; }
     let toggle = wide(if paused { "恢复翻译" } else { "暂停翻译" });
     let settings = wide("设置...");
+    let update = wide("检查更新...");
     let exit = wide("退出 TransPop");
     AppendMenuW(menu, MF_STRING, TRAY_MENU_TOGGLE as usize, toggle.as_ptr());
     AppendMenuW(menu, MF_STRING, TRAY_MENU_SETTINGS as usize, settings.as_ptr());
+    AppendMenuW(menu, MF_STRING, TRAY_MENU_UPDATE as usize, update.as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
     AppendMenuW(menu, MF_STRING, TRAY_MENU_EXIT as usize, exit.as_ptr());
     let mut point = POINT { x: 0, y: 0 };
@@ -994,10 +1009,11 @@ unsafe fn tray_popup_menu(receiver: HWND, paused: bool) -> u32 {
 }
 
 fn set_paused(
-    paused: bool, bubble: HWND, shadow: HWND,
+    paused: bool, base: &Path, bubble: HWND, shadow: HWND,
     tray: &mut TrayIcon, probe_tx: &Sender<ProbeRequest>,
 ) {
     if TRANSLATION_PAUSED.swap(paused, Ordering::AcqRel) == paused { return; }
+    save_paused_state(base, paused);
     // Advance both generations to invalidate pending UIA/network work, even
     // if the last translated candidate happened to have identical text.
     clear_ready_translation();
@@ -1038,6 +1054,28 @@ fn set_paused(
         }
     }
     unsafe { tray.update(paused); }
+}
+
+fn paused_state_path(base: &Path) -> PathBuf {
+    base.join("state.conf")
+}
+
+fn load_paused_state(base: &Path) -> bool {
+    fs::read_to_string(paused_state_path(base))
+        .map(|text| text.lines().any(|line| line.trim().eq_ignore_ascii_case("paused=1")))
+        .unwrap_or(false)
+}
+
+fn save_paused_state(base: &Path, paused: bool) {
+    let path = paused_state_path(base);
+    let temporary = path.with_extension("conf.tmp");
+    let mut text = String::from("paused=");
+    text.push(if paused { '1' } else { '0' });
+    text.push('\n');
+    if fs::write(&temporary, text).is_err() { return; }
+    if fs::rename(&temporary, &path).is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
 }
 
 fn elapsed() -> String {
@@ -1125,6 +1163,133 @@ fn is_panel(id: &str) -> bool {
 // Prefer explicit selection supplied by the host. Some IMEs omit UIA Selection
 // patterns, hence read-only MSAA / keyboard-focus fallbacks and, finally,
 // the previous working first item behavior. Never change IME selection here.
+// One IME candidate item as exposed through UIA. The selection strategy runs
+// against this trait so the fallback order is unit-testable; the UIA
+// implementation keeps every property read lazy because each one is a
+// cross-process call issued on every candidate change.
+trait CandidateItem {
+    fn name(&self) -> Option<String>;
+    fn bounds(&self) -> Option<(i32, i32, i32, i32)>;
+    fn selected(&self) -> bool;
+    fn legacy_selected(&self) -> bool;
+    fn keyboard_focused(&self) -> bool;
+    fn legacy_focused(&self) -> bool;
+}
+
+struct UiaItem<'a> { element: &'a UIElement, index: usize }
+
+fn legacy_state(element: &UIElement) -> Option<u32> {
+    element.get_pattern::<UILegacyIAccessiblePattern>().ok()?.get_state().ok()
+}
+
+impl CandidateItem for UiaItem<'_> {
+    fn name(&self) -> Option<String> {
+        self.element.get_name().ok().filter(|name| !name.trim().is_empty())
+    }
+
+    fn bounds(&self) -> Option<(i32, i32, i32, i32)> {
+        self.element.get_bounding_rectangle().ok()
+            .map(|rect| (rect.get_left(), rect.get_top(), rect.get_right(), rect.get_bottom()))
+    }
+
+    fn selected(&self) -> bool {
+        match self.element.get_pattern::<UISelectionItemPattern>() {
+            Ok(pattern) => match pattern.is_selected() {
+                Ok(value) => value,
+                // A UIA error is not "not selected": log it instead of silently
+                // falling through to a lower-confidence selection source.
+                Err(e) => {
+                    log_global(format!("UIA_IS_SELECTED_FAILED index={} err={e}", self.index));
+                    false
+                }
+            },
+            Err(_) => false,
+        }
+    }
+
+    fn legacy_selected(&self) -> bool {
+        legacy_state(self.element).is_some_and(|state| state & STATE_SYSTEM_SELECTED != 0)
+    }
+
+    fn keyboard_focused(&self) -> bool {
+        match self.element.has_keyboard_focus() {
+            Ok(value) => value,
+            Err(e) => {
+                log_global(format!("UIA_HAS_FOCUS_FAILED index={} err={e}", self.index));
+                false
+            }
+        }
+    }
+
+    fn legacy_focused(&self) -> bool {
+        legacy_state(self.element).is_some_and(|state| state & STATE_SYSTEM_FOCUSED != 0)
+    }
+}
+
+/// The seven-level selection fallback, in decreasing order of confidence.
+fn pick_candidate<V: CandidateItem>(
+    items: &[V],
+    container_selected: Option<&str>,
+    hint: Option<(&str, Option<(i32, i32, i32, i32)>)>,
+) -> Option<(String, usize, &'static str)> {
+    if let Some(name) = container_selected.filter(|name| !name.trim().is_empty()) {
+        let index = items.iter()
+            .position(|item| item.name().as_deref() == Some(name))
+            .map(|position| position + 1)
+            .unwrap_or(0);
+        return Some((name.to_owned(), index, "selection-container"));
+    }
+
+    // The official IME accessibility contract says that SelectionItem_ElementSelected
+    // is raised on the selected item. Some Windows 10 Microsoft Pinyin builds
+    // appear not to expose SelectionItem.IsSelected or keyboard focus for that item.
+    // Use the event sender's name *only if it matches an item in this exact panel*.
+    if let Some((text, rect)) = hint {
+        let mut match_index = None;
+        for (index, item) in items.iter().enumerate() {
+            if item.name().as_deref() != Some(text) { continue; }
+            if let Some((hl, ht, hr, hb)) = rect {
+                // A valid event rectangle can disambiguate duplicate item names.
+                if let Some((il, it, ir, ib)) = item.bounds() {
+                    let distance = (il - hl).abs() + (it - ht).abs()
+                        + (ir - hr).abs() + (ib - hb).abs();
+                    if distance <= 24 { match_index = Some(index); break; }
+                }
+            }
+            if match_index.is_none() { match_index = Some(index); }
+        }
+        if let Some(index) = match_index {
+            return Some((text.to_owned(), index + 1, "selection-event"));
+        }
+    }
+
+    // First selection status, before resorting to focus and first item: this
+    // is critical when the user moves the IME highlight with Up/Down.
+    let selectors: [(&str, fn(&V) -> bool); 4] = [
+        ("selection-item", |item| item.selected()),
+        ("legacy-selected", |item| item.legacy_selected()),
+        ("keyboard-focus", |item| item.keyboard_focused()),
+        ("legacy-focus", |item| item.legacy_focused()),
+    ];
+    for (source, matches) in selectors {
+        for (index, item) in items.iter().enumerate() {
+            if !matches(item) { continue; }
+            if let Some(name) = item.name() {
+                return Some((name, index + 1, source));
+            }
+        }
+    }
+
+    // On providers which do not expose their highlight state, retain the
+    // previous version's behavior instead of making the bubble disappear.
+    for (index, item) in items.iter().enumerate() {
+        if let Some(name) = item.name() {
+            return Some((name, index + 1, "first-fallback"));
+        }
+    }
+    None
+}
+
 fn selected_candidate(panel: &UIElement, all: &UICondition, hint: Option<&SelectionHint>)
     -> Result<Option<(String, usize, &'static str)>, String>
 {
@@ -1145,114 +1310,27 @@ fn selected_candidate(panel: &UIElement, all: &UICondition, hint: Option<&Select
 
     // SelectionPattern can expose the selected item directly, including on
     // implementations where individual ListItems omit SelectionItemPattern.
+    let mut container_selected = None;
     for container in &containers {
         if let Ok(selection) = container.get_pattern::<UISelectionPattern>() {
             if let Ok(selected) = selection.get_selection() {
                 for element in selected.into_iter().take(4) {
                     if let Ok(name) = element.get_name() {
                         if !name.trim().is_empty() {
-                            let index = items.iter().position(|v| v.get_name().ok().as_deref() == Some(name.as_str()))
-                                .map(|i| i + 1).unwrap_or(0);
-                            return Ok(Some((name, index, "selection-container")));
+                            container_selected = Some(name);
+                            break;
                         }
                     }
                 }
             }
         }
+        if container_selected.is_some() { break; }
     }
 
-    // The official IME accessibility contract says that SelectionItem_ElementSelected
-    // is raised on the selected item. Some Windows 10 Microsoft Pinyin builds
-    // appear not to expose SelectionItem.IsSelected or keyboard focus for that item.
-    // Use the event sender's name *only if it matches an item in this exact panel*.
-    if let Some(hint) = hint {
-        let mut match_index = None;
-        for (i, item) in items.iter().enumerate() {
-            if item.get_name().ok().as_deref() != Some(hint.text.as_str()) { continue; }
-            if let Some((hl, ht, hr, hb)) = hint.bounds {
-                // A valid event rectangle can disambiguate duplicate item names.
-                if let Ok(rect) = item.get_bounding_rectangle() {
-                    let d = (rect.get_left() - hl).abs() + (rect.get_top() - ht).abs()
-                        + (rect.get_right() - hr).abs() + (rect.get_bottom() - hb).abs();
-                    if d <= 24 { match_index = Some(i); break; }
-                }
-            }
-            if match_index.is_none() { match_index = Some(i); }
-        }
-        if let Some(i) = match_index {
-            return Ok(Some((hint.text.clone(), i + 1, "selection-event")));
-        }
-    }
-
-    // First find selection status before resorting to focus and first item.
-    // This is critical when the user moves the IME highlight with Up/Down.
-    for (i, item) in items.iter().enumerate() {
-        if let Ok(selection) = item.get_pattern::<UISelectionItemPattern>() {
-            let selected = match selection.is_selected() {
-                Ok(value) => value,
-                // A UIA error is not "not selected": log it instead of silently
-                // falling through to a lower-confidence selection source.
-                Err(e) => { log_global(format!("UIA_IS_SELECTED_FAILED index={i} err={e}")); false }
-            };
-            if selected {
-                if let Ok(name) = item.get_name() {
-                    if !name.trim().is_empty() {
-                        return Ok(Some((name, i + 1, "selection-item")));
-                    }
-                }
-            }
-        }
-    }
-
-    // Older hosts may publish selection via MSAA without SelectionItemPattern.
-    for (i, item) in items.iter().enumerate() {
-        if let Ok(legacy) = item.get_pattern::<UILegacyIAccessiblePattern>() {
-            if let Ok(state) = legacy.get_state() {
-                if state & STATE_SYSTEM_SELECTED != 0 {
-                    if let Ok(name) = item.get_name() {
-                        if !name.trim().is_empty() {
-                            return Ok(Some((name, i + 1, "legacy-selected")));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    for (i, item) in items.iter().enumerate() {
-        let focused = match item.has_keyboard_focus() {
-            Ok(value) => value,
-            Err(e) => { log_global(format!("UIA_HAS_FOCUS_FAILED index={i} err={e}")); false }
-        };
-        if focused {
-            if let Ok(name) = item.get_name() {
-                if !name.trim().is_empty() {
-                    return Ok(Some((name, i + 1, "keyboard-focus")));
-                }
-            }
-        }
-    }
-    for (i, item) in items.iter().enumerate() {
-        if let Ok(legacy) = item.get_pattern::<UILegacyIAccessiblePattern>() {
-            if let Ok(state) = legacy.get_state() {
-                if state & STATE_SYSTEM_FOCUSED != 0 {
-                    if let Ok(name) = item.get_name() {
-                        if !name.trim().is_empty() {
-                            return Ok(Some((name, i + 1, "legacy-focus")));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // On providers which do not expose their highlight state, retain the
-    // previous version's behavior instead of making the bubble disappear.
-    for (i, item) in items.iter().enumerate() {
-        if let Ok(name) = item.get_name() {
-            if !name.trim().is_empty() { return Ok(Some((name, i + 1, "first-fallback"))); }
-        }
-    }
-    Ok(None)
+    let views: Vec<UiaItem> = items.iter().enumerate()
+        .map(|(index, element)| UiaItem { element, index }).collect();
+    Ok(pick_candidate(&views, container_selected.as_deref(),
+        hint.map(|hint| (hint.text.as_str(), hint.bounds))))
 }
 
 fn targeted_candidate(
@@ -1951,12 +2029,75 @@ fn log_global(line: impl Into<String>) {
     if let Some(tx) = LOG_TX.get() { log_line(tx, line); }
 }
 
+// Network work never runs on the UI message loop.
+fn update_worker(base: PathBuf, manual: bool, log_tx: Sender<LogRecord>) {
+    let release = match update::latest() {
+        Ok(release) => release,
+        Err(reason) => {
+            log_line(&log_tx, format!("UPDATE_CHECK_FAILED {reason}"));
+            if manual { update_notice("检查更新失败", &format!("无法获取最新版本：{reason}")); }
+            return;
+        }
+    };
+    log_line(&log_tx, format!("UPDATE_CHECK_OK current={VERSION} remote={}", release.tag));
+    if !update::is_newer(VERSION, &release.tag) {
+        if manual { update_notice("检查更新", &format!("当前已是最新版本 v{VERSION}。")); }
+        return;
+    }
+    log_line(&log_tx, format!("UPDATE_AVAILABLE remote={}", release.tag));
+    let downloaded = match update::download(&release, &base.join("update")) {
+        Ok(path) => path,
+        Err(reason) => {
+            log_line(&log_tx, format!("UPDATE_DOWNLOAD_FAILED {reason}"));
+            if manual {
+                update_notice("自动更新", &format!("下载新版本 {} 失败：{reason}", release.tag));
+            }
+            return;
+        }
+    };
+    log_line(&log_tx, "UPDATE_DOWNLOADED_AND_VERIFIED");
+    if manual {
+        update_notice("自动更新", &format!("发现新版本 {}，正在更新并重启 TransPop。", release.tag));
+    }
+    match update::apply(&downloaded) {
+        Ok(()) => {
+            log_line(&log_tx, format!("UPDATE_APPLIED version={} restarting", release.tag));
+            let hwnd = CONTROL_HWND.load(Ordering::Acquire) as HWND;
+            if !hwnd.is_null() { unsafe { PostMessageW(hwnd, WM_APP_EXIT, 0, 0); } }
+        }
+        Err(reason) => {
+            log_line(&log_tx, format!("UPDATE_APPLY_FAILED {reason}"));
+            if manual { update_notice("自动更新", &format!("安装新版本失败：{reason}")); }
+        }
+    }
+}
+
+fn update_notice(caption: &str, text: &str) {
+    let caption = wide(caption);
+    let text = wide(text);
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            ptr::null_mut(), text.as_ptr(), caption.as_ptr(), 0x00000040);
+    }
+}
+
 // No custom WndProc is registered. The built-in EDIT class handles painting
 // and all app-specific messages are intercepted by the owning thread's loop.
 fn main() {
     let static_class = wide(STATIC_CLASS);
     let control_title = wide(CONTROL_TITLE);
     let arguments: Vec<String> = env::args().skip(1).collect();
+
+    // A self-update starts this copy while the previous instance is still
+    // shutting down; wait for it to release the single-instance window.
+    if arguments.iter().any(|v| v == "--after-update") {
+        for _ in 0..100 {
+            if unsafe { FindWindowW(static_class.as_ptr(), control_title.as_ptr()) }.is_null() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
 
     let remote = if arguments.iter().any(|v| v == "--quit" || v == "--exit") {
         Some(WM_APP_EXIT)
@@ -1991,6 +2132,7 @@ fn main() {
             return;
         }
     };
+    update::remove_stale_backup();
     let seconds = arguments.windows(2).find(|w| w[0] == "--seconds")
         .and_then(|w| w[1].parse::<u64>().ok()).filter(|v| *v > 0);
     START.set(Instant::now()).ok();
@@ -2117,6 +2259,13 @@ fn main() {
         let tray_receiver = create_tray_receiver(instance);
         let mut tray = TrayIcon::new(tray_receiver);
         if !tray_receiver.is_null() { tray.add(); }
+        // Restore the previous session's paused state. The bubble is still
+        // hidden and the probe channel is live, so this is the same transition
+        // a tray click makes.
+        if load_paused_state(&base) {
+            set_paused(true, &base, hwnd, shadow, &mut tray, &probe_tx);
+            log_line(&log_tx, "PAUSED_STATE_RESTORED");
+        }
         // With a null HWND, WM_HOTKEY is posted to this thread's message queue.
         if RegisterHotKey(ptr::null_mut(), EXIT_HOTKEY_ID,
             MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'Q' as u32) == 0 {
@@ -2156,6 +2305,16 @@ fn main() {
             }
         }
         log_line(&log_tx, format!("HOOKS_READY {}/5", hooks.len()));
+        let auto_update = config.auto_update;
+        if auto_update {
+            let update_base = base.clone();
+            let update_log = log_tx.clone();
+            thread::spawn(move || {
+                thread::sleep(UPDATE_CHECK_DELAY);
+                update_worker(update_base, false, update_log);
+            });
+            log_line(&log_tx, "UPDATE_CHECK_SCHEDULED");
+        }
         if let Some(seconds) = seconds {
             // Post to our known control HWND, not to the focused application.
             let target = control as usize;
@@ -2181,6 +2340,7 @@ fn main() {
         let mut last_loading = Instant::now();
         let mut last_main_health = Instant::now();
         let mut last_tray_toggle: Option<Instant> = None;
+        let mut last_update_check = Instant::now();
         let mut settings_window: Option<settings::SettingsWindow> = None;
         let settings_on_start = arguments.iter().any(|v| v == "--settings");
         if settings_on_start {
@@ -2298,11 +2458,11 @@ fn main() {
                     continue;
                 }
                 WM_APP_PAUSE if msg.hwnd == control => {
-                    set_paused(true, hwnd, shadow, &mut tray, &probe_tx);
+                    set_paused(true, &base, hwnd, shadow, &mut tray, &probe_tx);
                     continue;
                 }
                 WM_APP_RESUME if msg.hwnd == control => {
-                    set_paused(false, hwnd, shadow, &mut tray, &probe_tx);
+                    set_paused(false, &base, hwnd, shadow, &mut tray, &probe_tx);
                     continue;
                 }
                 WM_APP_TRAY if msg.hwnd == control => {
@@ -2315,7 +2475,7 @@ fn main() {
                             last_tray_toggle = Some(Instant::now());
                             let new_paused = !TRANSLATION_PAUSED.load(Ordering::Acquire);
                             log_global(if new_paused { "TRAY_LEFT_PAUSE" } else { "TRAY_LEFT_RESUME" });
-                            set_paused(new_paused, hwnd, shadow, &mut tray, &probe_tx);
+                            set_paused(new_paused, &base, hwnd, shadow, &mut tray, &probe_tx);
                         }
                     } else if code == WM_RBUTTONUP || code == WM_CONTEXTMENU {
                         log_global("TRAY_MENU_OPEN");
@@ -2325,7 +2485,7 @@ fn main() {
                         match selected {
                             TRAY_MENU_TOGGLE => {
                                 let new_paused = !TRANSLATION_PAUSED.load(Ordering::Acquire);
-                                set_paused(new_paused, hwnd, shadow, &mut tray, &probe_tx);
+                                set_paused(new_paused, &base, hwnd, shadow, &mut tray, &probe_tx);
                             }
                             TRAY_MENU_SETTINGS => {
                                 if let Some(ref settings_ui) = settings_window {
@@ -2334,6 +2494,12 @@ fn main() {
                                     settings_window = settings::SettingsWindow::open(base.clone(), dpi);
                                     log_global(if settings_window.is_some() { "SETTINGS_OPENED" } else { "SETTINGS_OPEN_FAILED" });
                                 }
+                            }
+                            TRAY_MENU_UPDATE => {
+                                log_global("UPDATE_CHECK_MANUAL");
+                                let update_base = base.clone();
+                                let update_log = log_tx.clone();
+                                thread::spawn(move || update_worker(update_base, true, update_log));
                             }
                             TRAY_MENU_EXIT => { log_global("EXIT_TRAY"); break; }
                             _ => {}
@@ -2360,6 +2526,12 @@ fn main() {
                             "MAIN_LOOP_HEARTBEAT paused={} tray_registered={}",
                             TRANSLATION_PAUSED.load(Ordering::Acquire), tray.registered));
                         last_main_health = Instant::now();
+                    }
+                    if auto_update && last_update_check.elapsed() >= UPDATE_INTERVAL {
+                        last_update_check = Instant::now();
+                        let update_base = base.clone();
+                        let update_log = log_tx.clone();
+                        thread::spawn(move || update_worker(update_base, false, update_log));
                     }
                     hide_if_focus_lost(hwnd, shadow);
                     if last_loading.elapsed() >= Duration::from_millis(300) {
@@ -2391,4 +2563,127 @@ fn main() {
     }
     log_line(&log_tx, format!("TransPop v{VERSION} stopped"));
     thread::sleep(Duration::from_millis(200));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeItem {
+        name: Option<&'static str>,
+        bounds: Option<(i32, i32, i32, i32)>,
+        selected: bool,
+        legacy_selected: bool,
+        focus: bool,
+        legacy_focus: bool,
+    }
+
+    impl FakeItem {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name: Some(name), bounds: None, selected: false,
+                legacy_selected: false, focus: false, legacy_focus: false,
+            }
+        }
+    }
+
+    impl CandidateItem for FakeItem {
+        fn name(&self) -> Option<String> { self.name.map(str::to_owned) }
+        fn bounds(&self) -> Option<(i32, i32, i32, i32)> { self.bounds }
+        fn selected(&self) -> bool { self.selected }
+        fn legacy_selected(&self) -> bool { self.legacy_selected }
+        fn keyboard_focused(&self) -> bool { self.focus }
+        fn legacy_focused(&self) -> bool { self.legacy_focus }
+    }
+
+    #[test]
+    fn container_selection_wins_and_reports_item_index() {
+        let items = [FakeItem::new("甲"), FakeItem::new("乙"), FakeItem::new("丙")];
+        assert_eq!(pick_candidate(&items, Some("乙"), None).unwrap(),
+            ("乙".to_string(), 2, "selection-container"));
+        // A container name that no item repeats is reported as index 0.
+        assert_eq!(pick_candidate(&items, Some("丁"), None).unwrap(),
+            ("丁".to_string(), 0, "selection-container"));
+    }
+
+    #[test]
+    fn selection_event_rect_disambiguates_duplicate_names() {
+        let mut items = [FakeItem::new("好"), FakeItem::new("好")];
+        items[0].bounds = Some((0, 0, 10, 10));
+        items[1].bounds = Some((100, 100, 110, 110));
+        assert_eq!(pick_candidate(&items, None, Some(("好", Some((100, 101, 110, 111))))).unwrap().1, 2);
+        // Without a rectangle the first matching name is used.
+        assert_eq!(pick_candidate(&items, None, Some(("好", None))).unwrap().1, 1);
+        // A hint that matches no item falls through to the next level.
+        let items = [FakeItem::new("好")];
+        assert_eq!(pick_candidate(&items, None, Some(("坏", None))).unwrap().2, "first-fallback");
+    }
+
+    #[test]
+    fn selection_status_is_tried_before_focus() {
+        let mut items = [FakeItem::new("甲"), FakeItem::new("乙")];
+        items[0].focus = true;
+        items[1].selected = true;
+        assert_eq!(pick_candidate(&items, None, None).unwrap(),
+            ("乙".to_string(), 2, "selection-item"));
+    }
+
+    #[test]
+    fn legacy_selection_is_tried_before_focus() {
+        let mut items = [FakeItem::new("甲"), FakeItem::new("乙")];
+        items[0].focus = true;
+        items[1].legacy_selected = true;
+        assert_eq!(pick_candidate(&items, None, None).unwrap().2, "legacy-selected");
+    }
+
+    #[test]
+    fn keyboard_focus_is_tried_before_legacy_focus() {
+        let mut items = [FakeItem::new("甲"), FakeItem::new("乙")];
+        items[0].legacy_focus = true;
+        items[1].focus = true;
+        assert_eq!(pick_candidate(&items, None, None).unwrap(),
+            ("乙".to_string(), 2, "keyboard-focus"));
+    }
+
+    #[test]
+    fn first_fallback_uses_first_non_empty_name() {
+        let items = [FakeItem { name: None, ..FakeItem::new("ignored") }, FakeItem::new("乙")];
+        assert_eq!(pick_candidate(&items, None, None).unwrap(),
+            ("乙".to_string(), 2, "first-fallback"));
+        let items = [FakeItem { name: None, ..FakeItem::new("ignored") }];
+        assert!(pick_candidate(&items, None, None).is_none());
+    }
+
+    #[test]
+    fn sanitize_english_normalizes_and_rejects() {
+        assert_eq!(sanitize_english("  “Hello,   world”  ").as_deref(), Some("Hello, world"));
+        assert_eq!(sanitize_english("你好"), None);
+        assert_eq!(sanitize_english("   "), None);
+        assert_eq!(sanitize_english(&"a".repeat(200)).unwrap().chars().count(), 170);
+    }
+
+    #[test]
+    fn has_han_detects_chinese_only() {
+        assert!(has_han("拼音"));
+        assert!(!has_han("pinyin"));
+    }
+
+    #[test]
+    fn urls_require_https_or_loopback_http() {
+        assert!(allowed_url("https://api.example.com/x"));
+        assert!(allowed_url("http://127.0.0.1:8080/x"));
+        assert!(allowed_url("http://localhost:1234/x"));
+        assert!(!allowed_url("http://example.com/x"));
+        assert!(!is_loopback_http("https://127.0.0.1:8080/x"));
+    }
+
+    #[test]
+    fn error_captions_map_transport_http_and_credentials() {
+        assert_eq!(error_caption("TRANSPORT_Timeout", "openai"), "网络连接失败");
+        assert_eq!(error_caption("HTTP_429", "openai"), "翻译服务繁忙");
+        assert_eq!(error_caption("HTTP_401", "openai"), "翻译密钥无效");
+        assert_eq!(error_caption("HTTP_403", "bing"), "Bing 接口拒绝访问");
+        assert_eq!(error_caption("HTTP_500", "azure"), "翻译服务异常");
+        assert_eq!(error_caption("garbage", "off"), "翻译失败");
+    }
 }
