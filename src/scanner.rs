@@ -22,6 +22,8 @@ pub struct Candidate {
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanReport {
+    pub examined: usize,
+    pub candidate_hints: String,
     pub candidate: Option<Candidate>,
     pub top_windows: usize,
     pub child_windows: usize,
@@ -35,7 +37,7 @@ pub struct ScanReport {
 struct Enumerated {
     top: usize,
     children: usize,
-    handles: Vec<isize>,
+    handles: Vec<(isize, i32, i32)>,
 }
 
 unsafe extern "system" fn child_cb(hwnd: HWND, param: LPARAM) -> i32 {
@@ -73,7 +75,7 @@ fn add_candidate_hwnd(hwnd: HWND, state: &mut Enumerated) {
         let height = bounds.bottom - bounds.top;
         // Ignore invisible, zero-area and unusually large UWP application windows.
         if !(80..=2800).contains(&width) || !(20..=850).contains(&height) { return; }
-        state.handles.push(hwnd as isize);
+        state.handles.push((hwnd as isize, width, height));
     }
 }
 
@@ -81,7 +83,13 @@ fn enumerate_hwnds() -> Enumerated {
     let mut state = Enumerated::default();
     unsafe { EnumWindows(Some(top_cb), &mut state as *mut _ as isize); }
     let mut dedup = HashSet::new();
-    state.handles.retain(|h| dedup.insert(*h));
+    state.handles.retain(|(hwnd, _, _)| dedup.insert(*hwnd));
+    // First inspect short/wide IME-looking CoreWindows, not unrelated UWP surfaces.
+    // Win10 19045 validated candidate is a CoreWindow approx 1383x80 pixels.
+    state.handles.sort_by_key(|(_, width, height)| {
+        let likely_ime = (45..=210).contains(height) && *width >= 80;
+        (!likely_ime, *height, *width)
+    });
     state
 }
 
@@ -150,7 +158,11 @@ pub fn scan(uia: &UIAutomation, walker: &UITreeWalker) -> ScanReport {
         ..ScanReport::default()
     };
     // Limit UIA calls, which can cross process boundaries and be slow.
-    for handle in all.handles.iter().take(32) {
+    report.candidate_hints = all.handles.iter().take(8)
+        .map(|(hwnd, width, height)| format!("0x{:X}({}x{})", hwnd, width, height))
+        .collect::<Vec<_>>().join(" ");
+    for (handle, _, _) in all.handles.iter().take(64) {
+        report.examined += 1;
         report.uia_checked += 1;
         let root = match uia.element_from_handle(Handle::from(*handle)) {
             Ok(root) => root,

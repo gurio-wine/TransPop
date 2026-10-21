@@ -25,14 +25,15 @@ use windows_sys::Win32::{
         DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
     },
     System::LibraryLoader::GetModuleHandleW,
+    UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT},
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetMessageW, GetSystemMetrics, PostQuitMessage,
+        GetMessageW, GetSystemMetrics, FindWindowW, PostMessageW, PostQuitMessage,
         RegisterClassW, SetLayeredWindowAttributes, SetProcessDPIAware, SetTimer,
         SetWindowPos, ShowWindow, TranslateMessage, WNDCLASSW, MSG,
         HWND_TOPMOST, LWA_ALPHA, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
         SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOWNOACTIVATE,
-        SWP_NOACTIVATE, SWP_SHOWWINDOW, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND,
+        SWP_NOACTIVATE, SWP_SHOWWINDOW, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY,
         WM_NCHITTEST, WM_PAINT, WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE,
         WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     },
@@ -41,6 +42,7 @@ use windows_sys::Win32::{
 const WIDTH: i32 = 392;
 const HEIGHT: i32 = 102;
 const TICK_ID: usize = 1;
+const EXIT_HOTKEY_ID: i32 = 0x3452;
 const TICK_MS: u32 = 150;
 
 static RECEIVER: OnceLock<Mutex<mpsc::Receiver<ScanReport>>> = OnceLock::new();
@@ -103,10 +105,10 @@ fn spawn_scanner(sender: mpsc::Sender<ScanReport>) {
             if last_log.elapsed() >= Duration::from_secs(5) {
                 // Do NOT log candidate text: it can include private information.
                 log_status(&format!(
-                    "scan: top={} child={} plausible={} uia={} errors={} panels={} found={} elapsed_ms={}",
+                    "scan: top={} child={} plausible={} uia={} errors={} panels={} found={} elapsed_ms={} likely_hwnds=[{}]",
                     report.top_windows, report.child_windows, report.core_windows,
                     report.uia_checked, report.uia_errors, report.panels,
-                    report.candidate.is_some(), start.elapsed().as_millis()
+                    report.candidate.is_some(), start.elapsed().as_millis(), report.candidate_hints
                 ));
                 last_log = Instant::now();
             }
@@ -222,22 +224,36 @@ unsafe fn draw_text(dc: windows_sys::Win32::Graphics::Gdi::HDC, s: &str, mut rec
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match msg {
         WM_TIMER if w == TICK_ID => { unsafe { update(hwnd) }; 0 }
+        WM_HOTKEY if w == EXIT_HOTKEY_ID as usize => { log_status("exit: Ctrl+Alt+Q hotkey"); unsafe { DestroyWindow(hwnd) }; 0 }
         WM_PAINT => { unsafe { paint(hwnd) }; 0 }
         WM_ERASEBKGND => 1,
         WM_NCHITTEST => -1, // HTTRANSPARENT: don't steal mouse input from the IME.
         WM_CLOSE => { unsafe { DestroyWindow(hwnd) }; 0 }
-        WM_DESTROY => { log_status("window: WM_DESTROY received"); unsafe { PostQuitMessage(0) }; 0 }
+        WM_DESTROY => {
+            log_status("window: WM_DESTROY received");
+            unsafe { UnregisterHotKey(hwnd, EXIT_HOTKEY_ID); PostQuitMessage(0) };
+            0
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, w, l) },
     }
 }
 
 fn main() {
+    // `--quit` closes the already-running background copy without Task Manager.
+    if std::env::args().any(|arg| arg == "--quit" || arg == "--exit") {
+        let class_name = wide("TransPopBubbleRust");
+        unsafe {
+            let hwnd = FindWindowW(class_name.as_ptr(), ptr::null());
+            if !hwnd.is_null() { PostMessageW(hwnd, WM_CLOSE, 0, 0); }
+        }
+        return;
+    }
     let debug = std::env::args().any(|arg| arg == "--debug");
     STARTED.set(Instant::now()).ok();
     STATE.set(Mutex::new(State {
         debug,
         text: "等待微软拼音候选…".into(),
-        status: "正在扫描输入法窗口…".into(),
+        status: "扫描启动中 · Ctrl+Alt+Q 退出".into(),
         ..State::default()
     })).ok();
     let (sender, receiver) = mpsc::channel();
@@ -245,7 +261,7 @@ fn main() {
     std::panic::set_hook(Box::new(|info| {
         log_status(&format!("PANIC: {info}"));
     }));
-    log_status(&format!("---- TransPop v0.6.4 start | debug={} ----", debug));
+    log_status(&format!("---- TransPop v0.6.6 start | debug={} ----", debug));
 
     unsafe {
         // Match the physical coordinates returned by UIA even at non-100% display scaling.
@@ -272,6 +288,11 @@ fn main() {
         if window.is_null() {
             log_status("ERROR: CreateWindowExW failed");
             return;
+        }
+        // Do not launch duplicate background copies.
+        // Exit via Ctrl+Alt+Q or `TransPop.exe --quit`.
+        if RegisterHotKey(window, EXIT_HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'Q' as u32) == 0 {
+            log_status("WARN: Ctrl+Alt+Q global exit hotkey unavailable; --quit still works");
         }
         SetLayeredWindowAttributes(window, 0, 248, LWA_ALPHA);
         let region = CreateRoundRectRgn(0, 0, WIDTH, HEIGHT, 25, 25);

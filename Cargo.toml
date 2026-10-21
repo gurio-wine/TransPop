@@ -1,6 +1,6 @@
 [package]
 name = "transpop"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2024"
 description = "Minimal Microsoft Pinyin candidate preview bubble for Windows 10/11"
 license = "MIT"
@@ -10,6 +10,7 @@ uiautomation = { version = "=0.25.1", default-features = false, features = ["inp
 windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
+  "Win32_UI_Input_KeyboardAndMouse",
   "Win32_System_LibraryLoader",
   "Win32_UI_WindowsAndMessaging",
 ] }
