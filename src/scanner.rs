@@ -1,14 +1,17 @@
-//! Native HWND discovery + Microsoft UI Automation Raw View candidate reading.
-//! Everything in this module runs on a dedicated MTA thread. COM objects never cross threads.
-use std::{collections::HashSet, mem};
+//! Locate the Microsoft Pinyin candidate HWND, then inspect its UIA Raw View.
+//! Runs only on the scanner thread: do not send COM elements across threads.
+use std::{collections::{HashSet, VecDeque}, mem};
 
 use uiautomation::{
     core::{UIAutomation, UIElement, UITreeWalker},
     types::{ControlType, Handle},
 };
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, RECT},
-    UI::WindowsAndMessaging::{EnumChildWindows, EnumWindows, GetClassNameW, GetWindowRect, IsWindowVisible},
+    Foundation::{HWND, LPARAM, POINT, RECT},
+    UI::WindowsAndMessaging::{
+        ClientToScreen, EnumChildWindows, EnumWindows, GetClassNameW, GetGUIThreadInfo,
+        GetWindowRect, IsWindowVisible, WindowFromPoint, GUITHREADINFO,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -28,68 +31,123 @@ pub struct ScanReport {
     pub top_windows: usize,
     pub child_windows: usize,
     pub core_windows: usize,
+    pub core_seen: usize,
+    pub core_visible: usize,
+    pub caret_available: bool,
+    pub caret_hits: usize,
     pub uia_checked: usize,
     pub uia_errors: usize,
     pub panels: usize,
+    pub offscreen_panels: usize,
+}
+
+#[derive(Clone)]
+struct Probe {
+    hwnd: isize,
+    width: i32,
+    height: i32,
+    visible: bool,
+    from_caret: bool,
 }
 
 #[derive(Default)]
 struct Enumerated {
     top: usize,
     children: usize,
-    handles: Vec<(isize, i32, i32)>,
+    core_seen: usize,
+    core_visible: usize,
+    caret_available: bool,
+    caret_hits: usize,
+    handles: Vec<Probe>,
+}
+
+fn class_name(hwnd: HWND) -> Option<String> {
+    unsafe {
+        let mut buffer = [0_u16; 192];
+        let n = GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+        if n <= 0 { return None; }
+        Some(String::from_utf16_lossy(&buffer[..n as usize]))
+    }
+}
+
+fn is_ime_host_class(class: &str) -> bool {
+    class == "Windows.UI.Core.CoreWindow" || class.contains("Candidate") || class.contains("IME")
+}
+
+fn append_handle(hwnd: HWND, state: &mut Enumerated, from_caret: bool) {
+    if hwnd.is_null() { return; }
+    let Some(class) = class_name(hwnd) else { return; };
+    if !is_ime_host_class(&class) { return; }
+    let is_core = class == "Windows.UI.Core.CoreWindow";
+    let visible = unsafe { IsWindowVisible(hwnd) != 0 };
+    // For diagnostics, count matching windows *before* applying any geometric/visible filter.
+    if !from_caret && is_core {
+        state.core_seen += 1;
+        if visible { state.core_visible += 1; }
+    }
+    let mut rect: RECT = unsafe { mem::zeroed() };
+    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 { return; }
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    // Do not silently discard a genuine IME HWND based on width, height or visibility.
+    // The UIA pane itself will later be validated by its AutomationId and bounds.
+    state.handles.push(Probe {
+        hwnd: hwnd as isize, width, height, visible, from_caret,
+    });
 }
 
 unsafe extern "system" fn child_cb(hwnd: HWND, param: LPARAM) -> i32 {
-    // The parameter points into a Vec that lives for the duration of EnumChildWindows.
     let state = unsafe { &mut *(param as *mut Enumerated) };
     state.children += 1;
-    add_candidate_hwnd(hwnd, state);
+    append_handle(hwnd, state, false);
     1
 }
 
 unsafe extern "system" fn top_cb(hwnd: HWND, param: LPARAM) -> i32 {
     let state = unsafe { &mut *(param as *mut Enumerated) };
     state.top += 1;
-    add_candidate_hwnd(hwnd, state);
-    // Crucial for Win10: TextInputHost's CoreWindow is nested below ApplicationFrameWindow.
-    // EnumWindows alone cannot find this nested HWND.
+    append_handle(hwnd, state, false);
     unsafe { EnumChildWindows(hwnd, Some(child_cb), param); }
     1
 }
 
-fn add_candidate_hwnd(hwnd: HWND, state: &mut Enumerated) {
+fn add_near_caret_windows(state: &mut Enumerated) {
+    // An independent fallback: query windows near the *typing caret*, not the mouse.
+    // Useful if modern TextInputHost windows are missed by regular enumeration.
     unsafe {
-        if IsWindowVisible(hwnd) == 0 { return; }
-        let mut buffer = [0_u16; 192];
-        let n = GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
-        if n <= 0 { return; }
-        let class = String::from_utf16_lossy(&buffer[..n as usize]);
-        // Known Win10 Microsoft Pinyin host and possible other IME host classes.
-        if !(class == "Windows.UI.Core.CoreWindow"
-            || class.contains("Candidate")
-            || class.contains("IME")) { return; }
-        let mut bounds: RECT = mem::zeroed();
-        if GetWindowRect(hwnd, &mut bounds) == 0 { return; }
-        let width = bounds.right - bounds.left;
-        let height = bounds.bottom - bounds.top;
-        // Ignore invisible, zero-area and unusually large UWP application windows.
-        if !(80..=2800).contains(&width) || !(20..=850).contains(&height) { return; }
-        state.handles.push((hwnd as isize, width, height));
+        let mut info: GUITHREADINFO = mem::zeroed();
+        info.cbSize = mem::size_of::<GUITHREADINFO>() as u32;
+        if GetGUIThreadInfo(0, &mut info) == 0 || info.hwndCaret.is_null() { return; }
+        let mut point = POINT { x: info.rcCaret.left, y: info.rcCaret.bottom };
+        if ClientToScreen(info.hwndCaret, &mut point) == 0 { return; }
+        state.caret_available = true;
+        // Candidate list can appear below or above the caret. Sample its likely area.
+        // No cursor movement, hooks or keystroke monitoring are involved.
+        for dy in [-115, -75, -35, 9, 27, 47, 67, 93] {
+            for dx in [12, 48, 125, 250] {
+                let hwnd = WindowFromPoint(POINT { x: point.x + dx, y: point.y + dy });
+                if hwnd.is_null() { continue; }
+                if class_name(hwnd).as_deref().is_some_and(is_ime_host_class) {
+                    state.caret_hits += 1;
+                    append_handle(hwnd, state, true);
+                }
+            }
+        }
     }
 }
 
 fn enumerate_hwnds() -> Enumerated {
     let mut state = Enumerated::default();
     unsafe { EnumWindows(Some(top_cb), &mut state as *mut _ as isize); }
-    let mut dedup = HashSet::new();
-    state.handles.retain(|(hwnd, _, _)| dedup.insert(*hwnd));
-    // First inspect short/wide IME-looking CoreWindows, not unrelated UWP surfaces.
-    // Win10 19045 validated candidate is a CoreWindow approx 1383x80 pixels.
-    state.handles.sort_by_key(|(_, width, height)| {
-        let likely_ime = (45..=210).contains(height) && *width >= 80;
-        (!likely_ime, *height, *width)
+    add_near_caret_windows(&mut state);
+    let mut seen = HashSet::new();
+    // Prefer a real visible host found next to the typing caret. Next prefer
+    // visible IME-sized windows, then other CoreWindows for diagnostic inspection.
+    state.handles.sort_by_key(|h| {
+        let typical = (32..=300).contains(&h.height) && h.width >= 80;
+        (!h.from_caret, !h.visible, !typical, h.height, h.width)
     });
+    state.handles.retain(|h| seen.insert(h.hwnd));
     state
 }
 
@@ -98,33 +156,28 @@ fn is_panel(id: &str) -> bool {
 }
 
 fn list_item_first(panel: &UIElement, walker: &UITreeWalker) -> Option<String> {
-    // In the user's Win10 v0.3 trace, candidates are direct ListItem children
-    // of IME_Prediction_Window. Keep that order: item 1 is the first candidate.
-    if let Some(children) = walker.get_children(panel) {
-        for child in &children {
-            if child.get_control_type().ok() == Some(ControlType::ListItem) {
-                if let Ok(s) = child.get_name() {
-                    if !s.trim().is_empty() { return Some(s); }
-                }
-                // Some IMEs place candidate text in a nested TextBlock.
-                if let Some(grandchildren) = walker.get_children(child) {
-                    for grandchild in grandchildren {
-                        if grandchild.get_automation_id().unwrap_or_default()
-                            == "TEMPLATE_PART_CandidateItemText" {
-                            if let Ok(s) = grandchild.get_name() {
-                                if !s.trim().is_empty() { return Some(s); }
-                            }
+    // The confirmed Windows 10 host exposes first candidate as the first ListItem.
+    let children = walker.get_children(panel)?;
+    for child in &children {
+        if child.get_control_type().ok() == Some(ControlType::ListItem) {
+            if let Ok(text) = child.get_name() {
+                if !text.trim().is_empty() { return Some(text); }
+            }
+            if let Some(grandchildren) = walker.get_children(child) {
+                for g in grandchildren {
+                    if g.get_automation_id().unwrap_or_default() == "TEMPLATE_PART_CandidateItemText" {
+                        if let Ok(text) = g.get_name() {
+                            if !text.trim().is_empty() { return Some(text); }
                         }
                     }
                 }
             }
         }
-        // Fallback: UIA providers that expose a candidate TextBlock but not ListItem.
-        for child in &children {
-            if child.get_automation_id().unwrap_or_default() == "TEMPLATE_PART_CandidateItemText" {
-                if let Ok(s) = child.get_name() {
-                    if !s.trim().is_empty() { return Some(s); }
-                }
+    }
+    for child in &children {
+        if child.get_automation_id().unwrap_or_default() == "TEMPLATE_PART_CandidateItemText" {
+            if let Ok(text) = child.get_name() {
+                if !text.trim().is_empty() { return Some(text); }
             }
         }
     }
@@ -132,12 +185,11 @@ fn list_item_first(panel: &UIElement, walker: &UITreeWalker) -> Option<String> {
 }
 
 fn find_panel(root: &UIElement, walker: &UITreeWalker) -> Option<UIElement> {
-    // BFS limited to 5 levels and 96 nodes; never traverse the whole desktop UIA tree.
-    let mut queue = std::collections::VecDeque::from([(root.clone(), 0_usize)]);
+    let mut queue = VecDeque::from([(root.clone(), 0_usize)]);
     let mut visited = 0;
     while let Some((node, depth)) = queue.pop_front() {
         visited += 1;
-        if visited > 96 { break; }
+        if visited > 128 { break; }
         if let Ok(id) = node.get_automation_id() {
             if is_panel(&id) { return Some(node); }
         }
@@ -155,28 +207,35 @@ pub fn scan(uia: &UIAutomation, walker: &UITreeWalker) -> ScanReport {
         top_windows: all.top,
         child_windows: all.children,
         core_windows: all.handles.len(),
+        core_seen: all.core_seen,
+        core_visible: all.core_visible,
+        caret_available: all.caret_available,
+        caret_hits: all.caret_hits,
         ..ScanReport::default()
     };
-    // Limit UIA calls, which can cross process boundaries and be slow.
-    report.candidate_hints = all.handles.iter().take(8)
-        .map(|(hwnd, width, height)| format!("0x{:X}({}x{})", hwnd, width, height))
+    report.candidate_hints = all.handles.iter().take(10)
+        .map(|h| format!("0x{:X}({}x{},{},{})", h.hwnd, h.width, h.height,
+            if h.visible { "V" } else { "H" }, if h.from_caret { "caret" } else { "enum" }))
         .collect::<Vec<_>>().join(" ");
-    for (handle, _, _) in all.handles.iter().take(64) {
+    // Inspect only visible hosts; retain hidden hosts in stats for diagnosis.
+    for probe in all.handles.iter().filter(|p| p.visible).take(96) {
         report.examined += 1;
         report.uia_checked += 1;
-        let root = match uia.element_from_handle(Handle::from(*handle)) {
+        let root = match uia.element_from_handle(Handle::from(probe.hwnd)) {
             Ok(root) => root,
             Err(_) => { report.uia_errors += 1; continue; }
         };
         let Some(panel) = find_panel(&root, walker) else { continue; };
         report.panels += 1;
-        if panel.is_offscreen().unwrap_or(false) { continue; }
+        if panel.is_offscreen().unwrap_or(false) {
+            report.offscreen_panels += 1;
+            continue;
+        }
         let Some(text) = list_item_first(&panel, walker) else { continue; };
         let Ok(rect) = panel.get_bounding_rectangle() else { continue; };
-        let left = rect.get_left();
-        let top = rect.get_top();
-        let right = rect.get_right();
-        let bottom = rect.get_bottom();
+        let (left, top, right, bottom) = (
+            rect.get_left(), rect.get_top(), rect.get_right(), rect.get_bottom(),
+        );
         if right <= left || bottom <= top { continue; }
         report.candidate = Some(Candidate {
             text: text.chars().take(120).collect(), x: left, y: top, right, bottom,

@@ -105,9 +105,10 @@ fn spawn_scanner(sender: mpsc::Sender<ScanReport>) {
             if last_log.elapsed() >= Duration::from_secs(5) {
                 // Do NOT log candidate text: it can include private information.
                 log_status(&format!(
-                    "scan: top={} child={} plausible={} uia={} errors={} panels={} found={} elapsed_ms={} likely_hwnds=[{}]",
+                    "scan: top={} child={} hosts={} core_seen={} core_visible={} caret={} caret_hits={} uia={} errors={} panels={} offscreen={} found={} elapsed_ms={} likely_hwnds=[{}]",
                     report.top_windows, report.child_windows, report.core_windows,
-                    report.uia_checked, report.uia_errors, report.panels,
+                    report.core_seen, report.core_visible, report.caret_available, report.caret_hits,
+                    report.uia_checked, report.uia_errors, report.panels, report.offscreen_panels,
                     report.candidate.is_some(), start.elapsed().as_millis(), report.candidate_hints
                 ));
                 last_log = Instant::now();
@@ -120,9 +121,9 @@ fn spawn_scanner(sender: mpsc::Sender<ScanReport>) {
 
 fn fmt_status(report: &ScanReport) -> String {
     format!(
-        "Top {} | Child {} | Core {} | UIA {} | Panel {} | Err {}",
-        report.top_windows, report.child_windows, report.core_windows,
-        report.uia_checked, report.panels, report.uia_errors
+        "Top {} | Core {} | UIA {} | Panel {} | Caret {}",
+        report.top_windows, report.core_seen,
+        report.uia_checked, report.panels, report.caret_hits
     )
 }
 
@@ -261,7 +262,7 @@ fn main() {
     std::panic::set_hook(Box::new(|info| {
         log_status(&format!("PANIC: {info}"));
     }));
-    log_status(&format!("---- TransPop v0.6.6 start | debug={} ----", debug));
+    log_status(&format!("---- TransPop v0.6.7 start | debug={} ----", debug));
 
     unsafe {
         // Match the physical coordinates returned by UIA even at non-100% display scaling.
