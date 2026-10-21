@@ -4,9 +4,12 @@
 mod settings;
 mod startup;
 
-// TransPop v0.6.5: event-first selected IME candidate -> asynchronous English translation.
+/// Single source of truth for every version string in logs and CLI output.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// TransPop: event-first selected IME candidate -> asynchronous English translation.
 // Windows 10/11 Microsoft Pinyin -> WinEvent -> targeted UIA -> translation -> bubble.
-// No desktop scanning, mouse position sampling, keyboard hooks, or text injection.
+// No desktop scanning. Optional, opt-in Alt text output uses a guarded keyboard hook.
 
 use std::{
     collections::HashMap,
@@ -50,6 +53,8 @@ use windows_sys::Win32::{
         },
         Input::KeyboardAndMouse::{
             RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
+            GetAsyncKeyState, SendInput, INPUT, INPUT_0, KEYBDINPUT, INPUT_KEYBOARD,
+            KEYEVENTF_UNICODE, KEYEVENTF_KEYUP, VK_LMENU, VK_RMENU, VK_CONTROL, VK_SHIFT, VK_ESCAPE,
         },
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
@@ -70,7 +75,10 @@ use windows_sys::Win32::{
             TPM_RETURNCMD, TPM_RIGHTBUTTON, WINEVENT_OUTOFCONTEXT,
             WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CONTEXTMENU, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
             WM_NULL, WM_RBUTTONUP,
-            WM_HOTKEY, WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+            WM_HOTKEY, WM_TIMER, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+            SetWindowsHookExW, UnhookWindowsHookEx, CallNextHookEx, WH_KEYBOARD_LL,
+            KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+            WS_EX_LAYERED, WS_EX_NOACTIVATE,
             WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
         },
     },
@@ -149,6 +157,9 @@ const WM_APP_SETTINGS: u32 = WM_APP + 23;
 const TRAY_MENU_EXIT: u32 = 3002;
 const TIMER_ID: usize = 1;
 const EXIT_HOTKEY_ID: i32 = 0x4341;
+const GCS_COMPSTR: u32 = 0x0008;
+// Keep a generous window for a physically tapped left Alt; held keys never fire.
+const ALT_TAP_MAX: Duration = Duration::from_millis(500);
 
 static START: OnceLock<Instant> = OnceLock::new();
 static LOG_TX: OnceLock<Sender<LogRecord>> = OnceLock::new();
@@ -161,9 +172,16 @@ static CANDIDATE_EPOCH: AtomicU64 = AtomicU64::new(0);
 static TRANSLATION_SERIAL: AtomicU64 = AtomicU64::new(0);
 static CONFIG_REVISION: AtomicU64 = AtomicU64::new(0);
 static CONFIG_ENABLED: AtomicBool = AtomicBool::new(false);
+static ALT_OUTPUT_ENABLED: AtomicBool = AtomicBool::new(false);
+static READY_TRANSLATION: OnceLock<Mutex<Option<ReadyTranslation>>> = OnceLock::new();
+static ALT_GESTURE: OnceLock<Mutex<AltGesture>> = OnceLock::new();
+static PENDING_COMMIT: OnceLock<Mutex<Option<PendingCommit>>> = OnceLock::new();
+static PHYSICAL_KEY_EVENTS: AtomicU64 = AtomicU64::new(0);
 // Candidate text can change in-place without any WinEvent. While the menu
 // is open, recheck ONLY the already identified CoreWindow (never the desktop).
 static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+// Only a matched IME panel MenuClosed event confirms the Escape transition.
+static IME_MENU_CLOSE_SEQ: AtomicU64 = AtomicU64::new(0);
 // Pausing never changes the IME or intercepts keystrokes. Network responses
 // that were already in flight are ignored after pause.
 static TRANSLATION_PAUSED: AtomicBool = AtomicBool::new(false);
@@ -180,6 +198,243 @@ const ACTIVE_RECHECK_WAKE: Duration = Duration::from_millis(40);
 // Bound diagnostics for unattended sessions; keep at most two 2 MiB files.
 const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const HEALTH_INTERVAL: Duration = Duration::from_secs(60);
+
+// None of these structures exposes typed characters, clipboard contents, or keys
+// in logs. The keyboard callback only recognizes an isolated physical LAlt tap.
+#[derive(Clone)]
+struct ReadyTranslation {
+    text: String, foreground: usize, epoch: u64, serial: u64,
+}
+#[derive(Default)]
+struct AltGesture { down: Option<Instant>, chord: bool }
+struct PendingCommit {
+    translation: ReadyTranslation, focus: usize, started: Instant, stage: u8,
+    input_generation: u64,
+    menu_close_before: u64,
+    closed_since: Option<Instant>,
+}
+fn ready_slot() -> &'static Mutex<Option<ReadyTranslation>> {
+    READY_TRANSLATION.get_or_init(|| Mutex::new(None))
+}
+fn clear_ready_translation() {
+    if let Ok(mut r) = ready_slot().lock() { *r = None; }
+}
+fn commit_slot() -> &'static Mutex<Option<PendingCommit>> {
+    PENDING_COMMIT.get_or_init(|| Mutex::new(None))
+}
+fn cancel_pending_commit() {
+    if let Ok(mut slot) = commit_slot().lock() { *slot = None; }
+}
+fn cancel_pending_unless_cancel_sent() {
+    if let Ok(mut slot) = commit_slot().lock() {
+        if slot.as_ref().is_none_or(|p| p.stage != 1) { *slot = None; }
+    }
+}
+
+// TSF-based Microsoft Pinyin commonly exposes no composition through a
+// cross-process IMM32 context. Use this only as an additional veto if it
+// DOES report a nonempty composition; never infer success from its absence.
+#[link(name = "imm32")]
+extern "system" {
+    fn ImmGetContext(hwnd: HWND) -> *mut std::ffi::c_void;
+    fn ImmReleaseContext(hwnd: HWND, himc: *mut std::ffi::c_void) -> i32;
+    fn ImmGetCompositionStringW(himc: *mut std::ffi::c_void, index: u32,
+        buffer: *mut std::ffi::c_void, length: u32) -> i32;
+}
+
+#[repr(C)]
+struct FocusInfo {
+    size: u32, flags: u32, active: HWND, focus: HWND, capture: HWND,
+    menu_owner: HWND, move_size: HWND, caret: HWND, caret_rect: RECT,
+}
+#[link(name = "user32")]
+extern "system" {
+    fn GetGUIThreadInfo(thread: u32, info: *mut FocusInfo) -> i32;
+    fn GetWindowThreadProcessId(hwnd: HWND, process: *mut u32) -> u32;
+}
+fn focused_window(foreground: usize) -> usize {
+    if foreground == 0 || unsafe { GetForegroundWindow() } as usize != foreground { return 0; }
+    unsafe {
+        let thread = GetWindowThreadProcessId(foreground as HWND, ptr::null_mut());
+        if thread == 0 { return 0; }
+        let mut info: FocusInfo = mem::zeroed();
+        info.size = mem::size_of::<FocusInfo>() as u32;
+        if GetGUIThreadInfo(thread, &mut info) == 0 { return 0; }
+        // Never insert into a native menu opened by the original Alt press.
+        if info.flags & 0x0004 != 0 { return 0; }
+        info.focus as usize
+    }
+}
+fn composition_length(focus: usize) -> Option<i32> {
+    if focus == 0 { return None; }
+    unsafe {
+        let imc = ImmGetContext(focus as HWND);
+        if imc.is_null() { return None; }
+        let count = ImmGetCompositionStringW(imc, GCS_COMPSTR, ptr::null_mut(), 0);
+        ImmReleaseContext(focus as HWND, imc);
+        if count < 0 { None } else { Some(count) }
+    }
+}
+fn send_escape_key() -> bool {
+    // Microsoft Pinyin documents Escape as discarding the uncommitted
+    // candidate composition, unlike Enter/Space which may commit input.
+    // Do not try to delete committed text with Backspace, Ctrl+A or similar.
+    let keys = [
+        INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 {
+            ki: KEYBDINPUT { wVk: VK_ESCAPE as u16, wScan: 0, dwFlags: 0,
+                time: 0, dwExtraInfo: 0 },
+        }},
+        INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 {
+            ki: KEYBDINPUT { wVk: VK_ESCAPE as u16, wScan: 0,
+                dwFlags: KEYEVENTF_KEYUP, time: 0, dwExtraInfo: 0 },
+        }},
+    ];
+    unsafe { SendInput(2, keys.as_ptr(), mem::size_of::<INPUT>() as i32) == 2 }
+}
+fn still_eligible(info: &ReadyTranslation, focus: usize, require_menu: bool) -> bool {
+    ALT_OUTPUT_ENABLED.load(Ordering::Acquire)
+        && !TRANSLATION_PAUSED.load(Ordering::Acquire)
+        && CONFIG_ENABLED.load(Ordering::Acquire)
+        && info.epoch == CANDIDATE_EPOCH.load(Ordering::Acquire)
+        && info.serial == TRANSLATION_SERIAL.load(Ordering::Acquire)
+        && (!require_menu || MENU_OPEN.load(Ordering::Acquire))
+        && info.foreground != 0 && focused_window(info.foreground) == focus
+}
+fn send_unicode_text(text: &str) -> bool {
+    if text.is_empty() || text.encode_utf16().count() > 1024 { return false; }
+    // Scan-code Unicode KEYBDINPUT, not clipboard and not VK-based typing.
+    let mut input = Vec::<INPUT>::new();
+    for unit in text.encode_utf16() {
+        for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
+            input.push(INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 {
+                ki: KEYBDINPUT { wVk: 0, wScan: unit, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+            }});
+        }
+    }
+    unsafe { SendInput(input.len() as u32, input.as_ptr(), mem::size_of::<INPUT>() as i32) == input.len() as u32 }
+}
+
+fn process_alt_commit() {
+    let action = {
+        let Ok(mut slot) = commit_slot().lock() else { return; };
+        slot.take()
+    };
+    let Some(mut action) = action else { return; };
+    // Never react to held modifiers, additional real keyboard input, a
+    // changed focus or a late translation. The injected Escape is marked
+    // LLKHF_INJECTED and deliberately excluded from PHYSICAL_KEY_EVENTS.
+    if action.started.elapsed() > Duration::from_millis(if action.stage == 0 { 650 } else { 850 })
+        || action.input_generation != PHYSICAL_KEY_EVENTS.load(Ordering::Acquire)
+        || [VK_LMENU, VK_RMENU, VK_CONTROL, VK_SHIFT].iter()
+            .any(|&key| unsafe { GetAsyncKeyState(key as i32) } < 0) {
+        log_global("ALT_COMMIT_ABORT modifier_or_timeout");
+        return;
+    }
+    let valid = if action.stage == 0 {
+        still_eligible(&action.translation, action.focus, true)
+    } else {
+        ALT_OUTPUT_ENABLED.load(Ordering::Acquire)
+            && !TRANSLATION_PAUSED.load(Ordering::Acquire)
+            && CONFIG_ENABLED.load(Ordering::Acquire)
+            && focused_window(action.translation.foreground) == action.focus
+    };
+    if !valid {
+        log_global("ALT_COMMIT_ABORT focus_or_candidate_changed");
+        return;
+    }
+    if action.stage == 0 {
+        let close_before = IME_MENU_CLOSE_SEQ.load(Ordering::Acquire);
+        // Inject only after the real LAlt has been released and the IME menu
+        // was positively known open. If Escape cannot be delivered, stop.
+        if !send_escape_key() {
+            log_global("ALT_COMMIT_ABORT escape_send_failed");
+            return;
+        }
+        action.stage = 1;
+        action.menu_close_before = close_before;
+        action.closed_since = None;
+        action.started = Instant::now();
+        log_global("ALT_COMMIT_ESCAPE_SENT");
+    } else {
+        // The actual IME panel must report MenuClosed AFTER our Escape.
+        // An absent candidate window on its own is not enough to proceed.
+        let confirmed_closed = IME_MENU_CLOSE_SEQ.load(Ordering::Acquire)
+            > action.menu_close_before && !MENU_OPEN.load(Ordering::Acquire);
+        if !confirmed_closed {
+            // Another UIA event or an older on-going composition can reopen
+            // the panel. In that case, wait briefly and fail safely.
+            action.closed_since = None;
+        } else if action.closed_since.is_none() {
+            action.closed_since = Some(Instant::now());
+        } else if action.closed_since.is_some_and(|t| t.elapsed() >= Duration::from_millis(60)) {
+            // A positive IMM composition state vetoes insertion. A missing
+            // IMM state is normal for TSF; Microsoft Pinyin's documented Esc
+            // behavior + UIA MenuClosed are our (experimental) fallback.
+            if composition_length(action.focus).is_some_and(|n| n > 0) {
+                log_global("ALT_COMMIT_ABORT composition_still_present");
+                return;
+            }
+            // Do not recheck the old epoch: a successful cancellation itself
+            // closes the IME menu and intentionally invalidates that epoch.
+            if send_unicode_text(&action.translation.text) {
+                log_global("ALT_COMMIT_TEXT_SENT");
+                clear_ready_translation();
+            } else {
+                log_global("ALT_COMMIT_ABORT sendinput_failed");
+            }
+            return;
+        }
+    }
+    // Nonblocking continuation; timer revisits without busy-waiting.
+    if let Ok(mut slot) = commit_slot().lock() { *slot = Some(action); }
+}
+
+unsafe extern "system" fn alt_keyboard_callback(code: i32, wparam: usize, lparam: isize) -> isize {
+    if code >= 0 && lparam != 0 && ALT_OUTPUT_ENABLED.load(Ordering::Relaxed) {
+        let event = &*(lparam as *const KBDLLHOOKSTRUCT);
+        if event.flags & LLKHF_INJECTED == 0 {
+            let down = wparam == WM_KEYDOWN as usize || wparam == WM_SYSKEYDOWN as usize;
+            let up = wparam == WM_KEYUP as usize || wparam == WM_SYSKEYUP as usize;
+            if let Ok(mut g) = ALT_GESTURE.get_or_init(|| Mutex::new(AltGesture::default())).lock() {
+                if event.vkCode == VK_LMENU as u32
+                    || (event.vkCode == 0x12 && event.flags & 0x01 == 0) {
+                    if down && g.down.is_none() {
+                        g.down = Some(Instant::now());
+                        g.chord = [VK_CONTROL, VK_SHIFT, VK_RMENU].iter()
+                            .any(|&key| GetAsyncKeyState(key as i32) < 0);
+                    } else if up {
+                        let eligible_tap = g.down.take().is_some_and(|t| t.elapsed() < ALT_TAP_MAX)
+                            && !g.chord;
+                        g.chord = false;
+                        if eligible_tap {
+                            // The callback only stores a snapshot. All COM, IMM
+                            // and SendInput calls are deferred to the UI loop.
+                            if let Ok(ready) = ready_slot().try_lock() {
+                                if let Some(snapshot) = ready.clone() {
+                                    let focus = focused_window(snapshot.foreground);
+                                    if focus != 0 && still_eligible(&snapshot, focus, true) {
+                                        if let Ok(mut commit) = commit_slot().try_lock() {
+                                            *commit = Some(PendingCommit { translation: snapshot,
+                                                focus, started: Instant::now(), stage: 0,
+                                                input_generation: PHYSICAL_KEY_EVENTS.load(Ordering::Acquire),
+                                                menu_close_before: 0, closed_since: None });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if down {
+                    PHYSICAL_KEY_EVENTS.fetch_add(1, Ordering::AcqRel);
+                    if g.down.is_some() { g.chord = true; }
+                }
+            }
+        }
+    }
+    // Pass through ALL physical keys. This preserves Alt+Tab, Alt+F4, etc.
+    // Some applications will still activate their own menu on plain Alt.
+    CallNextHookEx(ptr::null_mut(), code, wparam, lparam)
+}
 
 #[derive(Clone, Debug)]
 struct NativeEvent {
@@ -261,7 +516,7 @@ struct TranslatorConfig {
 impl TranslatorConfig {
     fn load(base: &std::path::Path) -> Self {
         let path = base.join("translator.conf");
-        let sample = "# TransPop v0.6.0 translator settings (UTF-8); use tray Settings to apply without restart.\n\
+        let sample = "# TransPop translator settings (UTF-8); use tray Settings to apply without restart.\n\
 # provider=bing uses an undocumented Edge/Microsoft webpage endpoint; no API key.\n\
 # The Bing mode may change, block automated calls, or enforce rate limits without notice.\n\
 # Other choices: provider=azure or provider=openai; provider=off sends nothing.\n\
@@ -453,11 +708,16 @@ fn finish_translation(
     let mut candidate = req.candidate;
     match result {
         Ok(english) => {
+            if let Ok(mut slot) = ready_slot().lock() {
+                *slot = Some(ReadyTranslation { text: english.clone(), foreground: req.foreground,
+                    epoch: req.epoch, serial: req.serial });
+            }
             log_line(log_tx, format!("TRANSLATION_OK chars={} elapsed_ms={elapsed_ms}",
                 english.chars().count()));
             candidate.text = english;
         }
         Err(reason) => {
+            clear_ready_translation();
             log_line(log_tx, format!("TRANSLATION_ERROR reason={reason} elapsed_ms={elapsed_ms}"));
             candidate.text = error_caption(&reason, provider).to_string();
         }
@@ -738,6 +998,8 @@ fn set_paused(
     if TRANSLATION_PAUSED.swap(paused, Ordering::AcqRel) == paused { return; }
     // Advance both generations to invalidate pending UIA/network work, even
     // if the last translated candidate happened to have identical text.
+    clear_ready_translation();
+    cancel_pending_commit();
     let epoch = CANDIDATE_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
     TRANSLATION_SERIAL.fetch_add(1, Ordering::AcqRel);
     clear_selection_hint();
@@ -924,7 +1186,13 @@ fn selected_candidate(panel: &UIElement, all: &UICondition, hint: Option<&Select
     // This is critical when the user moves the IME highlight with Up/Down.
     for (i, item) in items.iter().enumerate() {
         if let Ok(selection) = item.get_pattern::<UISelectionItemPattern>() {
-            if selection.is_selected().unwrap_or(false) {
+            let selected = match selection.is_selected() {
+                Ok(value) => value,
+                // A UIA error is not "not selected": log it instead of silently
+                // falling through to a lower-confidence selection source.
+                Err(e) => { log_global(format!("UIA_IS_SELECTED_FAILED index={i} err={e}")); false }
+            };
+            if selected {
                 if let Ok(name) = item.get_name() {
                     if !name.trim().is_empty() {
                         return Ok(Some((name, i + 1, "selection-item")));
@@ -949,7 +1217,11 @@ fn selected_candidate(panel: &UIElement, all: &UICondition, hint: Option<&Select
         }
     }
     for (i, item) in items.iter().enumerate() {
-        if item.has_keyboard_focus().unwrap_or(false) {
+        let focused = match item.has_keyboard_focus() {
+            Ok(value) => value,
+            Err(e) => { log_global(format!("UIA_HAS_FOCUS_FAILED index={i} err={e}")); false }
+        };
+        if focused {
             if let Ok(name) = item.get_name() {
                 if !name.trim().is_empty() {
                     return Ok(Some((name, i + 1, "keyboard-focus")));
@@ -1171,6 +1443,8 @@ fn candidate_worker(
                 if changed {
                     if request.active_recheck { active_changes += 1; }
                     TRANSLATION_SERIAL.fetch_add(1, Ordering::AcqRel);
+                    clear_ready_translation();
+                    cancel_pending_commit();
                     last_key = Some(key);
                     log_line(&log_tx, format!("CANDIDATE_CHANGED chars={} epoch={} (content omitted)",
                         candidate.text.chars().count(), request.epoch));
@@ -1323,7 +1597,10 @@ fn uia_event_worker(
                     });
                 }
             } else if event == UIEventType::MenuClosed {
+                IME_MENU_CLOSE_SEQ.fetch_add(1, Ordering::AcqRel);
                 MENU_OPEN.store(false, Ordering::Release);
+                clear_ready_translation();
+                cancel_pending_unless_cancel_sent();
                 clear_selection_hint();
                 CONFIRMED_IME_HWND.store(0, Ordering::Release);
                 CONFIRMED_FOREGROUND.store(0, Ordering::Release);
@@ -1374,11 +1651,12 @@ fn log_worker(
             eprintln!("TransPop: cannot preserve previous log: {e}");
         }
     }
-    let file = match File::create(&path) {
-        Ok(value) => value,
-        Err(e) => { eprintln!("Cannot open {}: {e}", path.display()); return; }
+    // Logging is diagnostic only: this worker also relays WinEvents into probe
+    // requests, so a missing log file must not stop it.
+    let mut file = match File::create(&path) {
+        Ok(value) => Some(BufWriter::new(value)),
+        Err(e) => { eprintln!("Cannot open {}: {e}", path.display()); None }
     };
-    let mut file = BufWriter::new(file);
     let mut written = 0u64;
     let mut recent = HashMap::<usize, Instant>::new();
     let mut last_verbose = Instant::now();
@@ -1418,11 +1696,13 @@ fn log_worker(
         };
         let text = format!("{} {}\n", elapsed(), line);
         let text_len = text.len() as u64;
-        if written.saturating_add(text_len) > LOG_MAX_BYTES {
-            if let Err(e) = file.flush() {
-                eprintln!("TransPop: cannot flush log before rotation: {e}");
+        if file.is_some() && written.saturating_add(text_len) > LOG_MAX_BYTES {
+            if let Some(writer) = file.as_mut() {
+                if let Err(e) = writer.flush() {
+                    eprintln!("TransPop: cannot flush log before rotation: {e}");
+                }
             }
-            drop(file); // Windows cannot rename a file that is still open.
+            drop(file.take()); // Windows cannot rename a file that is still open.
             match fs::remove_file(&archive) {
                 Ok(()) => {},
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
@@ -1434,24 +1714,28 @@ fn log_worker(
             // If rename failed, truncate the closed log rather than allowing
             // unbounded growth. On error, stop only the diagnostic writer.
             file = match File::create(&path) {
-                Ok(value) => BufWriter::new(value),
+                Ok(value) => Some(BufWriter::new(value)),
                 Err(e) => {
                     eprintln!("TransPop: cannot reopen log after rotation: {e}");
-                    return;
+                    None
                 }
             };
             written = 0;
         }
-        if let Err(e) = file.write_all(text.as_bytes()) {
-            eprintln!("TransPop: log write failed: {e}");
-            return;
+        let mut failed = false;
+        if let Some(writer) = file.as_mut() {
+            if let Err(e) = writer.write_all(text.as_bytes()) {
+                eprintln!("TransPop: log write failed: {e}");
+                failed = true;
+            }
+            // Preserve the immediately-readable log behavior: an unexpected
+            // exit should not lose the last diagnostic lines.
+            else if let Err(e) = writer.flush() {
+                eprintln!("TransPop: log flush failed: {e}");
+                failed = true;
+            }
         }
-        // Preserve the existing immediately-readable log behavior: an
-        // unexpected exit should not lose the last diagnostic lines.
-        if let Err(e) = file.flush() {
-            eprintln!("TransPop: log flush failed: {e}");
-            return;
-        }
+        if failed { file = None; }
         written = written.saturating_add(text_len);
     }
 }
@@ -1626,6 +1910,8 @@ fn hide_if_focus_lost(hwnd: HWND, shadow: HWND) {
         .unwrap_or(false);
     if should_hide {
         MENU_OPEN.store(false, Ordering::Release);
+        clear_ready_translation();
+        cancel_pending_commit();
         CONFIRMED_IME_HWND.store(0, Ordering::Release);
         CONFIRMED_FOREGROUND.store(0, Ordering::Release);
         CANDIDATE_EPOCH.fetch_add(1, Ordering::AcqRel);
@@ -1720,7 +2006,7 @@ fn main() {
         eprintln!("Cannot create {}: {e}", base.display());
         return;
     }
-    let logfile = base.join("transpop-v0.6.5.log");
+    let logfile = base.join(format!("transpop-v{VERSION}.log"));
     let (log_tx, log_rx) = mpsc::channel::<LogRecord>();
     LOG_TX.set(log_tx.clone()).ok();
     let (probe_tx, probe_rx) = mpsc::channel::<ProbeRequest>();
@@ -1728,6 +2014,7 @@ fn main() {
     let uia_probe_tx = probe_tx.clone();
     thread::spawn(move || log_worker(log_rx, logfile, log_probe_tx));
     let config = TranslatorConfig::load(&base);
+    ALT_OUTPUT_ENABLED.store(settings::SettingsValues::from_file(&base).alt_output, Ordering::Release);
     let configuration_status = config.readiness();
     CONFIG_ENABLED.store(configuration_status.is_ok(), Ordering::Release);
     let provider_label = config.provider.clone();
@@ -1738,7 +2025,7 @@ fn main() {
     let translation_log = log_tx.clone();
     let translation_base = base.clone();
     thread::spawn(move || translation_worker(translate_rx, translation_ui, translation_log, translation_base));
-    log_line(&log_tx, "---- TransPop v0.6.5 visual refresh started ----");
+    log_line(&log_tx, format!("---- TransPop v{VERSION} started ----"));
     log_line(&log_tx, "Candidate text is not written to the log.");
     log_line(&log_tx, "SINGLE_INSTANCE_MUTEX_ACQUIRED");
 
@@ -1749,7 +2036,7 @@ fn main() {
     let worker_ui = ui_tx.clone();
     thread::spawn(move || candidate_worker(probe_rx, worker_log, worker_ui, translate_tx, ready_tx));
     if !matches!(ready_rx.recv_timeout(Duration::from_secs(5)), Ok(true)) {
-        eprintln!("TransPop 候选读取线程初始化失败，详细原因见 transpop-v0.6.5.log。");
+        eprintln!("TransPop 候选读取线程初始化失败，详细原因见 transpop-v{VERSION}.log。");
         log_line(&log_tx, "ABORT_UIA_READER_NOT_READY");
         thread::sleep(Duration::from_millis(150));
         return;
@@ -1830,9 +2117,18 @@ fn main() {
             MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'Q' as u32) == 0 {
             log_line(&log_tx, "WARN hotkey unavailable; use --quit");
         }
+        // Only physical LAlt taps are observed; no keys are intercepted.
+        // Do not install a global hook until the user enables the feature.
+        let keyboard_hook = if ALT_OUTPUT_ENABLED.load(Ordering::Acquire) {
+            let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(alt_keyboard_callback), instance, 0);
+            if hook.is_null() { log_line(&log_tx, "ALT_HOOK_INSTALL_FAILED"); }
+            else { log_line(&log_tx, "ALT_HOOK_INSTALLED"); }
+            hook
+        } else { ptr::null_mut() };
+        let mut keyboard_hook = keyboard_hook;
         // The UI timer is only for animation/focus. Candidate rechecks run
         // on the dedicated UIA reader worker, even when the UI is busy.
-        if SetTimer(ptr::null_mut(), TIMER_ID, 100, None) == 0 {
+        if SetTimer(ptr::null_mut(), TIMER_ID, 25, None) == 0 {
             log_line(&log_tx, "WARN timer unavailable; focus-based hiding disabled");
         }
 
@@ -1863,7 +2159,7 @@ fn main() {
                 PostMessageW(target as HWND, WM_APP_EXIT, 0, 0);
             });
         }
-        println!("TransPop v0.6.5 已启动（事件驱动翻译气泡 + 设置与开机自启）。");
+        println!("TransPop v{VERSION} 已启动（事件驱动翻译气泡 + 设置与开机自启）。");
         println!("翻译提供方：{provider_label}");
         if let Err(reason) = &configuration_status {
             println!("翻译尚未启用：{reason}");
@@ -1874,7 +2170,7 @@ fn main() {
         }
         println!("托盘：左键暂停／恢复，右键菜单可打开设置、暂停或退出。");
         println!(r"命令：--settings、--pause、--resume、--quit；退出快捷键：Ctrl+Alt+Q。");
-        println!("日志：{}", base.join("transpop-v0.6.5.log").display());
+        println!("日志：{}", base.join(format!("transpop-v{VERSION}.log")).display());
 
         let mut msg: MSG = mem::zeroed();
         let mut last_loading = Instant::now();
@@ -1928,18 +2224,33 @@ fn main() {
                         match values.save(&settings_file_base) {
                             Ok(()) => {
                                 // Registry is changed only after an explicit Save click.
-                                // An autostart error must not silently claim success.
+                                // An autostart error must be reported, but it must not
+                                // skip applying the settings that were just saved.
+                                let mut autostart_error = None;
                                 if let Err(reason) = startup::set_enabled(wants_autostart) {
                                     log_global("AUTOSTART_UPDATE_FAILED");
-                                    let caption = wide("TransPop 开机自启");
-                                    let message = wide(&format!(
-                                        "翻译设置已保存，但开机自启修改失败：\n{reason}"
-                                    ));
-                                    windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
-                                        settings_dialog_hwnd, message.as_ptr(), caption.as_ptr(), 0x00000010);
-                                    continue;
+                                    // Show the real registry state instead of the wish.
+                                    if let Ok(actual) = startup::enabled_for_current_exe() {
+                                        settings_ui.set_autostart_checked(actual);
+                                    }
+                                    autostart_error = Some(reason);
                                 }
-                                log_global(format!("AUTOSTART_CHANGED enabled={wants_autostart}"));
+                                ALT_OUTPUT_ENABLED.store(values.alt_output, Ordering::Release);
+                                if values.alt_output && keyboard_hook.is_null() {
+                                    keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL,
+                                        Some(alt_keyboard_callback), instance, 0);
+                                    log_global(if keyboard_hook.is_null() { "ALT_HOOK_INSTALL_FAILED" } else { "ALT_HOOK_INSTALLED" });
+                                } else if !values.alt_output && !keyboard_hook.is_null() {
+                                    UnhookWindowsHookEx(keyboard_hook);
+                                    keyboard_hook = ptr::null_mut();
+                                    log_global("ALT_HOOK_REMOVED");
+                                }
+                                clear_ready_translation();
+                                cancel_pending_commit();
+                                log_global(format!("ALT_OUTPUT_SETTING enabled={}", values.alt_output));
+                                if autostart_error.is_none() {
+                                    log_global(format!("AUTOSTART_CHANGED enabled={wants_autostart}"));
+                                }
                                 log_global(format!("SETTINGS_SAVED provider={}", values.provider));
                                 // Invalidate all in-flight old translations and
                                 // force a fresh targeted read during composition.
@@ -1955,10 +2266,20 @@ fn main() {
                                         state.text.clear();
                                     }
                                 }
-                                ShowWindow(hwnd, SW_HIDE);
-                                if !shadow.is_null() { ShowWindow(shadow, SW_HIDE); }
-                                if let Some(settings_ui) = settings_window.take() { settings_ui.close(); }
-                                log_global("SETTINGS_APPLIED");
+                                if let Some(reason) = autostart_error {
+                                    // Keep the form open so the registry write can be retried.
+                                    let caption = wide("TransPop 开机自启");
+                                    let message = wide(&format!(
+                                        "翻译设置已保存并已生效，但开机自启修改失败：\n{reason}"
+                                    ));
+                                    windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                                        settings_dialog_hwnd, message.as_ptr(), caption.as_ptr(), 0x00000010);
+                                } else {
+                                    ShowWindow(hwnd, SW_HIDE);
+                                    if !shadow.is_null() { ShowWindow(shadow, SW_HIDE); }
+                                    if let Some(settings_ui) = settings_window.take() { settings_ui.close(); }
+                                    log_global("SETTINGS_APPLIED");
+                                }
                             }
                             Err(reason) => {
                                 log_global("SETTINGS_SAVE_REJECTED");
@@ -2028,6 +2349,7 @@ fn main() {
                     continue;
                 }
                 WM_TIMER if msg.wParam == TIMER_ID => {
+                    process_alt_commit();
                     if last_main_health.elapsed() >= HEALTH_INTERVAL {
                         log_global(format!(
                             "MAIN_LOOP_HEARTBEAT paused={} tray_registered={}",
@@ -2052,6 +2374,7 @@ fn main() {
         if !tray_receiver.is_null() { DestroyWindow(tray_receiver); }
         stop.store(true, Ordering::Release);
         for hook in hooks { UnhookWinEvent(hook); }
+        if !keyboard_hook.is_null() { UnhookWindowsHookEx(keyboard_hook); }
         KillTimer(ptr::null_mut(), TIMER_ID);
         UnregisterHotKey(ptr::null_mut(), EXIT_HOTKEY_ID);
         CONTROL_HWND.store(0, Ordering::Release);
@@ -2061,6 +2384,6 @@ fn main() {
         if !font.is_null() { DeleteObject(font); }
         if IsWindow(control) != 0 { DestroyWindow(control); }
     }
-    log_line(&log_tx, "TransPop v0.6.5 stopped");
+    log_line(&log_tx, format!("TransPop v{VERSION} stopped"));
     thread::sleep(Duration::from_millis(200));
 }

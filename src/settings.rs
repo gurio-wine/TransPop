@@ -2,7 +2,7 @@
 //! The window procedure only forwards form commands to the application's
 //! existing message loop. No UIA or networking occurs in a Win32 callback.
 
-use std::{collections::HashMap, fs, mem, path::{Path, PathBuf}, ptr};
+use std::{collections::HashMap, fs, io::Write, mem, path::{Path, PathBuf}, ptr};
 use windows_sys::Win32::{
     Foundation::HWND,
     Graphics::Gdi::{CreateFontW, DeleteObject, GetStockObject, SetBkMode, SetTextColor, HFONT},
@@ -108,6 +108,7 @@ pub struct SettingsValues {
     pub openai_key: String,
     pub timeout_seconds: String,
     pub debounce_ms: String,
+    pub alt_output: bool,
 }
 impl SettingsValues {
     pub fn from_file(base: &Path) -> Self {
@@ -123,7 +124,7 @@ impl SettingsValues {
         }
         let get = |key: &str, default: &str| map.get(key).cloned().unwrap_or_else(|| default.into());
         Self {
-            provider: get("provider", "off"),
+            provider: get("provider", "off").to_ascii_lowercase(),
             azure_url: get("azure_url", "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=en"),
             azure_region: get("azure_region", ""),
             azure_key: get("azure_key", ""),
@@ -132,6 +133,7 @@ impl SettingsValues {
             openai_key: get("openai_key", ""),
             timeout_seconds: get("timeout_seconds", "8"),
             debounce_ms: get("debounce_ms", "300"),
+            alt_output: get("alt_output", "false").eq_ignore_ascii_case("true"),
         }
     }
 
@@ -171,7 +173,13 @@ impl SettingsValues {
     pub fn save(&self, base: &Path) -> Result<(), String> {
         self.validate()?;
         let path = base.join("translator.conf");
-        let content = fs::read_to_string(&path).unwrap_or_default();
+        // A failed read is not an empty file: rewriting from an empty base
+        // would silently drop user comments and unknown keys.
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("无法读取 translator.conf，已取消保存（{e}）")),
+        };
         let entries = [
             ("provider", self.provider.as_str()),
             ("azure_url", self.azure_url.as_str()),
@@ -182,6 +190,7 @@ impl SettingsValues {
             ("openai_key", self.openai_key.as_str()),
             ("timeout_seconds", self.timeout_seconds.as_str()),
             ("debounce_ms", self.debounce_ms.as_str()),
+            ("alt_output", if self.alt_output { "true" } else { "false" }),
         ];
         let mut seen = std::collections::HashSet::<String>::new();
         let mut result = String::new();
@@ -201,7 +210,20 @@ impl SettingsValues {
             if !seen.contains(key) { result.push_str(&format!("{key}={value}\n")); }
         }
         // Normal Windows files are short; an error here must keep the form open.
-        fs::write(&path, result.as_bytes()).map_err(|_| "无法保存 translator.conf，请检查文件权限".to_string())
+        // Write a sibling temp file, flush it, then rename it into place, so a
+        // crash or a full disk cannot leave a truncated translator.conf behind.
+        let temp = base.join("translator.conf.tmp");
+        let mut file = match fs::File::create(&temp) {
+            Ok(file) => file,
+            Err(_) => return Err("无法写入 translator.conf，请检查文件权限".to_string()),
+        };
+        let written = file.write_all(result.as_bytes()).and_then(|()| file.sync_all());
+        drop(file);
+        if written.is_err() || fs::rename(&temp, &path).is_err() {
+            let _ = fs::remove_file(&temp);
+            return Err("无法保存 translator.conf，请检查文件权限".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -229,6 +251,7 @@ pub struct SettingsWindow {
     timeout: HWND,
     debounce: HWND,
     autostart: HWND,
+    alt_output: HWND,
     autostart_help: HWND,
     footer_divider: HWND,
     footer_note: HWND,
@@ -250,7 +273,7 @@ impl SettingsWindow {
         let _ = RegisterClassW(&wc);
         let scale = |v: i32| v * dpi / 96;
         let width = scale(586);
-        let height = scale(496);
+        let height = scale(548);
         let x = (GetSystemMetrics(0) - width).max(0) / 2;
         let y = (GetSystemMetrics(1) - height).max(0) / 2;
         let title = wide("TransPop · 偏好设置");
@@ -344,14 +367,25 @@ impl SettingsWindow {
         let debounce_unit = create("STATIC", "ms", 0, 501, 261, 48, 24, 0);
         let autostart = create("BUTTON", "登录 Windows 时自动启动", 0,
             26, 317, 510, 25, BS_AUTOCHECKBOX | WS_TABSTOP);
-        let previously_enabled = super::startup::enabled_for_current_exe().unwrap_or(false);
+        // An unreadable registry state must not look like "disabled": the next
+        // Save would then delete a working autostart entry. Assume enabled.
+        let previously_enabled = match super::startup::enabled_for_current_exe() {
+            Ok(enabled) => enabled,
+            Err(reason) => {
+                super::log_global(format!("AUTOSTART_STATE_UNREADABLE {reason}"));
+                true
+            }
+        };
         SendMessageW(autostart, BM_SETCHECK, if previously_enabled { BST_CHECKED } else { 0 }, 0);
+        let alt_output = create("BUTTON", "轻按左 Alt：取消拼音并输入英文（实验性）", 0,
+            26, 370, 510, 25, BS_AUTOCHECKBOX | WS_TABSTOP);
+        SendMessageW(alt_output, BM_SETCHECK, if values.alt_output { BST_CHECKED } else { 0 }, 0);
         let autostart_help = create("STATIC", "仅当前用户 · 移动程序后需要重新启用", 0,
             49, 348, 492, 23, 0);
         set_font(autostart_help, note_font);
-        let footer_divider = create("STATIC", "", 0, 26, 383, 520, 2, SS_ETCHEDHORZ);
+        let footer_divider = create("STATIC", "", 0, 26, 432, 520, 2, SS_ETCHEDHORZ);
         let footer_note = create("STATIC", "在线翻译会将候选文字发送给服务商", 0,
-            26, 401, 298, 23, 0);
+            26, 449, 298, 23, 0);
         set_font(footer_note, note_font);
         let save_button = create("BUTTON", "保存设置", ID_SAVE, 422, 402, 125, 34,
             WS_TABSTOP | 0x00000001); // BS_DEFPUSHBUTTON
@@ -360,7 +394,7 @@ impl SettingsWindow {
                           provider, azure, openai, azure_reveal, openai_reveal,
                           connection_title, connection_divider, behavior_title, behavior_divider,
                           timeout_label, debounce_label, timeout_unit, debounce_unit, timeout, debounce,
-                          autostart, autostart_help, footer_divider, footer_note,
+                          autostart, alt_output, autostart_help, footer_divider, footer_note,
                           save_button, cancel_button, hint };
         this.update_provider();
         ShowWindow(hwnd, SW_SHOW);
@@ -418,11 +452,12 @@ impl SettingsWindow {
         move_to(self.debounce, 421, 256 + delta, 75, 30);
         move_to(self.autostart, 26, 317 + delta, 510, 25);
         move_to(self.autostart_help, 49, 348 + delta, 492, 23);
-        move_to(self.footer_divider, 26, 383 + delta, 520, 2);
-        move_to(self.footer_note, 26, 401 + delta, 328, 23);
-        move_to(self.save_button, 422, 402 + delta, 125, 34);
-        move_to(self.cancel_button, 334, 402 + delta, 78, 34);
-        SetWindowPos(self.hwnd, ptr::null_mut(), 0, 0, scaled(586), scaled(496 + delta),
+        move_to(self.alt_output, 26, 370 + delta, 510, 25);
+        move_to(self.footer_divider, 26, 432 + delta, 520, 2);
+        move_to(self.footer_note, 26, 449 + delta, 328, 23);
+        move_to(self.save_button, 422, 450 + delta, 125, 34);
+        move_to(self.cancel_button, 334, 450 + delta, 78, 34);
+        SetWindowPos(self.hwnd, ptr::null_mut(), 0, 0, scaled(586), scaled(548 + delta),
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
     }
 
@@ -449,10 +484,14 @@ impl SettingsWindow {
             openai_key: Self::get_text(self.openai[2].1),
             timeout_seconds: Self::get_text(self.timeout),
             debounce_ms: Self::get_text(self.debounce),
+            alt_output: SendMessageW(self.alt_output, BM_GETCHECK, 0, 0) as usize == BST_CHECKED,
         }
     }
     pub unsafe fn autostart_checked(&self) -> bool {
         SendMessageW(self.autostart, BM_GETCHECK, 0, 0) as usize == BST_CHECKED
+    }
+    pub unsafe fn set_autostart_checked(&self, checked: bool) {
+        SendMessageW(self.autostart, BM_SETCHECK, if checked { BST_CHECKED } else { 0 }, 0);
     }
     pub fn base(&self) -> &Path { &self.base }
     pub unsafe fn close(self) {
@@ -462,3 +501,41 @@ impl SettingsWindow {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_base(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("transpop-settings-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn save_preserves_comments_unknown_keys_and_replaces_atomically() {
+        let base = temp_base("save");
+        let path = base.join("translator.conf");
+        fs::write(&path, "# keep me\nprovider=bing\nunknown_key=1\n").unwrap();
+        let values = SettingsValues::from_file(&base);
+        assert_eq!(values.provider, "bing");
+        values.save(&base).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep me"), "comment lost: {text}");
+        assert!(text.contains("unknown_key=1"), "unknown key lost: {text}");
+        assert!(text.contains("provider=bing"));
+        assert!(!base.join("translator.conf.tmp").exists(), "temp file left behind");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn provider_from_file_is_normalized() {
+        let base = temp_base("provider");
+        fs::write(base.join("translator.conf"), "provider=Bing\n").unwrap();
+        assert_eq!(SettingsValues::from_file(&base).provider, "bing");
+        let _ = fs::remove_dir_all(&base);
+    }
+}
+

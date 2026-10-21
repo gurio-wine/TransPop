@@ -1,0 +1,6 @@
+# Keep one line-ending convention in the repository so diffs stay readable.
+* text=auto eol=lf
+
+# Binary resources must never be normalized.
+*.ico binary
+*.res binary
