@@ -8,8 +8,9 @@ use uiautomation::{
 };
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, POINT, RECT},
+    Graphics::Gdi::ClientToScreen,
     UI::WindowsAndMessaging::{
-        ClientToScreen, EnumChildWindows, EnumWindows, GetClassNameW, GetGUIThreadInfo,
+        EnumChildWindows, EnumWindows, GetClassNameW, GetGUIThreadInfo,
         GetWindowRect, IsWindowVisible, WindowFromPoint, GUITHREADINFO,
     },
 };
