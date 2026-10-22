@@ -46,9 +46,10 @@ use uiautomation::{
 use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, HANDLE, HWND, POINT, RECT, ERROR_ALREADY_EXISTS},
     Graphics::Gdi::{
-        CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, GetDC,
-        GetDeviceCaps, InvalidateRect, ReleaseDC, SelectObject, SetBkColor, SetBkMode,
-        SetTextColor, SetWindowRgn, HBRUSH, HFONT,
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateRoundRectRgn,
+        CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, GetDC, GetDeviceCaps, GetPixel,
+        InvalidateRect, ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor,
+        SetWindowRgn, HBRUSH, HBITMAP, HDC, HFONT, HGDIOBJ, SRCCOPY,
     },
     System::LibraryLoader::GetModuleHandleW,
     UI::{
@@ -224,10 +225,23 @@ static LATEST_CORE_HWND: AtomicUsize = AtomicUsize::new(0);
 static SELECTED_EVENT_HINT: OnceLock<Mutex<Option<SelectionHint>>> = OnceLock::new();
 static CONFIRMED_FOREGROUND: AtomicUsize = AtomicUsize::new(0);
 // Windows 11 hands the candidate pane to UIA event subscribers but refuses to
-// resolve it from a window handle. Once a pane read straight from an event
-// source has succeeded, stop paying for the handle lookups that cannot work.
-static PANEL_DIRECT: AtomicBool = AtomicBool::new(false);
+// resolve it from a window handle. While an event-delivered pane keeps being
+// read, handle lookups are pointless; the flag is a time window rather than a
+// latch so the handle path returns on its own once events stop arriving.
+static PANEL_DIRECT_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 static HWND_READ_MISSES: AtomicU32 = AtomicU32::new(0);
+// UIA event delivery can stop silently while WinEvents keep flowing. Both
+// clocks are milliseconds since START, so the event worker can tell "the IME
+// is quiet" apart from "the IME is busy but our subscription is dead".
+static LAST_UIA_EVENT_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_IME_WINEVENT_MS: AtomicU64 = AtomicU64::new(0);
+static UIA_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+// How long a successful event-delivered read suppresses handle lookups.
+const DIRECT_GRACE_MS: u64 = 5_000;
+// The event subscription is rebuilt after this many 500 ms ticks of
+// "IME busy, UIA silent", and at most once per cooldown.
+const UIA_SILENT_TICKS: u32 = 6;
+const UIA_RESUBSCRIBE_COOLDOWN: Duration = Duration::from_secs(10);
 const ACTIVE_RECHECK_INTERVAL: Duration = Duration::from_millis(85);
 // The reader controls its own poll cadence. WM_TIMER is for visual animation only.
 const ACTIVE_RECHECK_WAKE: Duration = Duration::from_millis(40);
@@ -1156,6 +1170,10 @@ fn save_paused_state(base: &Path, paused: bool) {
     }
 }
 
+fn uptime_ms() -> u64 {
+    START.get().map_or(0, |value| value.elapsed().as_millis() as u64)
+}
+
 fn elapsed() -> String {
     format!("+{:>8.3}s", START.get().map_or(0.0, |v| v.elapsed().as_secs_f64()))
 }
@@ -1197,8 +1215,15 @@ fn native_kind(event: u32) -> &'static str {
 
 fn is_ime_class(class: &str) -> bool {
     let c = class.to_ascii_lowercase();
-    c == "windows.ui.core.corewindow" || c.contains("ime")
+    is_core_window(class) || c.contains("ime")
         || c.contains("candidate") || c.contains("textinput")
+}
+
+/// The only host whose UIA subtree actually exposes the candidate pane. The
+/// per-composition MSCTFIME windows report IME activity but resolve to nothing,
+/// so they must never replace this handle.
+fn is_core_window(class: &str) -> bool {
+    class.eq_ignore_ascii_case("Windows.UI.Core.CoreWindow")
 }
 
 unsafe extern "system" fn native_callback(
@@ -1213,7 +1238,10 @@ unsafe extern "system" fn native_callback(
     let class = window_class(hwnd);
     let ime_event = (EVENT_OBJECT_IME_SHOW..=EVENT_OBJECT_IME_CHANGE).contains(&event);
     if !ime_event && !is_ime_class(&class) { return; }
-    if is_ime_class(&class)
+    // The IME is demonstrably alive. Stored before the class filter below so a
+    // busy IME with stalled UIA delivery cannot look like an idle desktop.
+    LAST_IME_WINEVENT_MS.store(uptime_ms(), Ordering::Release);
+    if is_core_window(&class)
         && matches!(event, EVENT_OBJECT_SHOW | EVENT_OBJECT_NAMECHANGE
             | EVENT_OBJECT_LOCATIONCHANGE | EVENT_OBJECT_IME_SHOW
             | EVENT_OBJECT_IME_CHANGE) {
@@ -1302,6 +1330,170 @@ impl CandidateItem for UiaItem<'_> {
     fn legacy_focused(&self) -> bool {
         legacy_state(self.element).is_some_and(|state| state & STATE_SYSTEM_FOCUSED != 0)
     }
+}
+
+/// One BitBlt of the whole candidate strip, then cheap local pixel reads.
+/// Reading the screen directly with GetPixel costs tens of milliseconds per
+/// call, which turned a candidate read into a visible second-long stall.
+struct StripCapture {
+    screen: HDC,
+    memory: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+}
+
+impl StripCapture {
+    /// Copies the union of the given rectangles. The process is system-DPI
+    /// aware, so UIA's physical rectangles index the screen DC directly.
+    fn new(bounds: &[(i32, i32, i32, i32)]) -> Option<Self> {
+        let left = bounds.iter().map(|b| b.0).min()?;
+        let top = bounds.iter().map(|b| b.1).min()?;
+        let right = bounds.iter().map(|b| b.2).max()?;
+        let bottom = bounds.iter().map(|b| b.3).max()?;
+        let (width, height) = (right - left, bottom - top);
+        if width <= 0 || height <= 0 || width > 4096 || height > 1024 { return None; }
+        unsafe {
+            let screen = GetDC(ptr::null_mut());
+            if screen.is_null() { return None; }
+            let memory = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, width, height);
+            if memory.is_null() || bitmap.is_null() {
+                if !bitmap.is_null() { DeleteObject(bitmap as *mut core::ffi::c_void); }
+                if !memory.is_null() { DeleteDC(memory); }
+                ReleaseDC(ptr::null_mut(), screen);
+                return None;
+            }
+            let previous = SelectObject(memory, bitmap as *mut core::ffi::c_void);
+            BitBlt(memory, 0, 0, width, height, screen, left, top, SRCCOPY);
+            Some(Self { screen, memory, bitmap, previous, left, top, width, height })
+        }
+    }
+
+    /// 0 means "unreadable"; the caller treats that as no evidence.
+    fn pixel(&self, x: i32, y: i32) -> u32 {
+        let (x, y) = (x - self.left, y - self.top);
+        if x < 0 || y < 0 || x >= self.width || y >= self.height { return 0; }
+        let color = unsafe { GetPixel(self.memory, x, y) };
+        if color == u32::MAX { 0 } else { color }
+    }
+
+    /// The background colour of one candidate cell: the most frequent of nine
+    /// inset samples, so a glyph or an antialiased edge cannot win the vote.
+    fn fill(&self, bounds: (i32, i32, i32, i32)) -> Option<u32> {
+        let (left, top, right, bottom) = bounds;
+        if right - left < 10 || bottom - top < 10 { return None; }
+        let mid_x = (left + right) / 2;
+        let mid_y = (top + bottom) / 2;
+        let mut samples = [0u32; 9];
+        let mut next = 0;
+        for y in [top + 4, mid_y, bottom - 4] {
+            for x in [left + 4, mid_x, right - 4] {
+                samples[next] = self.pixel(x, y);
+                next += 1;
+            }
+        }
+        let mut best = 0u32;
+        let mut best_hits = 0;
+        for (position, sample) in samples.iter().enumerate() {
+            if *sample == 0 { continue; }
+            let hits = samples.iter().skip(position).filter(|other| *other == sample).count();
+            if hits > best_hits { best_hits = hits; best = *sample; }
+        }
+        (best_hits >= 3).then_some(best)
+    }
+}
+
+impl Drop for StripCapture {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.memory, self.previous);
+            DeleteObject(self.bitmap as *mut core::ffi::c_void);
+            DeleteDC(self.memory);
+            ReleaseDC(ptr::null_mut(), self.screen);
+        }
+    }
+}
+
+/// Microsoft Pinyin on Windows 10 publishes no selection state at all: every
+/// item reports an identical legacy state, no SelectionItem pattern, no
+/// keyboard focus, and SelectionItem_ElementSelected never fires. The
+/// highlight exists only as paint, so read the pane's own cell colours and
+/// treat the one tinted cell as the highlight.
+///
+/// The discriminator is chroma, not brightness: the highlighted cell is an
+/// accent blue (#A6D8FF on the light theme), while every sibling is a neutral
+/// grey. Brightness differences also appear on a cell that has just lost the
+/// highlight, so they cannot be trusted.
+///
+/// ponytail: this assumes an accent-coloured highlight. A purely neutral
+/// highlight on some future build degrades to the previous first-item result
+/// rather than showing a wrong word; raise HIGHLIGHT_CHROMA_MIN after measuring
+/// that build.
+const HIGHLIGHT_CHROMA_MIN: u32 = 32;
+
+/// Channel spread of one colour: 0 for any neutral grey.
+fn chroma(color: u32) -> u32 {
+    let r = (color >> 16) & 0xFF;
+    let g = (color >> 8) & 0xFF;
+    let b = color & 0xFF;
+    r.max(g).max(b) - r.min(g).min(b)
+}
+
+fn highlighted_position<V: CandidateItem>(items: &[V]) -> Option<usize> {
+    let bounds: Vec<(i32, i32, i32, i32)> = items.iter().filter_map(|item| item.bounds()).collect();
+    let capture = StripCapture::new(&bounds)?;
+    let fills: Vec<Option<u32>> = items.iter()
+        .map(|item| item.bounds().and_then(|bounds| capture.fill(bounds)))
+        .collect();
+    pick_highlight(&fills)
+}
+
+/// The pure half of the pixel heuristic: `fills` holds each cell's background
+/// colour in strip order. Split out so the calibration threshold stays testable
+/// without a screen.
+fn pick_highlight(fills: &[Option<u32>]) -> Option<usize> {
+    let mut tinted = Vec::new();
+    for (position, fill) in fills.iter().enumerate() {
+        let Some(fill) = fill else { continue; };
+        if chroma(*fill) >= HIGHLIGHT_CHROMA_MIN { tinted.push(position); }
+    }
+    // Two tinted cells (the one losing the highlight, a themed accent bar)
+    // are ambiguous: guessing would translate the wrong word.
+    if tinted.len() != 1 { return None; }
+    tinted.first().copied()
+}
+
+/// Only a first-fallback pick is refined: it is the one branch that carries no
+/// evidence at all. Anything the provider phrased as a selection stays.
+fn prefer_highlight<V: CandidateItem>(
+    items: &[V],
+    picked: Option<(String, usize, &'static str)>,
+) -> Option<(String, usize, &'static str)> {
+    if picked.as_ref()?.2 != "first-fallback" { return picked; }
+    let Some(position) = highlighted_position(items) else { return picked; };
+    let Some(name) = items.get(position).and_then(|item| item.name()) else { return picked; };
+    Some((name, position + 1, "pixel-highlight"))
+}
+
+/// True while an event-delivered pane was read recently enough that handle
+/// lookups on this host are known to be wasted work.
+fn panel_direct_active() -> bool {
+    uptime_ms() < PANEL_DIRECT_UNTIL_MS.load(Ordering::Acquire)
+}
+
+/// Starts (or restarts) the grace window above. Never a latch: it expires on
+/// its own, so a dead UIA subscription cannot disable the handle path forever.
+fn mark_panel_direct() {
+    PANEL_DIRECT_UNTIL_MS.store(uptime_ms() + DIRECT_GRACE_MS, Ordering::Release);
+    HWND_READ_MISSES.store(0, Ordering::Release);
+}
+
+fn clear_panel_direct() {
+    PANEL_DIRECT_UNTIL_MS.store(0, Ordering::Release);
 }
 
 /// The seven-level selection fallback, in decreasing order of confidence.
@@ -1411,6 +1603,7 @@ fn selected_candidate(panel: &UIElement, all: &UICondition, hint: Option<&Select
         .map(|(index, element)| UiaItem { element, index }).collect();
     let picked = pick_candidate(&views, container_selected.as_deref(),
         hint.map(|hint| (hint.text.as_str(), hint.bounds)));
+    let picked = prefer_highlight(&views, picked);
     if picked.is_some() { return Ok(picked); }
 
     // Windows 11 can nest the entries below an intermediate list that the
@@ -1425,8 +1618,9 @@ fn selected_candidate(panel: &UIElement, all: &UICondition, hint: Option<&Select
     if nested_items.is_empty() { return Ok(None); }
     let nested_views: Vec<UiaItem> = nested_items.iter().enumerate()
         .map(|(index, element)| UiaItem { element, index }).collect();
-    Ok(pick_candidate(&nested_views, container_selected.as_deref(),
-        hint.map(|hint| (hint.text.as_str(), hint.bounds))))
+    let picked = pick_candidate(&nested_views, container_selected.as_deref(),
+        hint.map(|hint| (hint.text.as_str(), hint.bounds)));
+    Ok(prefer_highlight(&nested_views, picked))
 }
 
 /// Rate-limits the Windows 11 diagnosis lines so a missing pane cannot flood
@@ -1521,7 +1715,18 @@ fn targeted_candidate(
     hwnd: usize,
     hint: Option<&SelectionHint>,
 ) -> Result<Option<Candidate>, String> {
-    let Some(panel) = panel_for_hwnd(automation, all, hwnd) else { return Ok(None); };
+    // WinEvents name whatever window the IME touched, which is usually a
+    // per-composition MSCTFIME window owned by the *foreground application*.
+    // That window never resolves to the pane and the lookup costs about a
+    // second, so go straight to the IME host for any other class. UIA event
+    // delivery is then not required for the handle path to work at all.
+    let host = LATEST_CORE_HWND.load(Ordering::Acquire);
+    let ordered = if is_core_window(&window_class(hwnd as HWND)) || host == 0 || host == hwnd {
+        hwnd
+    } else {
+        host
+    };
+    let Some(panel) = panel_for_hwnd(automation, all, ordered) else { return Ok(None); };
     candidate_from_panel(&panel, all, hint)
 }
 
@@ -1535,7 +1740,7 @@ fn read_panel(
 ) -> Option<Candidate> {
     match candidate_from_panel(panel, all, hint) {
         Ok(Some(candidate)) => {
-            PANEL_DIRECT.store(true, Ordering::Release);
+            mark_panel_direct();
             Some(candidate)
         }
         Ok(None) => None,
@@ -1696,7 +1901,7 @@ fn candidate_worker(
             && last_recheck.elapsed() >= ACTIVE_RECHECK_INTERVAL
             // Windows 11 cannot resolve the pane from a window handle. Keep
             // polling only while that path works or has not been disproved.
-            && !(PANEL_DIRECT.load(Ordering::Acquire)
+            && !(panel_direct_active()
                 && HWND_READ_MISSES.load(Ordering::Acquire) >= 3) {
             let foreground = unsafe { GetForegroundWindow() } as usize;
             let confirmed = CONFIRMED_IME_HWND.load(Ordering::Acquire);
@@ -1731,10 +1936,11 @@ fn candidate_worker(
         let Some(request) = incoming else { continue; };
         if TRANSLATION_PAUSED.load(Ordering::Acquire)
             || request.epoch != CANDIDATE_EPOCH.load(Ordering::Acquire) { continue; }
-        // Once an event-delivered pane has been read a few times, handle
-        // lookups are known to miss on this host; skip their COM cost.
+        // While an event-delivered pane is being read and the handle path has
+        // already missed repeatedly, skip its COM cost. The window expires, so
+        // this can never strand the reader if events stop.
         if request.candidate.is_none()
-            && PANEL_DIRECT.load(Ordering::Acquire)
+            && panel_direct_active()
             && HWND_READ_MISSES.load(Ordering::Acquire) >= 3 { continue; }
         if request.candidate.is_none() {
             if recent.get(&request.hwnd).is_some_and(|at| at.elapsed() < Duration::from_millis(50)) {
@@ -1873,7 +2079,6 @@ fn candidate_worker(
         // confirmed misses, discard the old translation rather than leaving
         // an unrelated English bubble on screen forever.
         if request.active_recheck && consecutive_misses >= 8
-            && !PANEL_DIRECT.load(Ordering::Acquire)
             && MENU_OPEN.load(Ordering::Acquire) {
             MENU_OPEN.store(false, Ordering::Release);
             clear_selection_hint();
@@ -1951,6 +2156,8 @@ fn on_uia_event(
     ui_tx: &Sender<OverlayMessage>,
     probe_tx: &Sender<ProbeRequest>,
 ) -> uiautomation::Result<()> {
+    LAST_UIA_EVENT_MS.store(uptime_ms(), Ordering::Release);
+    UIA_EVENT_COUNT.fetch_add(1, Ordering::AcqRel);
     // The event source is already a small IME pane. Never traverse a UIA tree here.
     let id = sender.get_automation_id().unwrap_or_default();
     let name = sender.get_name().unwrap_or_default();
@@ -2004,7 +2211,7 @@ fn on_uia_event(
                 let fallback = pane.as_ref()
                     .and_then(|panel| candidate_from_sender(sender, &name, Some(panel)));
                 if fallback.is_some() {
-                    PANEL_DIRECT.store(true, Ordering::Release);
+                    mark_panel_direct();
                     log_line(&log_tx, "PANEL_SENDER_FALLBACK");
                 }
                 fallback
@@ -2055,7 +2262,7 @@ fn on_uia_event(
                 if let Ok(mut slot) = panel_cache.try_borrow_mut() { *slot = None; }
             // The next composition may open on a host whose handle path
             // works, so allow those lookups again from a clean slate.
-            PANEL_DIRECT.store(false, Ordering::Release);
+            clear_panel_direct();
             HWND_READ_MISSES.store(0, Ordering::Release);
             MENU_OPEN.store(false, Ordering::Release);
             clear_ready_translation();
@@ -2070,22 +2277,56 @@ fn on_uia_event(
     }
     Ok(())
 }
-    let mut registered = 0;
-    for event in [UIEventType::MenuOpened, UIEventType::MenuClosed,
-        UIEventType::SelectionItem_ElementSelected] {
-        match automation.add_automation_event_handler(
-            event, &root, TreeScope::Subtree, None, &handler,
-        ) {
-            Ok(()) => {
-                registered += 1;
-                log_line(&log_tx, format!("UIA_EVENT_SUBSCRIBED {event:?}"));
+    fn subscribe(
+        automation: &UIAutomation, root: &UIElement, handler: &UIEventHandler,
+        log_tx: &Sender<LogRecord>,
+    ) -> usize {
+        let mut registered = 0;
+        for event in [UIEventType::MenuOpened, UIEventType::MenuClosed,
+            UIEventType::SelectionItem_ElementSelected] {
+            match automation.add_automation_event_handler(
+                event, root, TreeScope::Subtree, None, handler,
+            ) {
+                Ok(()) => {
+                    registered += 1;
+                    log_line(log_tx, format!("UIA_EVENT_SUBSCRIBED {event:?}"));
+                }
+                Err(e) => log_line(log_tx, format!("UIA_EVENT_SUBSCRIBE_ERROR {event:?} {e}")),
             }
-            Err(e) => log_line(&log_tx, format!("UIA_EVENT_SUBSCRIBE_ERROR {event:?} {e}")),
         }
+        log_line(log_tx, format!("UIA_EVENT_ACTIVE {registered}/3"));
+        registered
     }
-    log_line(&log_tx, format!("UIA_EVENT_ACTIVE {registered}/3"));
+    subscribe(&automation, &root, &handler, &log_tx);
+    // UI Automation can stop delivering events while the IME stays demonstrably
+    // busy (WinEvents keep arriving). That used to be unrecoverable for the
+    // rest of the session. Watch for exactly that signature and rebuild the
+    // subscription; a quiet desktop never triggers it.
+    let mut seen_events = UIA_EVENT_COUNT.load(Ordering::Acquire);
+    let mut silent_ticks = 0u32;
+    let mut last_resubscribe = Instant::now();
     while !stop.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(500));
+        if stop.load(Ordering::Relaxed) { break; }
+        let events = UIA_EVENT_COUNT.load(Ordering::Acquire);
+        if events != seen_events {
+            seen_events = events;
+            silent_ticks = 0;
+            continue;
+        }
+        let ime_busy = uptime_ms()
+            .saturating_sub(LAST_IME_WINEVENT_MS.load(Ordering::Acquire)) < 2_000;
+        if !ime_busy { silent_ticks = 0; continue; }
+        silent_ticks += 1;
+        if silent_ticks < UIA_SILENT_TICKS || last_resubscribe.elapsed() < UIA_RESUBSCRIBE_COOLDOWN {
+            continue;
+        }
+        let _ = automation.remove_all_event_handlers();
+        let registered = subscribe(&automation, &root, &handler, &log_tx);
+        log_line(&log_tx, format!("UIA_EVENT_RESUBSCRIBED {registered}/3"));
+        last_resubscribe = Instant::now();
+        silent_ticks = 0;
+        seen_events = UIA_EVENT_COUNT.load(Ordering::Acquire);
     }
     let _ = automation.remove_all_event_handlers();
 }
@@ -3206,6 +3447,42 @@ mod tests {
             ("乙".to_string(), 2, "first-fallback"));
         let items = [FakeItem { name: None, ..FakeItem::new("ignored") }];
         assert!(pick_candidate(&items, None, None).is_none());
+    }
+
+    #[test]
+    fn pixel_highlight_finds_the_single_outlier_cell() {
+        // Real sample from Windows 10 Microsoft Pinyin: the highlighted cell is
+        // a light blue, every sibling is the same neutral pane background.
+        let fills = [Some(0x00FFD8A6), Some(0x00D3D2D2), Some(0x00F4F4F4),
+            Some(0x00F3F3F3), Some(0x00F4F4F4), Some(0x00F5F5F5), Some(0x00F5F5F5)];
+        assert_eq!(pick_highlight(&fills), Some(0));
+        // After one Down press the highlight moves to the second cell.
+        let fills = [Some(0x00D7D6D6), Some(0x00FFD8A6), Some(0x00F4F4F4),
+            Some(0x00F3F3F3), Some(0x00F4F4F4), Some(0x00F5F5F5)];
+        assert_eq!(pick_highlight(&fills), Some(1));
+    }
+
+    #[test]
+    fn pixel_highlight_refuses_ambiguous_or_missing_paint() {
+        // Two candidates stand out: do not guess.
+        assert_eq!(pick_highlight(&[Some(0x00FFD8A6), Some(0x00FFD8A6), Some(0xF4F4F4)]), None);
+        // Uniform strip: no highlight is visible.
+        assert_eq!(pick_highlight(&[Some(0xF4F4F4), Some(0xF4F4F4), Some(0xF4F4F4)]), None);
+        // Unreadable screen (off-screen or occluded) yields no evidence.
+        assert_eq!(pick_highlight(&[None, None]), None);
+    }
+
+    #[test]
+    fn pixel_highlight_only_refines_first_fallback() {
+        // Bounds stay None here on purpose: an offline test never samples paint,
+        // so this asserts the guard, not the colour vote.
+        let items = [FakeItem::new("甲"), FakeItem::new("乙")];
+        // A provider-backed answer is never overridden by paint.
+        assert_eq!(prefer_highlight(&items, Some(("甲".into(), 1, "selection-item"))).unwrap().2,
+            "selection-item");
+        // Without a screen there is nothing to refine, so the old order holds.
+        assert_eq!(prefer_highlight(&items, Some(("甲".into(), 1, "first-fallback"))).unwrap().2,
+            "first-fallback");
     }
 
     #[test]
