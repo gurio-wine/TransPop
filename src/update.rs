@@ -144,11 +144,16 @@ pub fn apply(new_exe: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Remove the executable left over by a completed update.
-pub fn remove_stale_backup() {
-    if let Ok(current) = std::env::current_exe() {
-        let _ = fs::remove_file(backup_path(&current));
-    }
+/// The previous executable left by a self-update, if any.
+pub fn stale_backup() -> Option<PathBuf> {
+    let current = std::env::current_exe().ok()?;
+    let backup = backup_path(&current);
+    backup.exists().then_some(backup)
+}
+
+/// Drop the previous executable once the replacement proved healthy.
+pub fn remove_backup(path: &Path) {
+    let _ = fs::remove_file(path);
 }
 
 const SHA256_K: [u32; 64] = [

@@ -41,6 +41,7 @@ const ID_AZURE_REVEAL: u16 = 4103;
 const ID_OPENAI_REVEAL: u16 = 4104;
 const ID_AZURE_SECRET: u16 = 4105;
 const ID_OPENAI_SECRET: u16 = 4106;
+const ID_UPDATE: u16 = 4107;
 const EM_SETPASSWORDCHAR: u32 = 0x00CC;
 const WM_CTLCOLORSTATIC: u32 = 0x0138;
 const SS_ICON: u32 = 0x0003;
@@ -49,10 +50,12 @@ const SS_ETCHEDHORZ: u32 = 0x0010;
 const WM_APP_SETTINGS_SAVE: u32 = super::WM_APP + 30;
 const WM_APP_SETTINGS_CANCEL: u32 = super::WM_APP + 31;
 const WM_APP_SETTINGS_PROVIDER: u32 = super::WM_APP + 32;
+const WM_APP_SETTINGS_UPDATE: u32 = super::WM_APP + 33;
 
 pub const SAVE_MESSAGE: u32 = WM_APP_SETTINGS_SAVE;
 pub const CANCEL_MESSAGE: u32 = WM_APP_SETTINGS_CANCEL;
 pub const PROVIDER_MESSAGE: u32 = WM_APP_SETTINGS_PROVIDER;
+pub const UPDATE_MESSAGE: u32 = WM_APP_SETTINGS_UPDATE;
 
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
 
@@ -74,6 +77,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
         let outgoing = if id == ID_SAVE { WM_APP_SETTINGS_SAVE }
             else if id == ID_CANCEL { WM_APP_SETTINGS_CANCEL }
             else if id == ID_PROVIDER && notify == CBN_SELCHANGE { WM_APP_SETTINGS_PROVIDER }
+            else if id == ID_UPDATE { WM_APP_SETTINGS_UPDATE }
             else { 0 };
         if id == ID_AZURE_REVEAL || id == ID_OPENAI_REVEAL {
             // Password visibility is local to this settings dialog; it never
@@ -97,6 +101,94 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
     DefWindowProcW(hwnd, msg, wp, lp)
 }
 
+/// Shared translator.conf parser. The settings window and the runtime loader
+/// both build on this type, so key names, defaults and value normalization
+/// cannot drift apart again.
+#[derive(Clone, Debug)]
+pub struct ConfigFile {
+    pub provider: String,
+    pub azure_url: String,
+    pub azure_region: String,
+    pub azure_key: String,
+    pub openai_url: String,
+    pub openai_model: String,
+    pub openai_key: String,
+    pub timeout_seconds: String,
+    pub debounce_ms: String,
+    pub alt_output: bool,
+    pub auto_update: bool,
+}
+
+pub const DEFAULT_AZURE_URL: &str =
+    "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=en";
+pub const DEFAULT_OPENAI_URL: &str = "https://api.openai.com/v1/chat/completions";
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
+
+/// Only explicit off-values disable a boolean setting.
+pub fn truthy(value: &str, default: bool) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() { return default; }
+    !matches!(value.as_str(), "off" | "false" | "0" | "no")
+}
+
+impl ConfigFile {
+    pub fn read(base: &Path) -> Self {
+        let mut map = HashMap::new();
+        if let Ok(content) = fs::read_to_string(base.join("translator.conf")) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') { continue; }
+                if let Some((key, value)) = line.split_once('=') {
+                    map.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+                }
+            }
+        }
+        let get = |key: &str, default: &str| map.get(key).cloned().unwrap_or_else(|| default.into());
+        let flag = |key: &str, default: bool| map.get(key).is_none_or(|value| truthy(value, default));
+        Self {
+            provider: get("provider", "off").to_ascii_lowercase(),
+            azure_url: get("azure_url", DEFAULT_AZURE_URL),
+            azure_region: get("azure_region", ""),
+            azure_key: super::secret::open(&get("azure_key", "")),
+            openai_url: get("openai_url", DEFAULT_OPENAI_URL),
+            openai_model: get("openai_model", DEFAULT_OPENAI_MODEL),
+            openai_key: super::secret::open(&get("openai_key", "")),
+            timeout_seconds: get("timeout_seconds", "8"),
+            debounce_ms: get("debounce_ms", "300"),
+            alt_output: flag("alt_output", false),
+            auto_update: flag("auto_update", true),
+        }
+    }
+
+    /// First run only: write a commented sample without touching user values.
+    pub fn ensure_sample(base: &Path) {
+        let path = base.join("translator.conf");
+        if fs::metadata(&path).is_ok() { return; }
+        let sample = "# TransPop translator settings (UTF-8); use tray Settings to apply without restart.\n\
+# provider=bing uses an undocumented Edge/Microsoft webpage endpoint; no API key.\n\
+# The Bing mode may change, block automated calls, or enforce rate limits without notice.\n\
+# Other choices: provider=azure or provider=openai; provider=off sends nothing.\n\
+# API keys saved from Settings are encrypted with Windows DPAPI for the current user.\n\
+# Environment variables TRANSPOP_AZURE_KEY / TRANSPOP_OPENAI_KEY remain safer.\n\
+provider=off\n\
+azure_url=https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=en\n\
+azure_region=\n\
+azure_key=\n\
+openai_url=https://api.openai.com/v1/chat/completions\n\
+openai_model=gpt-4o-mini\n\
+openai_key=\n\
+# A local OpenAI-compatible endpoint can use http://127.0.0.1:PORT/v1/chat/completions.\n\
+timeout_seconds=8\n\
+debounce_ms=300\n\
+# auto_update=on checks GitHub Releases at startup and every 6 hours and installs\n\
+# a newer release after verifying the digest GitHub publishes for its asset.\n\
+auto_update=on\n\
+alt_output=false\n";
+        let _ = fs::OpenOptions::new().write(true).create_new(true).open(&path)
+            .and_then(|mut file| file.write_all(sample.as_bytes()));
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SettingsValues {
     pub provider: String,
@@ -109,31 +201,23 @@ pub struct SettingsValues {
     pub timeout_seconds: String,
     pub debounce_ms: String,
     pub alt_output: bool,
+    pub auto_update: bool,
 }
 impl SettingsValues {
     pub fn from_file(base: &Path) -> Self {
-        let mut map = HashMap::new();
-        if let Ok(content) = fs::read_to_string(base.join("translator.conf")) {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.starts_with('#') { continue; }
-                if let Some((k, v)) = line.split_once('=') {
-                    map.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-                }
-            }
-        }
-        let get = |key: &str, default: &str| map.get(key).cloned().unwrap_or_else(|| default.into());
+        let file = ConfigFile::read(base);
         Self {
-            provider: get("provider", "off").to_ascii_lowercase(),
-            azure_url: get("azure_url", "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=en"),
-            azure_region: get("azure_region", ""),
-            azure_key: super::secret::open(&get("azure_key", "")),
-            openai_url: get("openai_url", "https://api.openai.com/v1/chat/completions"),
-            openai_model: get("openai_model", "gpt-4o-mini"),
-            openai_key: super::secret::open(&get("openai_key", "")),
-            timeout_seconds: get("timeout_seconds", "8"),
-            debounce_ms: get("debounce_ms", "300"),
-            alt_output: get("alt_output", "false").eq_ignore_ascii_case("true"),
+            provider: file.provider,
+            azure_url: file.azure_url,
+            azure_region: file.azure_region,
+            azure_key: file.azure_key,
+            openai_url: file.openai_url,
+            openai_model: file.openai_model,
+            openai_key: file.openai_key,
+            timeout_seconds: file.timeout_seconds,
+            debounce_ms: file.debounce_ms,
+            alt_output: file.alt_output,
+            auto_update: file.auto_update,
         }
     }
 
@@ -197,6 +281,7 @@ impl SettingsValues {
             ("timeout_seconds", self.timeout_seconds.clone()),
             ("debounce_ms", self.debounce_ms.clone()),
             ("alt_output", if self.alt_output { "true".to_string() } else { "false".to_string() }),
+            ("auto_update", if self.auto_update { "on".to_string() } else { "off".to_string() }),
         ];
         let mut seen = std::collections::HashSet::<String>::new();
         let mut result = String::new();
@@ -279,6 +364,8 @@ pub struct SettingsWindow {
     debounce: HWND,
     autostart: HWND,
     alt_output: HWND,
+    auto_update: HWND,
+    update_button: HWND,
     autostart_help: HWND,
     footer_divider: HWND,
     footer_note: HWND,
@@ -336,7 +423,8 @@ impl SettingsWindow {
         }
         let heading = create("STATIC", "TransPop", 0, 77, 19, 450, 30, 0);
         set_font(heading, title_font);
-        let subtitle = create("STATIC", "偏好设置 · 让翻译恰到好处", 0, 78, 50, 460, 21, 0);
+        let subtitle = create("STATIC",
+            &format!("偏好设置 · 让翻译恰到好处 · v{}", super::VERSION), 0, 78, 50, 480, 21, 0);
         set_font(subtitle, note_font);
         create("STATIC", "", 0, 26, 83, 520, 2, SS_ETCHEDHORZ);
 
@@ -410,19 +498,23 @@ impl SettingsWindow {
         let autostart_help = create("STATIC", "仅当前用户 · 移动程序后需要重新启用", 0,
             49, 348, 492, 23, 0);
         set_font(autostart_help, note_font);
-        let footer_divider = create("STATIC", "", 0, 26, 432, 520, 2, SS_ETCHEDHORZ);
+        let auto_update = create("BUTTON", "自动检查并安装 GitHub 更新", 0,
+            26, 403, 330, 25, BS_AUTOCHECKBOX | WS_TABSTOP);
+        SendMessageW(auto_update, BM_SETCHECK, if values.auto_update { BST_CHECKED } else { 0 }, 0);
+        let update_button = create("BUTTON", "检查更新", ID_UPDATE, 422, 400, 125, 30, WS_TABSTOP);
+        let footer_divider = create("STATIC", "", 0, 26, 437, 520, 2, SS_ETCHEDHORZ);
         let footer_note = create("STATIC", "在线翻译会将候选文字发送给服务商", 0,
-            26, 449, 298, 23, 0);
+            26, 453, 298, 23, 0);
         set_font(footer_note, note_font);
-        let save_button = create("BUTTON", "保存设置", ID_SAVE, 422, 402, 125, 34,
+        let save_button = create("BUTTON", "保存设置", ID_SAVE, 422, 481, 125, 34,
             WS_TABSTOP | 0x00000001); // BS_DEFPUSHBUTTON
-        let cancel_button = create("BUTTON", "取消", ID_CANCEL, 334, 402, 78, 34, WS_TABSTOP);
+        let cancel_button = create("BUTTON", "取消", ID_CANCEL, 334, 481, 78, 34, WS_TABSTOP);
         let this = Self { hwnd, base, dpi, font, title_font, section_font, note_font,
                           provider, azure, openai, azure_reveal, openai_reveal,
                           connection_title, connection_divider, behavior_title, behavior_divider,
                           timeout_label, debounce_label, timeout_unit, debounce_unit, timeout, debounce,
-                          autostart, alt_output, autostart_help, footer_divider, footer_note,
-                          save_button, cancel_button, hint };
+                          autostart, alt_output, auto_update, update_button, autostart_help,
+                          footer_divider, footer_note, save_button, cancel_button, hint };
         this.update_provider();
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
@@ -480,10 +572,12 @@ impl SettingsWindow {
         move_to(self.autostart, 26, 317 + delta, 510, 25);
         move_to(self.autostart_help, 49, 348 + delta, 492, 23);
         move_to(self.alt_output, 26, 370 + delta, 510, 25);
-        move_to(self.footer_divider, 26, 432 + delta, 520, 2);
-        move_to(self.footer_note, 26, 449 + delta, 328, 23);
-        move_to(self.save_button, 422, 450 + delta, 125, 34);
-        move_to(self.cancel_button, 334, 450 + delta, 78, 34);
+        move_to(self.auto_update, 26, 403 + delta, 330, 25);
+        move_to(self.update_button, 422, 400 + delta, 125, 30);
+        move_to(self.footer_divider, 26, 437 + delta, 520, 2);
+        move_to(self.footer_note, 26, 453 + delta, 328, 23);
+        move_to(self.save_button, 422, 481 + delta, 125, 34);
+        move_to(self.cancel_button, 334, 481 + delta, 78, 34);
         SetWindowPos(self.hwnd, ptr::null_mut(), 0, 0, scaled(586), scaled(548 + delta),
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
     }
@@ -512,6 +606,7 @@ impl SettingsWindow {
             timeout_seconds: Self::get_text(self.timeout),
             debounce_ms: Self::get_text(self.debounce),
             alt_output: SendMessageW(self.alt_output, BM_GETCHECK, 0, 0) as usize == BST_CHECKED,
+            auto_update: SendMessageW(self.auto_update, BM_GETCHECK, 0, 0) as usize == BST_CHECKED,
         }
     }
     pub unsafe fn autostart_checked(&self) -> bool {
@@ -602,6 +697,40 @@ mod tests {
         fs::write(&path, original).unwrap();
         migrate_plaintext_secrets(&base);
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn shared_parser_feeds_settings_and_runtime_defaults() {
+        let base = temp_base("shared");
+        fs::write(base.join("translator.conf"),
+            "provider=OpenAI\nauto_update=off\nalt_output=yes\n             openai_url=http://127.0.0.1:8080/v1/chat/completions\n")
+            .unwrap();
+        let file = ConfigFile::read(&base);
+        assert_eq!(file.provider, "openai");
+        assert!(!file.auto_update);
+        assert!(file.alt_output);
+        assert_eq!(file.openai_url, "http://127.0.0.1:8080/v1/chat/completions");
+        assert_eq!(file.azure_url, DEFAULT_AZURE_URL);
+        assert_eq!(file.openai_model, DEFAULT_OPENAI_MODEL);
+        let values = SettingsValues::from_file(&base);
+        assert_eq!(values.provider, file.provider);
+        assert_eq!(values.auto_update, file.auto_update);
+        assert!(truthy("on", false));
+        assert!(!truthy("No", true));
+        assert!(truthy("", true));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sample_file_is_written_once_and_parsed() {
+        let base = temp_base("sample");
+        ConfigFile::ensure_sample(&base);
+        let text = fs::read_to_string(base.join("translator.conf")).unwrap();
+        assert!(text.contains("auto_update=on"), "sample missing auto_update: {text}");
+        assert!(ConfigFile::read(&base).auto_update);
+        ConfigFile::ensure_sample(&base); // never overwrites an existing file
+        assert_eq!(fs::read_to_string(base.join("translator.conf")).unwrap(), text);
         let _ = fs::remove_dir_all(&base);
     }
 }

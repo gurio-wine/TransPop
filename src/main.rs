@@ -16,7 +16,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 use std::{
     collections::HashMap,
     env,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{BufWriter, Write},
     mem,
     path::{Path, PathBuf},
@@ -176,6 +176,7 @@ static TRANSLATION_SERIAL: AtomicU64 = AtomicU64::new(0);
 static CONFIG_REVISION: AtomicU64 = AtomicU64::new(0);
 static CONFIG_ENABLED: AtomicBool = AtomicBool::new(false);
 static ALT_OUTPUT_ENABLED: AtomicBool = AtomicBool::new(false);
+static AUTO_UPDATE_ENABLED: AtomicBool = AtomicBool::new(true);
 static READY_TRANSLATION: OnceLock<Mutex<Option<ReadyTranslation>>> = OnceLock::new();
 static ALT_GESTURE: OnceLock<Mutex<AltGesture>> = OnceLock::new();
 static PENDING_COMMIT: OnceLock<Mutex<Option<PendingCommit>>> = OnceLock::new();
@@ -204,6 +205,9 @@ const HEALTH_INTERVAL: Duration = Duration::from_secs(60);
 // Give the first update check time to lose to interactive startup work.
 const UPDATE_CHECK_DELAY: Duration = Duration::from_secs(20);
 const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+// Reaching the message loop is the health signal for a freshly self-updated
+// executable; the previous binary stays available for rollback until then.
+const UPDATE_HEALTH_DELAY: Duration = Duration::from_secs(30);
 
 // None of these structures exposes typed characters, clipboard contents, or keys
 // in logs. The keyboard callback only recognizes an isolated physical LAlt tap.
@@ -522,63 +526,26 @@ struct TranslatorConfig {
 
 impl TranslatorConfig {
     fn load(base: &std::path::Path) -> Self {
-        let path = base.join("translator.conf");
-        let sample = "# TransPop translator settings (UTF-8); use tray Settings to apply without restart.\n\
-# provider=bing uses an undocumented Edge/Microsoft webpage endpoint; no API key.\n\
-# The Bing mode may change, block automated calls, or enforce rate limits without notice.\n\
-# Other choices: provider=azure or provider=openai; provider=off sends nothing.\n\
-# API keys saved from Settings are encrypted with Windows DPAPI for the current user.\n\
-# Environment variables TRANSPOP_AZURE_KEY / TRANSPOP_OPENAI_KEY remain safer.\n\
-provider=off\n\
-azure_url=https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=en\n\
-azure_region=\n\
-azure_key=\n\
-openai_url=https://api.openai.com/v1/chat/completions\n\
-openai_model=gpt-4o-mini\n\
-openai_key=\n\
-# A local OpenAI-compatible endpoint can use http://127.0.0.1:PORT/v1/chat/completions.\n\
-timeout_seconds=8\n\
-debounce_ms=300\n\
-# auto_update=on checks GitHub Releases at startup and every 6 hours and installs\n\
-# a newer release after verifying the digest GitHub publishes for its asset.\n\
-auto_update=on\n";
-        if let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(&path) {
-            let _ = file.write_all(sample.as_bytes());
-        }
-        let mut map = HashMap::<String, String>::new();
-        if let Ok(content) = fs::read_to_string(&path) {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') { continue; }
-                if let Some((key, value)) = line.split_once('=') {
-                    map.insert(key.trim().to_ascii_lowercase(), value.trim().to_owned());
-                }
-            }
-        }
-        let get = |key: &str, default: &str| map.get(key).cloned()
-            .unwrap_or_else(|| default.to_string());
+        settings::ConfigFile::ensure_sample(base);
+        let file = settings::ConfigFile::read(base);
+        // Process-level overrides stay here; file parsing, defaults and value
+        // normalization are shared with the settings window.
         let env_or = |key: &str, fallback: String| env::var(key)
             .ok().filter(|value| !value.is_empty()).unwrap_or(fallback);
-        let provider = env_or("TRANSPOP_PROVIDER", get("provider", "off"))
-            .to_ascii_lowercase();
-        let azure_key = env_or("TRANSPOP_AZURE_KEY", secret::open(&get("azure_key", "")));
-        let openai_key = env_or("TRANSPOP_OPENAI_KEY", secret::open(&get("openai_key", "")));
-        let azure_url = env_or("TRANSPOP_AZURE_URL", get("azure_url",
-            "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=en"));
-        let openai_url = env_or("TRANSPOP_OPENAI_URL", get("openai_url",
-            "https://api.openai.com/v1/chat/completions"));
-        let openai_model = env_or("TRANSPOP_OPENAI_MODEL", get("openai_model", "gpt-4o-mini"));
         Self {
-            provider, azure_url, azure_region: env_or("TRANSPOP_AZURE_REGION", get("azure_region", "")),
-            azure_key, openai_url, openai_model, openai_key,
-            timeout_seconds: get("timeout_seconds", "8").parse::<u64>()
+            provider: env_or("TRANSPOP_PROVIDER", file.provider).to_ascii_lowercase(),
+            azure_url: env_or("TRANSPOP_AZURE_URL", file.azure_url),
+            azure_region: env_or("TRANSPOP_AZURE_REGION", file.azure_region),
+            azure_key: env_or("TRANSPOP_AZURE_KEY", file.azure_key),
+            openai_url: env_or("TRANSPOP_OPENAI_URL", file.openai_url),
+            openai_model: env_or("TRANSPOP_OPENAI_MODEL", file.openai_model),
+            openai_key: env_or("TRANSPOP_OPENAI_KEY", file.openai_key),
+            timeout_seconds: file.timeout_seconds.parse::<u64>()
                 .unwrap_or(8).clamp(2, 30),
-            debounce_ms: get("debounce_ms", "300").parse::<u64>()
+            debounce_ms: file.debounce_ms.parse::<u64>()
                 .unwrap_or(300).clamp(100, 1000),
-            auto_update: !matches!(
-                env_or("TRANSPOP_AUTO_UPDATE", get("auto_update", "on"))
-                    .to_ascii_lowercase().as_str(),
-                "off" | "false" | "0" | "no"),
+            auto_update: settings::truthy(
+                &env_or("TRANSPOP_AUTO_UPDATE", String::new()), file.auto_update),
         }
     }
 
@@ -743,11 +710,26 @@ fn finish_translation(
     });
 }
 
+/// Run a long-lived subsystem on a dedicated thread. A panic in one worker
+/// must not leave the process alive with a silently dead feature, so log it
+/// and restart the worker after a short pause.
+fn supervise_worker(name: &'static str, mut body: impl FnMut()) {
+    loop {
+        match panic::catch_unwind(panic::AssertUnwindSafe(&mut body)) {
+            Ok(()) => return,
+            Err(_) => {
+                log_global(format!("WORKER_PANIC_RESTART worker={name}"));
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+}
+
 // This worker ONLY coalesces/debounces. It never waits for an HTTP response,
 // so a slow obsolete translation cannot block the newest first candidate.
 fn translation_worker(
-    rx: Receiver<TranslationRequest>, ui_tx: Sender<OverlayMessage>,
-    log_tx: Sender<LogRecord>, base: PathBuf,
+    rx: &Receiver<TranslationRequest>, ui_tx: &Sender<OverlayMessage>,
+    log_tx: &Sender<LogRecord>, base: &Path,
 ) {
     // Keep the worker alive even when provider=off. Settings can turn it on
     // without restarting TransPop; new candidates pick up the new revision.
@@ -1372,11 +1354,11 @@ fn targeted_candidate(
 }
 
 fn candidate_worker(
-    rx: Receiver<ProbeRequest>,
-    log_tx: Sender<LogRecord>,
-    ui_tx: Sender<OverlayMessage>,
-    translate_tx: Sender<TranslationRequest>,
-    ready_tx: Sender<bool>,
+    rx: &Receiver<ProbeRequest>,
+    log_tx: &Sender<LogRecord>,
+    ui_tx: &Sender<OverlayMessage>,
+    translate_tx: &Sender<TranslationRequest>,
+    ready_tx: &Sender<bool>,
 ) {
     // The event probe has proved FindAll(Children, TrueCondition) on this PC.
     // Retry occasional COM/UIA initialization errors, but never silently
@@ -1601,10 +1583,10 @@ fn candidate_worker(
 }
 
 fn uia_event_worker(
-    log_tx: Sender<LogRecord>,
-    ui_tx: Sender<OverlayMessage>,
-    probe_tx: Sender<ProbeRequest>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
+    log_tx: &Sender<LogRecord>,
+    ui_tx: &Sender<OverlayMessage>,
+    probe_tx: &Sender<ProbeRequest>,
+    stop: &AtomicBool,
 ) {
     let automation = match UIAutomation::new() {
         Ok(value) => value,
@@ -1713,9 +1695,9 @@ fn uia_event_worker(
 }
 
 fn log_worker(
-    rx: Receiver<LogRecord>,
-    path: PathBuf,
-    probe_tx: Sender<ProbeRequest>,
+    rx: &Receiver<LogRecord>,
+    path: &Path,
+    probe_tx: &Sender<ProbeRequest>,
 ) {
     // Only this thread owns the log file. Rotate the previous session once,
     // then roll over at 2 MiB while the process is running. Keeping a single
@@ -2132,7 +2114,6 @@ fn main() {
             return;
         }
     };
-    update::remove_stale_backup();
     let seconds = arguments.windows(2).find(|w| w[0] == "--seconds")
         .and_then(|w| w[1].parse::<u64>().ok()).filter(|v| *v > 0);
     START.set(Instant::now()).ok();
@@ -2156,12 +2137,24 @@ fn main() {
     let (probe_tx, probe_rx) = mpsc::channel::<ProbeRequest>();
     let log_probe_tx = probe_tx.clone();
     let uia_probe_tx = probe_tx.clone();
-    thread::spawn(move || log_worker(log_rx, logfile, log_probe_tx));
+    thread::spawn(move || supervise_worker("log", || log_worker(&log_rx, &logfile, &log_probe_tx)));
+    // A self-update leaves the previous exe next to this one; it is the manual
+    // rollback path until this process proves it reaches its message loop.
+    if let Some(backup) = update::stale_backup() {
+        log_line(&log_tx, format!("UPDATE_BACKUP_PRESENT path={}", backup.display()));
+        let health_log = log_tx.clone();
+        thread::spawn(move || {
+            thread::sleep(UPDATE_HEALTH_DELAY);
+            update::remove_backup(&backup);
+            log_line(&health_log, "UPDATE_BACKUP_REMOVED previous_version_healthy");
+        });
+    }
     // Legacy plaintext keys must not survive an upgrade; failures are logged
     // and deliberately keep the app running.
     settings::migrate_plaintext_secrets(&base);
     let config = TranslatorConfig::load(&base);
     ALT_OUTPUT_ENABLED.store(settings::SettingsValues::from_file(&base).alt_output, Ordering::Release);
+    AUTO_UPDATE_ENABLED.store(config.auto_update, Ordering::Release);
     let configuration_status = config.readiness();
     CONFIG_ENABLED.store(configuration_status.is_ok(), Ordering::Release);
     let provider_label = config.provider.clone();
@@ -2171,7 +2164,9 @@ fn main() {
     let translation_ui = ui_tx.clone();
     let translation_log = log_tx.clone();
     let translation_base = base.clone();
-    thread::spawn(move || translation_worker(translate_rx, translation_ui, translation_log, translation_base));
+    thread::spawn(move || supervise_worker("translation", || {
+        translation_worker(&translate_rx, &translation_ui, &translation_log, &translation_base)
+    }));
     log_line(&log_tx, format!("---- TransPop v{VERSION} started ----"));
     log_line(&log_tx, "Candidate text is not written to the log.");
     log_line(&log_tx, "SINGLE_INSTANCE_MUTEX_ACQUIRED");
@@ -2181,7 +2176,9 @@ fn main() {
     let (ready_tx, ready_rx) = mpsc::channel::<bool>();
     let worker_log = log_tx.clone();
     let worker_ui = ui_tx.clone();
-    thread::spawn(move || candidate_worker(probe_rx, worker_log, worker_ui, translate_tx, ready_tx));
+    thread::spawn(move || supervise_worker("candidate", || {
+        candidate_worker(&probe_rx, &worker_log, &worker_ui, &translate_tx, &ready_tx)
+    }));
     if !matches!(ready_rx.recv_timeout(Duration::from_secs(5)), Ok(true)) {
         eprintln!("TransPop 候选读取线程初始化失败，详细原因见 transpop-v{VERSION}.log。");
         log_line(&log_tx, "ABORT_UIA_READER_NOT_READY");
@@ -2289,7 +2286,9 @@ fn main() {
         let event_log = log_tx.clone();
         let event_ui = ui_tx.clone();
         let event_stop = Arc::clone(&stop);
-        thread::spawn(move || uia_event_worker(event_log, event_ui, uia_probe_tx, event_stop));
+        thread::spawn(move || supervise_worker("uia-event", || {
+            uia_event_worker(&event_log, &event_ui, &uia_probe_tx, &event_stop)
+        }));
 
         let mut hooks = Vec::new();
         for (first, last) in [
@@ -2375,6 +2374,13 @@ fn main() {
                     if let Some(ref settings_ui) = settings_window { settings_ui.update_provider(); }
                     continue;
                 }
+                settings::UPDATE_MESSAGE if msg.hwnd == control => {
+                    log_global("UPDATE_CHECK_MANUAL");
+                    let update_base = base.clone();
+                    let update_log = log_tx.clone();
+                    thread::spawn(move || update_worker(update_base, true, update_log));
+                    continue;
+                }
                 settings::CANCEL_MESSAGE if msg.hwnd == control => {
                     if let Some(settings_ui) = settings_window.take() { settings_ui.close(); }
                     log_global("SETTINGS_CANCELED");
@@ -2401,6 +2407,8 @@ fn main() {
                                     autostart_error = Some(reason);
                                 }
                                 ALT_OUTPUT_ENABLED.store(values.alt_output, Ordering::Release);
+                                let was_auto_update = AUTO_UPDATE_ENABLED
+                                    .swap(values.auto_update, Ordering::AcqRel);
                                 if values.alt_output && keyboard_hook.is_null() {
                                     keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL,
                                         Some(alt_keyboard_callback), instance, 0);
@@ -2417,6 +2425,16 @@ fn main() {
                                     log_global(format!("AUTOSTART_CHANGED enabled={wants_autostart}"));
                                 }
                                 log_global(format!("SETTINGS_SAVED provider={}", values.provider));
+                                log_global(format!("AUTO_UPDATE_SETTING enabled={}", values.auto_update));
+                                if values.auto_update && !was_auto_update {
+                                    let update_base = base.clone();
+                                    let update_log = log_tx.clone();
+                                    thread::spawn(move || {
+                                        thread::sleep(Duration::from_secs(5));
+                                        update_worker(update_base, false, update_log);
+                                    });
+                                    log_global("UPDATE_CHECK_SCHEDULED setting_enabled");
+                                }
                                 // Invalidate all in-flight old translations and
                                 // force a fresh targeted read during composition.
                                 let enabled = TranslatorConfig::load(&base).readiness().is_ok();
@@ -2527,7 +2545,8 @@ fn main() {
                             TRANSLATION_PAUSED.load(Ordering::Acquire), tray.registered));
                         last_main_health = Instant::now();
                     }
-                    if auto_update && last_update_check.elapsed() >= UPDATE_INTERVAL {
+                    if AUTO_UPDATE_ENABLED.load(Ordering::Acquire)
+                        && last_update_check.elapsed() >= UPDATE_INTERVAL {
                         last_update_check = Instant::now();
                         let update_base = base.clone();
                         let update_log = log_tx.clone();
@@ -2568,6 +2587,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supervisor_restarts_after_panic() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        supervise_worker("test", move || {
+            if counter.fetch_add(1, Ordering::SeqCst) < 2 { panic!("boom"); }
+        });
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
 
     struct FakeItem {
         name: Option<&'static str>,

@@ -20,12 +20,13 @@ cargo build --release
 ## 使用
 
 - 托盘图标：左键暂停 / 恢复，右键菜单可打开设置、检查更新、暂停或退出
+- 设置窗口标题旁显示当前版本；窗口内可直接开关「自动检查并安装 GitHub 更新」，也可点「检查更新」
 - 快捷键：`Ctrl+Alt+Q` 退出
 - 命令行：`--settings`、`--pause`、`--resume`、`--quit`
 
 ## 配置
 
-配置文件：`%LOCALAPPDATA%\TransPop\translator.conf`（首次运行自动生成，默认 `provider=off`，不联网）。托盘「设置...」修改后立即生效。
+配置文件：`%LOCALAPPDATA%\TransPop\translator.conf`（首次运行自动生成，默认 `provider=off`，不联网）。托盘「设置...」或 `--settings` 打开设置窗口，保存后立即生效。
 
 | 键 | 说明 |
 |---|---|
@@ -43,7 +44,9 @@ cargo build --release
 
 ## 自动更新
 
-启动 20 秒后以及之后每 6 小时，TransPop 会查询 GitHub Releases 的最新版本（`auto_update=on`，默认）。发现新版本时下载 `transpop.exe`，用 GitHub 公布的 `sha256` 摘要校验后再替换自身并重启；校验失败不会安装。托盘右键「检查更新...」可手动触发并显示结果。更新文件存放在 `%LOCALAPPDATA%\TransPop\update\`。
+启动 20 秒后以及之后每 6 小时，TransPop 会查询 GitHub Releases 的最新版本（`auto_update=on`，默认，可在设置窗口关闭）。发现新版本时下载 `transpop.exe`，用 GitHub 公布的 `sha256` 摘要校验后再替换自身并重启；校验失败不会安装。托盘右键「检查更新...」或设置窗口的「检查更新」可手动触发并显示结果。更新文件存放在 `%LOCALAPPDATA%\TransPop\update\`。
+
+更新时旧版本会先改名为 `transpop.exe.old`。新版本成功进入消息循环并稳定运行 30 秒后才删除该备份；若新版本启动即崩溃，旧的 `transpop.exe.old` 会保留，可手动改回 `transpop.exe` 回滚。
 
 ## 日志
 
@@ -56,3 +59,4 @@ cargo build --release
 - API Key 由 DPAPI 绑定当前 Windows 用户，更换用户或重装系统后需要重新填写
 - 气泡位置跟随输入法候选窗计算，不支持拖动或跨重启记住位置
 - 自动更新需要能访问 GitHub；若安装目录不可写（例如 Program Files），替换会失败并只记录日志（手动检查时会弹窗提示）
+- 回滚备份 `transpop.exe.old` 只保留到新版本稳定运行 30 秒；更早的崩溃需要重新安装旧版本
