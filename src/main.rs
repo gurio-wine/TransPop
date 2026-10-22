@@ -1330,7 +1330,23 @@ fn selected_candidate(panel: &UIElement, all: &UICondition, hint: Option<&Select
 
     let views: Vec<UiaItem> = items.iter().enumerate()
         .map(|(index, element)| UiaItem { element, index }).collect();
-    Ok(pick_candidate(&views, container_selected.as_deref(),
+    let picked = pick_candidate(&views, container_selected.as_deref(),
+        hint.map(|hint| (hint.text.as_str(), hint.bounds)));
+    if picked.is_some() { return Ok(picked); }
+
+    // Windows 11 can nest the entries below an intermediate list that the
+    // Children pass above never sees; one bounded descendant scan is cheap and
+    // only runs when the direct children yielded nothing.
+    let nested = panel.find_all(TreeScope::Descendants, all)
+        .map_err(|e| format!("candidate_descendants: {e}"))?;
+    let nested_items: Vec<UIElement> = nested.into_iter().take(96)
+        .filter(|child| matches!(child.get_control_type(),
+            Ok(ControlType::ListItem) | Ok(ControlType::MenuItem)))
+        .take(48).collect();
+    if nested_items.is_empty() { return Ok(None); }
+    let nested_views: Vec<UiaItem> = nested_items.iter().enumerate()
+        .map(|(index, element)| UiaItem { element, index }).collect();
+    Ok(pick_candidate(&nested_views, container_selected.as_deref(),
         hint.map(|hint| (hint.text.as_str(), hint.bounds))))
 }
 
@@ -1430,17 +1446,14 @@ fn targeted_candidate(
     candidate_from_panel(&panel, all, hint)
 }
 
-/// Reads the pane that an IME event delivered. Returns nothing when no pane is
-/// cached yet or it exposes no candidate; the caller then falls back to the
-/// window-handle lookup that Windows 10 serves well.
-fn read_cached_panel(
-    cache: &RefCell<Option<UIElement>>,
+/// Reads the highlighted candidate out of any pane element, whichever event
+/// delivered it.
+fn read_panel(
+    panel: &UIElement,
     all: &UICondition,
     hint: Option<&SelectionHint>,
     log_tx: &Sender<LogRecord>,
 ) -> Option<Candidate> {
-    let cached = cache.borrow();
-    let panel = cached.as_ref()?;
     match candidate_from_panel(panel, all, hint) {
         Ok(Some(candidate)) => {
             PANEL_DIRECT.store(true, Ordering::Release);
@@ -1452,6 +1465,82 @@ fn read_cached_panel(
             None
         }
     }
+}
+
+/// Reads the pane that an IME event delivered. Returns nothing when no pane is
+/// cached yet or it exposes no candidate; the caller then falls back to the
+/// window-handle lookup that Windows 10 serves well.
+fn read_cached_panel(
+    cache: &RefCell<Option<UIElement>>,
+    all: &UICondition,
+    hint: Option<&SelectionHint>,
+    log_tx: &Sender<LogRecord>,
+) -> Option<Candidate> {
+    let cached = cache.borrow();
+    let panel = cached.as_ref()?;
+    read_panel(panel, all, hint, log_tx)
+}
+
+/// Climbs from an event source to its enclosing IME pane. Windows 11 reports
+/// selection on the candidate item itself, and the pane cached from MenuOpened
+/// can already be stale, so the live source is the reliable way back to it.
+fn panel_ancestor(automation: &UIAutomation, sender: &UIElement, max_hops: usize)
+    -> Option<UIElement>
+{
+    let walker = automation.get_control_view_walker().ok()?;
+    let mut current = sender.clone();
+    for _ in 0..max_hops {
+        if is_panel(&current.get_automation_id().unwrap_or_default()) {
+            return Some(current);
+        }
+        current = walker.get_parent(&current).ok()?;
+    }
+    None
+}
+
+/// Last resort when the pane exposes no readable list: the selected entry is
+/// itself the candidate, so its own name is the text. The bubble still anchors
+/// to the pane so it drops in under the whole candidate strip.
+fn candidate_from_sender(sender: &UIElement, name: &str, pane: Option<&UIElement>)
+    -> Option<Candidate>
+{
+    let text = name.trim();
+    if text.is_empty() { return None; }
+    let rect = pane.and_then(|panel| panel.get_bounding_rectangle().ok())
+        .or_else(|| sender.get_bounding_rectangle().ok())?;
+    let (left, top, right, bottom) = (
+        rect.get_left(), rect.get_top(), rect.get_right(), rect.get_bottom()
+    );
+    if !(20..=2200).contains(&(right - left))
+        || !(16..=700).contains(&(bottom - top)) {
+        return None;
+    }
+    Some(Candidate {
+        text: text.chars().take(100).collect(),
+        selection_index: 0,
+        selection_source: "selection-sender",
+        left, top, right, bottom,
+    })
+}
+
+/// Describes a pane once per throttle window, so a build that still cannot read
+/// Windows 11 candidates leaves behind enough shape information to fix it.
+fn panel_shape(panel: &UIElement, all: &UICondition) -> String {
+    let id = panel.get_automation_id().unwrap_or_default();
+    let kind = panel.get_control_type().ok();
+    let offscreen = panel.is_offscreen().unwrap_or(false);
+    let mut children = String::new();
+    if let Ok(list) = panel.find_all(TreeScope::Children, all) {
+        for (index, child) in list.into_iter().take(6).enumerate() {
+            if index > 0 { children.push(','); }
+            children.push_str(&format!("{:?}:{}:{}:{}",
+                child.get_control_type().ok(),
+                child.get_automation_id().unwrap_or_default(),
+                child.get_name().map(|name| name.chars().count()).unwrap_or(0),
+                child.is_offscreen().unwrap_or(false)));
+        }
+    }
+    format!("PANEL_SHAPE id={id:?} type={kind:?} off={offscreen} children=[{children}]")
 }
 
 fn candidate_worker(
@@ -1560,6 +1649,11 @@ fn candidate_worker(
         let Some(request) = incoming else { continue; };
         if TRANSLATION_PAUSED.load(Ordering::Acquire)
             || request.epoch != CANDIDATE_EPOCH.load(Ordering::Acquire) { continue; }
+        // Once an event-delivered pane has been read a few times, handle
+        // lookups are known to miss on this host; skip their COM cost.
+        if request.candidate.is_none()
+            && PANEL_DIRECT.load(Ordering::Acquire)
+            && HWND_READ_MISSES.load(Ordering::Acquire) >= 3 { continue; }
         if request.candidate.is_none() {
             if recent.get(&request.hwnd).is_some_and(|at| at.elapsed() < Duration::from_millis(50)) {
                 continue;
@@ -1742,6 +1836,9 @@ fn uia_event_worker(
     // it to subscribers but not through ElementFromHandle, so event callbacks
     // read it directly instead of asking the reader to re-resolve the window.
     let panel_cache: RefCell<Option<UIElement>> = RefCell::new(None);
+    // The callback needs to climb from an event source to its pane, which is a
+    // UIAutomation call; the handle is cloneable and stays on this apartment.
+    let cb_automation = automation.clone();
     let callback: Box<CustomEventHandlerFn> = Box::new(move |sender, event| {
         // The event source is already a small IME pane. Never traverse a UIA tree here.
         let id = sender.get_automation_id().unwrap_or_default();
@@ -1769,7 +1866,38 @@ fn uia_event_worker(
                     epoch: CANDIDATE_EPOCH.load(Ordering::Acquire),
                     bounds, observed: Instant::now(),
                 };
-                let direct = read_cached_panel(&panel_cache, &cb_all, Some(&hint), &cb_log);
+                // Windows 11 reports the selection on the item, and the pane
+                // cached at MenuOpened goes stale, so re-derive the pane from
+                // this live source before falling back to the cached copy.
+                let direct = match panel_ancestor(&cb_automation, sender, 6) {
+                    Some(pane) => {
+                        *panel_cache.borrow_mut() = Some(pane.clone());
+                        let direct = read_panel(&pane, &cb_all, Some(&hint), &cb_log);
+                        if direct.is_none() && probe_log_due() {
+                            log_line(&cb_log, panel_shape(&pane, &cb_all));
+                        }
+                        direct
+                    }
+                    None => read_cached_panel(&panel_cache, &cb_all, Some(&hint), &cb_log),
+                };
+                // A selection that comes from the candidate pane is itself the
+                // highlighted entry, so its own name is the text even when the
+                // pane refuses to enumerate. Text events are left out: they are
+                // mostly unrelated page text, not IME entries.
+                let direct = direct.or_else(|| {
+                    if !matches!(event_type, Some(ControlType::ListItem)
+                        | Some(ControlType::MenuItem)) {
+                        return None;
+                    }
+                    let pane = panel_cache.borrow();
+                    let fallback = pane.as_ref()
+                        .and_then(|panel| candidate_from_sender(sender, &name, Some(panel)));
+                    if fallback.is_some() {
+                        PANEL_DIRECT.store(true, Ordering::Release);
+                        log_line(&cb_log, "PANEL_SENDER_FALLBACK");
+                    }
+                    fallback
+                });
                 if let Ok(mut slot) = selection_hint_lock().lock() {
                     *slot = Some(hint);
                 }
@@ -1794,6 +1922,9 @@ fn uia_event_worker(
                 // so later selection events can read it without a window handle.
                 *panel_cache.borrow_mut() = Some(sender.clone());
                 let direct = read_cached_panel(&panel_cache, &cb_all, None, &cb_log);
+                if direct.is_none() && probe_log_due() {
+                    log_line(&cb_log, panel_shape(sender, &cb_all));
+                }
                 // The first opening event may precede a WinEvent. Probe the
                 // previously observed CoreWindow once, and keep active checks
                 // gated on the menu state until a matching MenuClosed arrives.
@@ -1811,6 +1942,10 @@ fn uia_event_worker(
             } else if event == UIEventType::MenuClosed {
                 IME_MENU_CLOSE_SEQ.fetch_add(1, Ordering::AcqRel);
                 *panel_cache.borrow_mut() = None;
+                // The next composition may open on a host whose handle path
+                // works, so allow those lookups again from a clean slate.
+                PANEL_DIRECT.store(false, Ordering::Release);
+                HWND_READ_MISSES.store(0, Ordering::Release);
                 MENU_OPEN.store(false, Ordering::Release);
                 clear_ready_translation();
                 cancel_pending_unless_cancel_sent();

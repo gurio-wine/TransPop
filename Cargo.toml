@@ -1,6 +1,6 @@
 [package]
 name = "transpop"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 description = "Translate the highlighted Chinese IME candidate to English in real time on Windows"
 license = "MIT"
