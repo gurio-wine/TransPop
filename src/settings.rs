@@ -921,7 +921,7 @@ impl SettingsWindow {
         let alt_output = create("BUTTON", "轻按左 Alt：取消拼音并输入英文", ID_ALT_OUTPUT,
             BS_OWNERDRAW | WS_TABSTOP);
         set_button_checked(alt_output, values.alt_output);
-        let auto_update = create("BUTTON", "自动检查并安装 GitHub 更新", ID_AUTO_UPDATE,
+        let auto_update = create("BUTTON", "自动检查 GitHub 更新", ID_AUTO_UPDATE,
             BS_OWNERDRAW | WS_TABSTOP);
         set_button_checked(auto_update, values.auto_update);
         let update_button = create("BUTTON", "检查更新", ID_UPDATE, WS_TABSTOP);

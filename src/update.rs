@@ -105,8 +105,14 @@ pub fn is_newer(current: &str, candidate: &str) -> bool {
     }
 }
 
-/// Download the release executable into the given directory and verify its digest.
-pub fn download(release: &Release, dir: &Path) -> Result<PathBuf, String> {
+/// Download the release executable into the given directory and verify its
+/// digest. `progress` receives a percentage after every chunk (0 means the
+/// server did not report a length).
+pub fn download(
+    release: &Release,
+    dir: &Path,
+    progress: &mut dyn FnMut(u32),
+) -> Result<PathBuf, String> {
     fs::create_dir_all(dir).map_err(|e| format!("create update dir: {e}"))?;
     let safe_tag: String = release.tag.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
@@ -117,14 +123,30 @@ pub fn download(release: &Release, dir: &Path) -> Result<PathBuf, String> {
         .set("User-Agent", USER_AGENT)
         .call()
         .map_err(transport_error)?;
+    let total = response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let mut reader = response.into_reader();
     let mut bytes = Vec::new();
-    response.into_reader().take(MAX_DOWNLOAD + 1).read_to_end(&mut bytes)
-        .map_err(|_| "download read error".to_string())?;
-    if bytes.len() as u64 > MAX_DOWNLOAD { return Err("download too large".to_string()); }
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut chunk).map_err(|_| "download read error".to_string())?;
+        if read == 0 { break; }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() as u64 > MAX_DOWNLOAD { return Err("download too large".to_string()); }
+        let percent = if total == 0 {
+            0
+        } else {
+            (bytes.len() as u64 * 100 / total).min(100) as u32
+        };
+        progress(percent);
+    }
     if !sha256_hex(&bytes).eq_ignore_ascii_case(&release.sha256) {
         return Err("UPDATE_DIGEST_MISMATCH".to_string());
     }
     fs::write(&path, &bytes).map_err(|e| format!("write update file: {e}"))?;
+    progress(100);
     Ok(path)
 }
 

@@ -20,7 +20,7 @@ cargo build --release
 ## 使用
 
 - 托盘图标：左键暂停 / 恢复，右键菜单可打开设置、检查更新、暂停或退出
-- 设置窗口标题旁显示当前版本；窗口内可直接开关「自动检查并安装 GitHub 更新」，也可点「检查更新」
+- 设置窗口标题旁显示当前版本；窗口内可直接开关「自动检查 GitHub 更新」，也可点「检查更新」
 - 快捷键：`Ctrl+Alt+Q` 退出
 - 命令行：`--settings`、`--pause`、`--resume`、`--quit`
 
@@ -34,7 +34,7 @@ cargo build --release
 | `timeout_seconds` | 请求超时，2–30 秒 |
 | `debounce_ms` | 翻译防抖，100–1000 毫秒 |
 | `alt_output` | `true` 时启用轻按左 Alt 直接输入英文 |
-| `auto_update` | `on`（默认）时自动检查并安装 GitHub 新版本，`off` 关闭 |
+| `auto_update` | `on`（默认）时自动检查 GitHub 新版本并弹窗询问是否更新，`off` 关闭 |
 
 也可以用环境变量覆盖（仅运行时生效，不会写回文件）：`TRANSPOP_PROVIDER`、`TRANSPOP_AZURE_KEY`、`TRANSPOP_AZURE_URL`、`TRANSPOP_AZURE_REGION`、`TRANSPOP_OPENAI_KEY`、`TRANSPOP_OPENAI_URL`、`TRANSPOP_OPENAI_MODEL`、`TRANSPOP_AUTO_UPDATE`。
 
@@ -44,7 +44,7 @@ cargo build --release
 
 ## 自动更新
 
-启动 20 秒后以及之后每 6 小时，TransPop 会查询 GitHub Releases 的最新版本（`auto_update=on`，默认，可在设置窗口关闭）。发现新版本时下载 `transpop.exe`，用 GitHub 公布的 `sha256` 摘要校验后再替换自身并重启；校验失败不会安装。托盘右键「检查更新...」或设置窗口的「检查更新」可手动触发并显示结果。更新文件存放在 `%LOCALAPPDATA%\TransPop\update\`。
+启动 20 秒后以及之后每 6 小时，TransPop 会查询 GitHub Releases 的最新版本（`auto_update=on`，默认，可在设置窗口关闭）。发现新版本时先弹出前台窗口告知版本并询问是否更新，确认后才开始下载，下载过程在同一窗口显示进度；下载完成后用 GitHub 公布的 `sha256` 摘要校验，通过后替换自身并自动重启（新进程会等旧进程退出后再启动）。选择「稍后」则本次不下载，下次检查或手动检查时再询问。托盘右键「检查更新...」或设置窗口的「检查更新」可手动触发同一流程。更新文件存放在 `%LOCALAPPDATA%\TransPop\update\`。
 
 更新时旧版本会先改名为 `transpop.exe.old`。新版本成功进入消息循环并稳定运行 30 秒后才删除该备份；若新版本启动即崩溃，旧的 `transpop.exe.old` 会保留，可手动改回 `transpop.exe` 回滚。
 
@@ -58,5 +58,5 @@ cargo build --release
 - 仅支持微软拼音的候选窗（UIAutomation `IME_Candidate_Window` / `IME_Prediction_Window`）
 - API Key 由 DPAPI 绑定当前 Windows 用户，更换用户或重装系统后需要重新填写
 - 气泡位置跟随输入法候选窗计算，不支持拖动或跨重启记住位置
-- 自动更新需要能访问 GitHub；若安装目录不可写（例如 Program Files），替换会失败并只记录日志（手动检查时会弹窗提示）
+- 自动更新需要能访问 GitHub；若安装目录不可写（例如 Program Files），替换会失败并弹窗提示，同时写入日志
 - 回滚备份 `transpop.exe.old` 只保留到新版本稳定运行 30 秒；更早的崩溃需要重新安装旧版本

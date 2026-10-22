@@ -5,6 +5,7 @@ mod secret;
 mod settings;
 mod startup;
 mod update;
+mod update_ui;
 
 /// Single source of truth for every version string in logs and CLI output.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -2330,7 +2331,8 @@ fn log_global(line: impl Into<String>) {
     if let Some(tx) = LOG_TX.get() { log_line(tx, line); }
 }
 
-// Network work never runs on the UI message loop.
+// Network work never runs on the UI message loop. A found release is announced
+// in a foreground prompt first; the download starts only after the user agrees.
 fn update_worker(base: PathBuf, manual: bool, log_tx: Sender<LogRecord>) {
     let release = match update::latest() {
         Ok(release) => release,
@@ -2346,21 +2348,40 @@ fn update_worker(base: PathBuf, manual: bool, log_tx: Sender<LogRecord>) {
         return;
     }
     log_line(&log_tx, format!("UPDATE_AVAILABLE remote={}", release.tag));
-    let downloaded = match update::download(&release, &base.join("update")) {
+    let Some(mut prompt) = (unsafe { update_ui::UpdatePrompt::open(&release.tag) }) else {
+        log_line(&log_tx, "UPDATE_PROMPT_FAILED");
+        return;
+    };
+    if !unsafe { prompt.wait_for_decision() } {
+        unsafe { prompt.close() };
+        log_line(&log_tx, "UPDATE_POSTPONED");
+        return;
+    }
+    log_line(&log_tx, format!("UPDATE_DOWNLOAD_STARTED remote={}", release.tag));
+    unsafe { prompt.start_download() };
+    let download_dir = base.join("update");
+    let downloaded = match update::download(&release, &download_dir, &mut |percent| {
+        unsafe {
+            prompt.set_percent(percent);
+            prompt.pump();
+        }
+    }) {
         Ok(path) => path,
         Err(reason) => {
+            unsafe { prompt.close() };
             log_line(&log_tx, format!("UPDATE_DOWNLOAD_FAILED {reason}"));
-            if manual {
-                update_notice("自动更新", &format!("下载新版本 {} 失败：{reason}", release.tag));
-            }
+            update_notice("自动更新", &format!("下载新版本 {} 失败：{reason}", release.tag));
             return;
         }
     };
     log_line(&log_tx, "UPDATE_DOWNLOADED_AND_VERIFIED");
-    if manual {
-        update_notice("自动更新", &format!("发现新版本 {}，正在更新并重启 TransPop。", release.tag));
+    unsafe {
+        prompt.install();
+        prompt.pump();
     }
-    match update::apply(&downloaded) {
+    let applied = update::apply(&downloaded);
+    unsafe { prompt.close() };
+    match applied {
         Ok(()) => {
             log_line(&log_tx, format!("UPDATE_APPLIED version={} restarting", release.tag));
             let hwnd = CONTROL_HWND.load(Ordering::Acquire) as HWND;
@@ -2368,7 +2389,7 @@ fn update_worker(base: PathBuf, manual: bool, log_tx: Sender<LogRecord>) {
         }
         Err(reason) => {
             log_line(&log_tx, format!("UPDATE_APPLY_FAILED {reason}"));
-            if manual { update_notice("自动更新", &format!("安装新版本失败：{reason}")); }
+            update_notice("自动更新", &format!("安装新版本失败：{reason}"));
         }
     }
 }
@@ -2390,8 +2411,10 @@ fn main() {
     let arguments: Vec<String> = env::args().skip(1).collect();
 
     // A self-update starts this copy while the previous instance is still
-    // shutting down; wait for it to release the single-instance window.
-    if arguments.iter().any(|v| v == "--after-update") {
+    // shutting down: its control window disappears before it closes the
+    // single-instance mutex, so wait for the window first and retry the mutex.
+    let restarting = arguments.iter().any(|v| v == "--after-update");
+    if restarting {
         for _ in 0..100 {
             if unsafe { FindWindowW(static_class.as_ptr(), control_title.as_ptr()) }.is_null() {
                 break;
@@ -2421,17 +2444,32 @@ fn main() {
         return;
     }
     // The control window isn't present yet during early startup. A mutex
-    // prevents a second copy from starting during that small gap.
-    let _instance_guard = match acquire_instance() {
-        Ok(Some(guard)) => guard,
-        Ok(None) => {
-            eprintln!("TransPop is already starting or running.");
-            return;
+    // prevents a second copy from starting during that small gap. A copy
+    // started by a self-update retries while its predecessor shuts down.
+    let attempts = if restarting { 150 } else { 1 };
+    let mut instance = None;
+    for attempt in 0..attempts {
+        match acquire_instance() {
+            Ok(Some(guard)) => {
+                instance = Some(guard);
+                break;
+            }
+            Ok(None) => {
+                if !restarting || attempt + 1 == attempts {
+                    eprintln!("TransPop is already starting or running.");
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(code) => {
+                eprintln!("TransPop single-instance initialization failed (Windows error {code}).");
+                return;
+            }
         }
-        Err(code) => {
-            eprintln!("TransPop single-instance initialization failed (Windows error {code}).");
-            return;
-        }
+    }
+    let _instance_guard = match instance {
+        Some(guard) => guard,
+        None => return,
     };
     let seconds = arguments.windows(2).find(|w| w[0] == "--seconds")
         .and_then(|w| w[1].parse::<u64>().ok()).filter(|v| *v > 0);
