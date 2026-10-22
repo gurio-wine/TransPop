@@ -1470,15 +1470,18 @@ fn read_panel(
 /// Reads the pane that an IME event delivered. Returns nothing when no pane is
 /// cached yet or it exposes no candidate; the caller then falls back to the
 /// window-handle lookup that Windows 10 serves well.
+///
+/// The clone matters: a UIA provider can re-enter the event callback from
+/// inside these COM calls, and holding the borrow across them makes that
+/// nested callback panic on the cache it wants to update.
 fn read_cached_panel(
     cache: &RefCell<Option<UIElement>>,
     all: &UICondition,
     hint: Option<&SelectionHint>,
     log_tx: &Sender<LogRecord>,
 ) -> Option<Candidate> {
-    let cached = cache.borrow();
-    let panel = cached.as_ref()?;
-    read_panel(panel, all, hint, log_tx)
+    let panel = cache.try_borrow().ok().and_then(|slot| slot.clone())?;
+    read_panel(&panel, all, hint, log_tx)
 }
 
 /// Climbs from an event source to its enclosing IME pane. Windows 11 reports
@@ -1840,126 +1843,154 @@ fn uia_event_worker(
     // UIAutomation call; the handle is cloneable and stays on this apartment.
     let cb_automation = automation.clone();
     let callback: Box<CustomEventHandlerFn> = Box::new(move |sender, event| {
-        // The event source is already a small IME pane. Never traverse a UIA tree here.
-        let id = sender.get_automation_id().unwrap_or_default();
-        let name = sender.get_name().unwrap_or_default();
-        if event == UIEventType::SelectionItem_ElementSelected {
-            if TRANSLATION_PAUSED.load(Ordering::Acquire) { return Ok(()); }
-            // Diagnose the event itself instead of merely requesting a refresh.
-            // The user's previous log showed first-fallback every time, but
-            // that build never logged whether SelectionItem events arrived.
-            let foreground = unsafe { GetForegroundWindow() } as usize;
-            let event_type = sender.get_control_type().ok();
-            let bounds = sender.get_bounding_rectangle().ok().map(|r| {
-                (r.get_left(), r.get_top(), r.get_right(), r.get_bottom())
-            });
-            let plausible = MENU_OPEN.load(Ordering::Acquire)
-                && !name.trim().is_empty() && name.chars().count() <= 100
-                && matches!(event_type, Some(ControlType::ListItem)
-                    | Some(ControlType::MenuItem) | Some(ControlType::Text));
-            log_line(&cb_log, format!(
-                "UIA_SELECTION_EVENT type={event_type:?} name_chars={} bounds={} accepted={plausible}",
-                name.chars().count(), bounds.is_some()));
-            if plausible {
-                let hint = SelectionHint {
-                    text: name.clone(), foreground,
-                    epoch: CANDIDATE_EPOCH.load(Ordering::Acquire),
-                    bounds, observed: Instant::now(),
-                };
-                // Windows 11 reports the selection on the item, and the pane
-                // cached at MenuOpened goes stale, so re-derive the pane from
-                // this live source before falling back to the cached copy.
-                let direct = match panel_ancestor(&cb_automation, sender, 6) {
-                    Some(pane) => {
-                        *panel_cache.borrow_mut() = Some(pane.clone());
-                        let direct = read_panel(&pane, &cb_all, Some(&hint), &cb_log);
-                        if direct.is_none() && probe_log_due() {
-                            log_line(&cb_log, panel_shape(&pane, &cb_all));
-                        }
-                        direct
-                    }
-                    None => read_cached_panel(&panel_cache, &cb_all, Some(&hint), &cb_log),
-                };
-                // A selection that comes from the candidate pane is itself the
-                // highlighted entry, so its own name is the text even when the
-                // pane refuses to enumerate. Text events are left out: they are
-                // mostly unrelated page text, not IME entries.
-                let direct = direct.or_else(|| {
-                    if !matches!(event_type, Some(ControlType::ListItem)
-                        | Some(ControlType::MenuItem)) {
-                        return None;
-                    }
-                    let pane = panel_cache.borrow();
-                    let fallback = pane.as_ref()
-                        .and_then(|panel| candidate_from_sender(sender, &name, Some(panel)));
-                    if fallback.is_some() {
-                        PANEL_DIRECT.store(true, Ordering::Release);
-                        log_line(&cb_log, "PANEL_SENDER_FALLBACK");
-                    }
-                    fallback
-                });
-                if let Ok(mut slot) = selection_hint_lock().lock() {
-                    *slot = Some(hint);
-                }
-                let confirmed = CONFIRMED_IME_HWND.load(Ordering::Acquire);
-                let hwnd = if confirmed != 0 { confirmed } else {
-                    LATEST_CORE_HWND.load(Ordering::Acquire)
-                };
-                if hwnd != 0 || direct.is_some() {
-                    let _ = cb_probe.send(ProbeRequest {
-                        hwnd, foreground, epoch: CANDIDATE_EPOCH.load(Ordering::Acquire),
-                        active_recheck: false, candidate: direct,
-                    });
-                }
+        // A provider can re-enter this callback from inside its own COM calls.
+        // A panic there would unwind through the COM dispatcher and end the
+        // process, so contain it here and keep the worker running.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            on_uia_event(sender, event, &cb_automation, &cb_all, &panel_cache,
+                &cb_log, &cb_ui, &cb_probe)
+        }));
+        match outcome {
+            Ok(result) => result,
+            Err(_) => {
+                log_line(&cb_log, "UIA_CALLBACK_PANIC");
+                Ok(())
             }
         }
-        if is_panel(&id) || name.contains("候选") {
-            log_line(&cb_log, format!("UIA_EVENT kind={event:?} id={id:?}"));
-            if event == UIEventType::MenuOpened {
-                clear_selection_hint();
-                MENU_OPEN.store(true, Ordering::Release);
-                // The event source is the candidate pane on Windows 11; keep it
-                // so later selection events can read it without a window handle.
-                *panel_cache.borrow_mut() = Some(sender.clone());
-                let direct = read_cached_panel(&panel_cache, &cb_all, None, &cb_log);
-                if direct.is_none() && probe_log_due() {
-                    log_line(&cb_log, panel_shape(sender, &cb_all));
-                }
-                // The first opening event may precede a WinEvent. Probe the
-                // previously observed CoreWindow once, and keep active checks
-                // gated on the menu state until a matching MenuClosed arrives.
-                let hwnd = CONFIRMED_IME_HWND.load(Ordering::Acquire);
-                let hwnd = if hwnd != 0 { hwnd } else {
-                    LATEST_CORE_HWND.load(Ordering::Acquire)
-                };
-                if hwnd != 0 || direct.is_some() {
-                    let foreground = unsafe { GetForegroundWindow() } as usize;
-                    let _ = cb_probe.send(ProbeRequest {
-                        hwnd, foreground, epoch: CANDIDATE_EPOCH.load(Ordering::Acquire),
-                        active_recheck: false, candidate: direct,
-                    });
-                }
-            } else if event == UIEventType::MenuClosed {
-                IME_MENU_CLOSE_SEQ.fetch_add(1, Ordering::AcqRel);
-                *panel_cache.borrow_mut() = None;
-                // The next composition may open on a host whose handle path
-                // works, so allow those lookups again from a clean slate.
-                PANEL_DIRECT.store(false, Ordering::Release);
-                HWND_READ_MISSES.store(0, Ordering::Release);
-                MENU_OPEN.store(false, Ordering::Release);
-                clear_ready_translation();
-                cancel_pending_unless_cancel_sent();
-                clear_selection_hint();
-                CONFIRMED_IME_HWND.store(0, Ordering::Release);
-                CONFIRMED_FOREGROUND.store(0, Ordering::Release);
-                let epoch = CANDIDATE_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
-                let serial = TRANSLATION_SERIAL.fetch_add(1, Ordering::AcqRel) + 1;
-                send_overlay(&cb_ui, OverlayMessage::Hide { epoch, serial });
-            }
-        }
-        Ok(())
     });
     let handler = UIEventHandler::from(callback);
+
+/// Handles one UIA event. It lives outside the COM callback so that callbacks
+/// stay a thin panic boundary around it.
+fn on_uia_event(
+    sender: &UIElement,
+    event: UIEventType,
+    automation: &UIAutomation,
+    all: &UICondition,
+    panel_cache: &RefCell<Option<UIElement>>,
+    log_tx: &Sender<LogRecord>,
+    ui_tx: &Sender<OverlayMessage>,
+    probe_tx: &Sender<ProbeRequest>,
+) -> uiautomation::Result<()> {
+    // The event source is already a small IME pane. Never traverse a UIA tree here.
+    let id = sender.get_automation_id().unwrap_or_default();
+    let name = sender.get_name().unwrap_or_default();
+    if event == UIEventType::SelectionItem_ElementSelected {
+        if TRANSLATION_PAUSED.load(Ordering::Acquire) { return Ok(()); }
+        // Diagnose the event itself instead of merely requesting a refresh.
+        // The user's previous log showed first-fallback every time, but
+        // that build never logged whether SelectionItem events arrived.
+        let foreground = unsafe { GetForegroundWindow() } as usize;
+        let event_type = sender.get_control_type().ok();
+        let bounds = sender.get_bounding_rectangle().ok().map(|r| {
+            (r.get_left(), r.get_top(), r.get_right(), r.get_bottom())
+        });
+        let plausible = MENU_OPEN.load(Ordering::Acquire)
+            && !name.trim().is_empty() && name.chars().count() <= 100
+            && matches!(event_type, Some(ControlType::ListItem)
+                | Some(ControlType::MenuItem) | Some(ControlType::Text));
+        log_line(&log_tx, format!(
+            "UIA_SELECTION_EVENT type={event_type:?} name_chars={} bounds={} accepted={plausible}",
+            name.chars().count(), bounds.is_some()));
+        if plausible {
+            let hint = SelectionHint {
+                text: name.clone(), foreground,
+                epoch: CANDIDATE_EPOCH.load(Ordering::Acquire),
+                bounds, observed: Instant::now(),
+            };
+            // Windows 11 reports the selection on the item, and the pane
+            // cached at MenuOpened goes stale, so re-derive the pane from
+            // this live source before falling back to the cached copy.
+            let direct = match panel_ancestor(&automation, sender, 6) {
+                Some(pane) => {
+                    if let Ok(mut slot) = panel_cache.try_borrow_mut() { *slot = Some(pane.clone()); }
+                    let direct = read_panel(&pane, &all, Some(&hint), &log_tx);
+                    if direct.is_none() && probe_log_due() {
+                        log_line(&log_tx, panel_shape(&pane, &all));
+                    }
+                    direct
+                }
+                None => read_cached_panel(&panel_cache, &all, Some(&hint), &log_tx),
+            };
+            // A selection that comes from the candidate pane is itself the
+            // highlighted entry, so its own name is the text even when the
+            // pane refuses to enumerate. Text events are left out: they are
+            // mostly unrelated page text, not IME entries.
+            let direct = direct.or_else(|| {
+                if !matches!(event_type, Some(ControlType::ListItem)
+                    | Some(ControlType::MenuItem)) {
+                    return None;
+                }
+                    let pane = panel_cache.try_borrow().ok().and_then(|slot| slot.clone());
+                let fallback = pane.as_ref()
+                    .and_then(|panel| candidate_from_sender(sender, &name, Some(panel)));
+                if fallback.is_some() {
+                    PANEL_DIRECT.store(true, Ordering::Release);
+                    log_line(&log_tx, "PANEL_SENDER_FALLBACK");
+                }
+                fallback
+            });
+            if let Ok(mut slot) = selection_hint_lock().lock() {
+                *slot = Some(hint);
+            }
+            let confirmed = CONFIRMED_IME_HWND.load(Ordering::Acquire);
+            let hwnd = if confirmed != 0 { confirmed } else {
+                LATEST_CORE_HWND.load(Ordering::Acquire)
+            };
+            if hwnd != 0 || direct.is_some() {
+                let _ = probe_tx.send(ProbeRequest {
+                    hwnd, foreground, epoch: CANDIDATE_EPOCH.load(Ordering::Acquire),
+                    active_recheck: false, candidate: direct,
+                });
+            }
+        }
+    }
+    if is_panel(&id) || name.contains("候选") {
+        log_line(&log_tx, format!("UIA_EVENT kind={event:?} id={id:?}"));
+        if event == UIEventType::MenuOpened {
+            clear_selection_hint();
+            MENU_OPEN.store(true, Ordering::Release);
+            // The event source is the candidate pane on Windows 11; keep it
+            // so later selection events can read it without a window handle.
+                if let Ok(mut slot) = panel_cache.try_borrow_mut() { *slot = Some(sender.clone()); }
+            let direct = read_cached_panel(&panel_cache, &all, None, &log_tx);
+            if direct.is_none() && probe_log_due() {
+                log_line(&log_tx, panel_shape(sender, &all));
+            }
+            // The first opening event may precede a WinEvent. Probe the
+            // previously observed CoreWindow once, and keep active checks
+            // gated on the menu state until a matching MenuClosed arrives.
+            let hwnd = CONFIRMED_IME_HWND.load(Ordering::Acquire);
+            let hwnd = if hwnd != 0 { hwnd } else {
+                LATEST_CORE_HWND.load(Ordering::Acquire)
+            };
+            if hwnd != 0 || direct.is_some() {
+                let foreground = unsafe { GetForegroundWindow() } as usize;
+                let _ = probe_tx.send(ProbeRequest {
+                    hwnd, foreground, epoch: CANDIDATE_EPOCH.load(Ordering::Acquire),
+                    active_recheck: false, candidate: direct,
+                });
+            }
+        } else if event == UIEventType::MenuClosed {
+            IME_MENU_CLOSE_SEQ.fetch_add(1, Ordering::AcqRel);
+                if let Ok(mut slot) = panel_cache.try_borrow_mut() { *slot = None; }
+            // The next composition may open on a host whose handle path
+            // works, so allow those lookups again from a clean slate.
+            PANEL_DIRECT.store(false, Ordering::Release);
+            HWND_READ_MISSES.store(0, Ordering::Release);
+            MENU_OPEN.store(false, Ordering::Release);
+            clear_ready_translation();
+            cancel_pending_unless_cancel_sent();
+            clear_selection_hint();
+            CONFIRMED_IME_HWND.store(0, Ordering::Release);
+            CONFIRMED_FOREGROUND.store(0, Ordering::Release);
+            let epoch = CANDIDATE_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
+            let serial = TRANSLATION_SERIAL.fetch_add(1, Ordering::AcqRel) + 1;
+            send_overlay(&ui_tx, OverlayMessage::Hide { epoch, serial });
+        }
+    }
+    Ok(())
+}
     let mut registered = 0;
     for event in [UIEventType::MenuOpened, UIEventType::MenuClosed,
         UIEventType::SelectionItem_ElementSelected] {
