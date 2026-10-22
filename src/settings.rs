@@ -24,7 +24,7 @@ use windows_sys::Win32::{
     UI::{
         Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
         Controls::{SetWindowTheme, DRAWITEMSTRUCT, ODS_FOCUS},
-        Shell::{DefSubclassProc, SetWindowSubclass},
+        Shell::{DefSubclassProc, SetWindowSubclass, ShellExecuteW},
         Input::KeyboardAndMouse::{
             GetKeyState, MapVirtualKeyW, SetFocus, MAPVK_VSC_TO_VK_EX, VK_CONTROL, VK_ESCAPE,
             VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_TAB,
@@ -36,7 +36,8 @@ use windows_sys::Win32::{
             GetWindowTextW, IsWindow, IsWindowVisible, PostMessageW, RegisterClassW, SendMessageW,
             SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
             SystemParametersInfoW, TrackPopupMenu, BN_CLICKED, DM_GETDEFID, GWLP_USERDATA,
-            MF_CHECKED, MF_STRING, SPI_GETHIGHCONTRAST, SW_HIDE, SW_SHOW, SW_SHOWNA, SWP_NOACTIVATE,
+            MF_CHECKED, MF_STRING, SPI_GETHIGHCONTRAST, SW_HIDE, SW_SHOW, SW_SHOWNA,
+            SW_SHOWNORMAL, SWP_NOACTIVATE,
             SWP_NOZORDER, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN, WM_CHAR,
             WM_CLOSE, WM_COMMAND, WM_DRAWITEM, WM_GETFONT, WM_KEYUP, WM_KILLFOCUS,
             WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_CAPTION, WS_CHILD,
@@ -60,10 +61,10 @@ const ID_OPENAI_SECRET: u16 = 4106;
 const ID_UPDATE: u16 = 4107;
 const ID_AUTOSTART: u16 = 4108;
 const ID_SHORTCUT_KEY: u16 = 4109;
-const ID_AUTO_UPDATE: u16 = 4110;
 const ID_THEME: u16 = 4111;
 const ID_UPDATE_INTERVAL: u16 = 4112;
 const ID_AUTO_INSTALL: u16 = 4113;
+const ID_OPEN_REPO: u16 = 4114;
 // One owner-drawn button per tab, in display order.
 const ID_TAB_TRANSLATE: u16 = 4120;
 const ID_TAB_APPEARANCE: u16 = 4121;
@@ -625,7 +626,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
             // Owner-drawn checks do not flip themselves; mirror the click into
             // the button state, then repaint.
             if notify as u32 == BN_CLICKED
-                && matches!(id, ID_AUTOSTART | ID_AUTO_UPDATE | ID_AUTO_INSTALL
+                && matches!(id, ID_AUTOSTART | ID_AUTO_INSTALL
                     | ID_AZURE_REVEAL | ID_OPENAI_REVEAL) {
                 let was_checked = button_checked(control);
                 set_button_checked(control, !was_checked);
@@ -672,6 +673,13 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
                 PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0);
                 return 0;
             }
+            // The project block only links out; nothing here is persisted.
+            if notify as u32 == BN_CLICKED && id == ID_OPEN_REPO {
+                let url = wide("https://github.com/gurio-wine/TransPop");
+                ShellExecuteW(hwnd, ptr::null(), url.as_ptr(), ptr::null(), ptr::null(),
+                    SW_SHOWNORMAL);
+                return 0;
+            }
             // Save-on-change: every committed edit reports the same message the
             // Save button used to send, so the main loop keeps one apply path.
             let committed = notify == EN_KILLFOCUS;
@@ -709,14 +717,16 @@ pub struct ConfigFile {
     pub timeout_seconds: String,
     pub debounce_ms: String,
     pub alt_output_shortcut: String,
-    pub auto_update: bool,
     pub auto_install: bool,
     pub update_interval_minutes: String,
     pub theme: String,
 }
 
 /// Update check intervals offered in the settings window, in minutes.
-pub const UPDATE_INTERVALS: [u32; 7] = [15, 30, 60, 180, 360, 720, 1440];
+pub const UPDATE_INTERVALS: [u32; 8] = [15, 30, 60, 180, 360, 720, 1440, 10080];
+
+/// Sentinel pinned to the bottom of the interval list: check only when asked.
+pub const MANUAL_UPDATE_INTERVAL: u32 = 0;
 
 pub const DEFAULT_UPDATE_INTERVAL: u32 = 30;
 
@@ -996,7 +1006,8 @@ pub fn shortcut_label(spec: &str) -> String {
 /// Self-describing label: the picker sits next to the checkbox, so the
 /// value itself has to say what it counts.
 pub fn interval_label(minutes: u32) -> String {
-    if minutes >= 1440 { format!("\u{6bcf} {} \u{5929}", minutes / 1440) }
+    if minutes == MANUAL_UPDATE_INTERVAL { "\u{4ec5}\u{624b}\u{52a8}".into() }
+    else if minutes >= 1440 { format!("\u{6bcf} {} \u{5929}", minutes / 1440) }
     else if minutes >= 60 { format!("\u{6bcf} {} \u{5c0f}\u{65f6}", minutes / 60) }
     else { format!("\u{6bcf} {minutes} \u{5206}\u{949f}") }
 }
@@ -1079,10 +1090,15 @@ impl ConfigFile {
             alt_output_shortcut: normalize_shortcut(&get("alt_output_shortcut",
                 if map.get("alt_output").is_some_and(|v| !truthy(v, true)) { "none" }
                 else { DEFAULT_SHORTCUT })),
-            auto_update: flag("auto_update", true),
             auto_install: flag("auto_install", true),
+            // Older files had an auto_update on/off switch instead of the
+            // 仅手动 interval entry; keep a disabled switch disabled.
             update_interval_minutes: get("update_interval_minutes",
-                &DEFAULT_UPDATE_INTERVAL.to_string()),
+                &if map.get("auto_update").is_some_and(|v| !truthy(v, true)) {
+                    MANUAL_UPDATE_INTERVAL.to_string()
+                } else {
+                    DEFAULT_UPDATE_INTERVAL.to_string()
+                }),
             theme: normalize_theme(&get("theme", "system")),
         }
     }
@@ -1107,11 +1123,11 @@ openai_key=\n\
 # A local OpenAI-compatible endpoint can use http://127.0.0.1:PORT/v1/chat/completions.\n\
 timeout_seconds=8\n\
 debounce_ms=300\n\
-# auto_update=on checks GitHub Releases in the background every\n\
-# update_interval_minutes (min 15); auto_install=on then downloads and installs\n\
-# a newer release after verifying the digest GitHub publishes for its asset,\n\
-# while auto_install=off only announces the release and waits for a click.\n\
-auto_update=on\n\
+# update_interval_minutes is the gap between background checks of GitHub\n\
+# Releases (min 15, default 30); write 0 to check only when asked. auto_install=on\n\
+# then downloads and installs a newer release after verifying the digest GitHub\n\
+# publishes for its asset, while auto_install=off only announces the release and\n\
+# waits for a click.\n\
 auto_install=on\n\
 update_interval_minutes=30\n\
 # alt_output_shortcut is pressed once (no chord) to paste the translation\n\
@@ -1135,7 +1151,6 @@ pub struct SettingsValues {
     pub timeout_seconds: String,
     pub debounce_ms: String,
     pub alt_output_shortcut: String,
-    pub auto_update: bool,
     pub auto_install: bool,
     pub update_interval_minutes: String,
     pub theme: String,
@@ -1154,7 +1169,6 @@ impl SettingsValues {
             timeout_seconds: file.timeout_seconds,
             debounce_ms: file.debounce_ms,
             alt_output_shortcut: file.alt_output_shortcut,
-            auto_update: file.auto_update,
             auto_install: file.auto_install,
             update_interval_minutes: file.update_interval_minutes,
             theme: file.theme,
@@ -1187,8 +1201,9 @@ impl SettingsValues {
         if !self.debounce_ms.parse::<u64>().is_ok_and(|n| (100..=1000).contains(&n)) {
             return Err("翻译防抖请设置为 100–1000 毫秒".into());
         }
-        if !self.update_interval_minutes.parse::<u32>().is_ok_and(|n| n >= 15) {
-            return Err("检查间隔请设置为 15 分钟以上".into());
+        if !self.update_interval_minutes.parse::<u32>()
+            .is_ok_and(|n| n >= 15 || n == MANUAL_UPDATE_INTERVAL) {
+            return Err("检查间隔请设置为 15 分钟以上，或选择仅手动".into());
         }
         if !["system", "light", "dark"].contains(&self.theme.as_str()) {
             return Err("未知的主题设置".into());
@@ -1232,7 +1247,6 @@ impl SettingsValues {
             ("timeout_seconds", values.timeout_seconds.clone()),
             ("debounce_ms", values.debounce_ms.clone()),
             ("alt_output_shortcut", values.alt_output_shortcut.clone()),
-            ("auto_update", if values.auto_update { "on".to_string() } else { "off".to_string() }),
             ("auto_install", if values.auto_install { "on".to_string() } else { "off".to_string() }),
             ("update_interval_minutes", values.update_interval_minutes.clone()),
             ("theme", values.theme.clone()),
@@ -1247,6 +1261,9 @@ impl SettingsValues {
                     if seen.insert(key.clone()) { result.push_str(&format!("{key}={value}\n")); }
                     continue;
                 }
+                // The retired auto_update switch lives on as the 仅手动 interval;
+                // drop the dead key instead of carrying it forever.
+                if key == "auto_update" { continue; }
             }
             result.push_str(line);
             result.push('\n');
@@ -1324,18 +1341,20 @@ pub struct SettingsWindow {
     autostart: HWND,
     shortcut_label: HWND,
     shortcut_key: HWND,
-    auto_update: HWND,
     auto_install: HWND,
     update_interval: HWND,
     update_intervals: Vec<u32>,
     update_button: HWND,
     startup_title: HWND,
+    project_title: HWND,
     update_title: HWND,
+    version_label: HWND,
     interval_caption: HWND,
     theme_label: HWND,
     theme_picker: HWND,
     tabs: [HWND; 5],
     about_text: HWND,
+    open_repo: HWND,
 }
 
 impl SettingsWindow {
@@ -1352,7 +1371,7 @@ impl SettingsWindow {
 
         let scale = |v: i32| v * dpi / 96;
         // A throwaway frame size: apply_layout sizes the window from the client grid.
-        let title = wide("TransPop · 偏好设置");
+        let title = wide("设置");
         let hwnd = CreateWindowExW(WINDOW_EX_STYLE, class.as_ptr(), title.as_ptr(), WINDOW_STYLE,
             0, 0, scale(CLIENT_W), scale(400), ptr::null_mut(), ptr::null_mut(), instance, ptr::null());
         if hwnd.is_null() { return None; }
@@ -1469,10 +1488,8 @@ impl SettingsWindow {
         };
         set_button_checked(autostart, previously_enabled);
 
-        // Two separate switches: checking for a release and installing it.
-        let auto_update = create("BUTTON", "检查更新", ID_AUTO_UPDATE,
-            BS_OWNERDRAW | WS_TABSTOP);
-        set_button_checked(auto_update, values.auto_update);
+        // Only the install switch is left; whether to check at all is now the
+        // bottom entry of the interval list ("仅手动", minutes = 0).
         let auto_install = create("BUTTON", "自动更新", ID_AUTO_INSTALL,
             BS_OWNERDRAW | WS_TABSTOP);
         set_button_checked(auto_install, values.auto_install);
@@ -1480,7 +1497,11 @@ impl SettingsWindow {
         // the presets no longer offer, so it is kept as an extra entry.
         let current: u32 = values.update_interval_minutes.parse().unwrap_or(DEFAULT_UPDATE_INTERVAL);
         let mut intervals = UPDATE_INTERVALS.to_vec();
-        if !intervals.contains(&current) { intervals.push(current); intervals.sort_unstable(); }
+        if !intervals.contains(&current) && current != MANUAL_UPDATE_INTERVAL {
+            intervals.push(current);
+            intervals.sort_unstable();
+        }
+        intervals.push(MANUAL_UPDATE_INTERVAL);
         let interval_items: Vec<String> =
             intervals.iter().map(|minutes| interval_label(*minutes)).collect();
         let interval_pos = intervals.iter().position(|m| *m == current).unwrap_or(0);
@@ -1488,11 +1509,16 @@ impl SettingsWindow {
             BS_OWNERDRAW | WS_TABSTOP);
         selects.push(Select { hwnd: update_interval as isize, items: interval_items,
             index: interval_pos });
-        let update_button = create("BUTTON", "立即检查", ID_UPDATE, WS_TABSTOP);
+        let update_button = create("BUTTON", "检查更新", ID_UPDATE, WS_TABSTOP);
         let startup_title = create("STATIC", "启动", 0, 0);
         set_font(startup_title, section_font);
+        // About page: a project block and an update block, nothing else.
+        let project_title = create("STATIC", "项目", 0, 0);
+        set_font(project_title, section_font);
+        let open_repo = create("BUTTON", "打开仓库", ID_OPEN_REPO, WS_TABSTOP);
         let update_title = create("STATIC", "更新", 0, 0);
         set_font(update_title, section_font);
+        let version_label = create("STATIC", &format!("当前版本 v{}", super::VERSION), 0, 0);
         let interval_caption = create("STATIC", "检查间隔", 0, 0);
         // In-app theme switch: system, light, dark.
         let theme_label = create("STATIC", "主题", 0, 0);
@@ -1520,9 +1546,8 @@ impl SettingsWindow {
             c.pending = None;
             c.spec = Some(normalize_shortcut(&values.alt_output_shortcut));
         });
-        let about_text = create("STATIC", &format!(
-            "TransPop v{}\r\n\r\n在微软拼音候选窗下方实时显示英文翻译。\r\n\r\n仓库：github.com/gurio-wine/TransPop\r\n许可：MIT",
-            super::VERSION), 0, 0);
+        let about_text = create("STATIC",
+            "仓库：github.com/gurio-wine/TransPop\r\n许可：MIT", 0, 0);
 
         // A slightly inset caret keeps addresses off the field frame.
         let pad = scale(8);
@@ -1554,11 +1579,11 @@ impl SettingsWindow {
             behavior_title, behavior_divider, timeout_label, timeout, timeout_unit,
             debounce_label, debounce, debounce_unit, autostart,
             shortcut_label: shortcut_caption, shortcut_key,
-            auto_update, auto_install, update_interval, update_intervals: intervals,
-            update_button, startup_title, update_title, interval_caption,
-            theme_label, theme_picker,
+            auto_install, update_interval, update_intervals: intervals,
+            update_button, startup_title, project_title, update_title, version_label,
+            interval_caption, theme_label, theme_picker,
             tabs: [tab_translate, tab_appearance, tab_system, tab_shortcut, tab_about],
-            about_text };
+            about_text, open_repo };
         this.apply_layout(true);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
@@ -1652,16 +1677,18 @@ impl SettingsWindow {
         place(self.shortcut_label, MARGIN_X, top + 4, LABEL_W, 22);
         place(self.shortcut_key, FIELD_X, top, 260, 30);
 
-        // About page: identity, then the update switches, which used to crowd
-        // the startup group on 系统.
-        place(self.about_text, MARGIN_X, top, CONTENT_W, 140);
-        place(self.connection_divider, MARGIN_X, top + 150, CONTENT_W, 1);
-        place(self.update_title, MARGIN_X, top + 168, 460, 22);
-        place(self.auto_update, MARGIN_X, top + 196, CONTENT_W, 24);
-        place(self.interval_caption, MARGIN_X, top + 228, LABEL_W, 22);
-        place(self.update_interval, FIELD_X, top + 224, 160, 30);
-        place(self.auto_install, MARGIN_X, top + 260, CONTENT_W, 24);
-        place(self.update_button, MARGIN_X, top + 292, 112, 30);
+        // About page: a project block (repo, licence, one button) and an
+        // update block (version, check button, interval, install switch).
+        place(self.project_title, MARGIN_X, top, 460, 22);
+        place(self.about_text, MARGIN_X, top + 28, CONTENT_W, 56);
+        place(self.open_repo, MARGIN_X, top + 90, 112, 30);
+        place(self.connection_divider, MARGIN_X, top + 138, CONTENT_W, 1);
+        place(self.update_title, MARGIN_X, top + 156, 460, 22);
+        place(self.version_label, MARGIN_X, top + 184, 200, 22);
+        place(self.update_button, MARGIN_X + 200, top + 180, 112, 30);
+        place(self.interval_caption, MARGIN_X, top + 216, LABEL_W, 22);
+        place(self.update_interval, FIELD_X, top + 212, 160, 30);
+        place(self.auto_install, MARGIN_X, top + 250, CONTENT_W, 24);
 
         for control in [self.service_title, self.provider] { show(control, translating); }
         for (label, edit) in self.azure {
@@ -1686,9 +1713,10 @@ impl SettingsWindow {
         for control in [self.shortcut_label, self.shortcut_key] {
             show(control, shortcuts);
         }
-        for control in [self.about_text, self.connection_divider, self.update_title,
-                        self.auto_update, self.interval_caption, self.update_interval,
-                        self.auto_install, self.update_button] {
+        for control in [self.project_title, self.about_text, self.open_repo,
+                        self.connection_divider, self.update_title, self.version_label,
+                        self.update_button, self.interval_caption, self.update_interval,
+                        self.auto_install] {
             show(control, about);
         }
 
@@ -1779,7 +1807,6 @@ impl SettingsWindow {
             c.spec = Some(normalize_shortcut(&values.alt_output_shortcut));
         });
         set_text(self.shortcut_key, &shortcut_label(&values.alt_output_shortcut));
-        set_button_checked(self.auto_update, values.auto_update);
         set_button_checked(self.auto_install, values.auto_install);
         let current: u32 = values.update_interval_minutes.parse()
             .unwrap_or(DEFAULT_UPDATE_INTERVAL);
@@ -1821,7 +1848,6 @@ impl SettingsWindow {
             debounce_ms: Self::get_text(self.debounce),
             alt_output_shortcut: CAPTURE.with(|c| c.borrow().spec.clone())
                 .unwrap_or_else(|| "none".to_string()),
-            auto_update: button_checked(self.auto_update),
             auto_install: button_checked(self.auto_install),
             update_interval_minutes: {
                 let index = (*self.theme).chosen_index(self.update_interval).unwrap_or(0);
@@ -1940,14 +1966,15 @@ mod tests {
             .unwrap();
         let file = ConfigFile::read(&base);
         assert_eq!(file.provider, "openai");
-        assert!(!file.auto_update);
+        // The retired auto_update=off switch maps onto the 仅手动 interval.
+        assert_eq!(file.update_interval_minutes, "0");
         assert_eq!(file.alt_output_shortcut, "ctrl+space");
         assert_eq!(file.openai_url, "http://127.0.0.1:8080/v1/chat/completions");
         assert_eq!(file.azure_url, DEFAULT_AZURE_URL);
         assert_eq!(file.openai_model, DEFAULT_OPENAI_MODEL);
         let values = SettingsValues::from_file(&base);
         assert_eq!(values.provider, file.provider);
-        assert_eq!(values.auto_update, file.auto_update);
+        assert_eq!(values.update_interval_minutes, file.update_interval_minutes);
         assert!(truthy("on", false));
         assert!(!truthy("No", true));
         assert!(truthy("", true));
@@ -1959,8 +1986,8 @@ mod tests {
         let base = temp_base("sample");
         ConfigFile::ensure_sample(&base);
         let text = fs::read_to_string(base.join("translator.conf")).unwrap();
-        assert!(text.contains("auto_update=on"), "sample missing auto_update: {text}");
-        assert!(ConfigFile::read(&base).auto_update);
+        assert!(text.contains("update_interval_minutes=30"), "sample missing interval: {text}");
+        assert_eq!(ConfigFile::read(&base).update_interval_minutes, "30");
         ConfigFile::ensure_sample(&base); // never overwrites an existing file
         assert_eq!(fs::read_to_string(base.join("translator.conf")).unwrap(), text);
         let _ = fs::remove_dir_all(&base);
@@ -1995,7 +2022,6 @@ mod tests {
         fs::create_dir_all(&base).unwrap();
         let values = SettingsValues::from_file(&base);
         assert_eq!(values.update_interval_minutes, "30");
-        assert!(values.auto_update, "checking defaults to on");
         assert!(values.auto_install, "installing defaults to on");
         let mut quiet = values.clone();
         quiet.provider = "bing".into();
@@ -2003,6 +2029,7 @@ mod tests {
         quiet.save(&base).unwrap();
         let text = fs::read_to_string(base.join("translator.conf")).unwrap();
         assert!(text.contains("auto_install=off"), "auto_install not saved: {text}");
+        assert!(!text.contains("auto_update="), "retired key must not come back: {text}");
         assert_eq!(SettingsValues::from_file(&base).update_interval_minutes, "30");
         let mut short = values.clone();
         short.provider = "bing".into();
@@ -2010,6 +2037,10 @@ mod tests {
         assert!(short.validate().is_err(), "14 minutes must be rejected");
         short.update_interval_minutes = "15".into();
         assert!(short.validate().is_ok(), "15 minutes must be accepted");
+        short.update_interval_minutes = MANUAL_UPDATE_INTERVAL.to_string();
+        assert!(short.validate().is_ok(), "0 means check only when asked");
+        assert_eq!(interval_label(MANUAL_UPDATE_INTERVAL), "\u{4ec5}\u{624b}\u{52a8}");
+        assert_eq!(interval_label(10080), "\u{6bcf} 7 \u{5929}");
         assert_eq!(interval_label(15), "\u{6bcf} 15 \u{5206}\u{949f}");
         assert_eq!(interval_label(360), "\u{6bcf} 6 \u{5c0f}\u{65f6}");
         assert_eq!(interval_label(1440), "\u{6bcf} 1 \u{5929}");

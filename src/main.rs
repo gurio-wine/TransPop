@@ -44,14 +44,19 @@ use uiautomation::{
     variants::Variant,
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GetLastError, HANDLE, HWND, POINT, RECT, ERROR_ALREADY_EXISTS},
+    Foundation::{CloseHandle, GetLastError, FILETIME, HANDLE, HWND, POINT, RECT,
+        SYSTEMTIME, ERROR_ALREADY_EXISTS},
     Graphics::Gdi::{
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateRoundRectRgn,
         CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, GetDC, GetDeviceCaps, GetPixel,
         InvalidateRect, ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor,
         SetWindowRgn, HBRUSH, HBITMAP, HDC, HFONT, HGDIOBJ, SRCCOPY,
     },
-    System::LibraryLoader::GetModuleHandleW,
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        SystemInformation::GetLocalTime,
+        Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
+    },
     UI::{
         Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK},
         Shell::{
@@ -200,10 +205,10 @@ static ALT_OUTPUT_ENABLED: AtomicBool = AtomicBool::new(false);
 static ALT_OUTPUT_KEY: AtomicU32 = AtomicU32::new(0);
 // Modifier bits (settings::MOD_*) the trigger key must be pressed with.
 static ALT_OUTPUT_MODS: AtomicU32 = AtomicU32::new(0);
-static AUTO_UPDATE_ENABLED: AtomicBool = AtomicBool::new(true);
-// Separate from AUTO_UPDATE_ENABLED: checking and installing are two switches.
+// Whether a found release installs itself; checking is the interval below.
 static AUTO_INSTALL_ENABLED: AtomicBool = AtomicBool::new(true);
 // Minutes between background update checks; the settings window owns it.
+// 0 means "仅手动": no background check at all.
 static UPDATE_INTERVAL_MINUTES: AtomicU64 = AtomicU64::new(30);
 static READY_TRANSLATION: OnceLock<Mutex<Option<ReadyTranslation>>> = OnceLock::new();
 static ALT_GESTURE: OnceLock<Mutex<AltGesture>> = OnceLock::new();
@@ -245,16 +250,18 @@ const UIA_RESUBSCRIBE_COOLDOWN: Duration = Duration::from_secs(10);
 const ACTIVE_RECHECK_INTERVAL: Duration = Duration::from_millis(85);
 // The reader controls its own poll cadence. WM_TIMER is for visual animation only.
 const ACTIVE_RECHECK_WAKE: Duration = Duration::from_millis(40);
-// Bound diagnostics for unattended sessions; keep at most two 2 MiB files.
-const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+// Bound diagnostics for unattended sessions; one file per local day.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(60);
 // Give the first update check time to lose to interactive startup work.
 const UPDATE_CHECK_DELAY: Duration = Duration::from_secs(20);
 // Floor for the user-chosen check interval: never hammer GitHub.
 const MIN_UPDATE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 fn update_interval() -> Duration {
-    Duration::from_secs(UPDATE_INTERVAL_MINUTES.load(Ordering::Acquire) * 60)
-        .max(MIN_UPDATE_INTERVAL)
+    match UPDATE_INTERVAL_MINUTES.load(Ordering::Acquire) {
+        // 仅手动: a timer that never comes due.
+        0 => Duration::MAX,
+        minutes => Duration::from_secs(minutes * 60).max(MIN_UPDATE_INTERVAL),
+    }
 }
 // Reaching the message loop is the health signal for a freshly self-updated
 // executable; the previous binary stays available for rollback until then.
@@ -624,7 +631,6 @@ struct TranslatorConfig {
     openai_key: String,
     timeout_seconds: u64,
     debounce_ms: u64,
-    auto_update: bool,
     auto_install: bool,
     update_interval_minutes: u64,
 }
@@ -650,12 +656,16 @@ impl TranslatorConfig {
                 .unwrap_or(8).clamp(2, 30),
             debounce_ms: file.debounce_ms.parse::<u64>()
                 .unwrap_or(300).clamp(100, 1000),
-            auto_update: settings::truthy(
-                &env_or("TRANSPOP_AUTO_UPDATE", String::new()), file.auto_update),
             auto_install: settings::truthy(
                 &env_or("TRANSPOP_AUTO_INSTALL", String::new()), file.auto_install),
-            update_interval_minutes: env_or("TRANSPOP_UPDATE_INTERVAL_MINUTES",
-                file.update_interval_minutes).parse::<u64>().unwrap_or(30).max(15),
+            // 0 = 仅手动. The retired TRANSPOP_AUTO_UPDATE=off still maps here.
+            update_interval_minutes: {
+                let minutes = env_or("TRANSPOP_UPDATE_INTERVAL_MINUTES",
+                    file.update_interval_minutes).parse::<u64>().unwrap_or(30);
+                if !settings::truthy(&env_or("TRANSPOP_AUTO_UPDATE", String::new()), true) {
+                    0
+                } else if minutes == 0 { 0 } else { minutes.max(15) }
+            },
         }
     }
 
@@ -2331,32 +2341,81 @@ fn on_uia_event(
     let _ = automation.remove_all_event_handlers();
 }
 
-fn log_worker(
-    rx: &Receiver<LogRecord>,
-    path: &Path,
-    probe_tx: &Sender<ProbeRequest>,
-) {
-    // Only this thread owns the log file. Rotate the previous session once,
-    // then roll over at 2 MiB while the process is running. Keeping a single
-    // archive bounds disk use without losing the most recent diagnostic data.
-    let archive = path.with_extension("log.1");
-    if path.exists() {
-        match fs::remove_file(&archive) {
-            Ok(()) => {},
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
-            Err(e) => eprintln!("TransPop: cannot delete old log archive: {e}"),
-        }
-        if let Err(e) = fs::rename(&path, &archive) {
-            eprintln!("TransPop: cannot preserve previous log: {e}");
-        }
-    }
-    // Logging is diagnostic only: this worker also relays WinEvents into probe
-    // requests, so a missing log file must not stop it.
-    let mut file = match File::create(&path) {
+/// Local calendar date as yyyymmdd, the archive suffix.
+fn local_day(stamp: Option<SYSTEMTIME>) -> String {
+    let mut now = SYSTEMTIME {
+        wYear: 0, wMonth: 0, wDayOfWeek: 0, wDay: 0,
+        wHour: 0, wMinute: 0, wSecond: 0, wMilliseconds: 0,
+    };
+    let value = match stamp {
+        Some(value) => value,
+        None => { unsafe { GetLocalTime(&mut now) }; now }
+    };
+    format!("{:04}{:02}{:02}", value.wYear, value.wMonth, value.wDay)
+}
+
+/// Local date the file was last written, i.e. the day its lines belong to.
+fn file_day(path: &Path) -> Option<String> {
+    let since = fs::metadata(path).ok()?.modified().ok()?
+        .duration_since(std::time::UNIX_EPOCH).ok()?;
+    // FILETIME counts 100 ns ticks from 1601-01-01.
+    let ticks = since.as_secs().checked_add(11_644_473_600)?
+        .checked_mul(10_000_000)? + u64::from(since.subsec_nanos()) / 100;
+    let filetime = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut utc = SYSTEMTIME {
+        wYear: 0, wMonth: 0, wDayOfWeek: 0, wDay: 0,
+        wHour: 0, wMinute: 0, wSecond: 0, wMilliseconds: 0,
+    };
+    let mut local = utc;
+    let converted = unsafe {
+        FileTimeToSystemTime(&filetime, &mut utc) != 0
+            && SystemTimeToTzSpecificLocalTime(ptr::null(), &utc, &mut local) != 0
+    };
+    if converted { Some(local_day(Some(local))) } else { None }
+}
+
+fn open_log(path: &Path) -> Option<BufWriter<File>> {
+    match fs::OpenOptions::new().create(true).append(true).open(path) {
         Ok(value) => Some(BufWriter::new(value)),
         Err(e) => { eprintln!("Cannot open {}: {e}", path.display()); None }
-    };
-    let mut written = 0u64;
+    }
+}
+
+/// Park the current log as transpop-<day>.log, appending when that day already
+/// has an archive from an earlier session.
+fn roll_log(path: &Path, day: &str) {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let archive = dir.join(format!("transpop-{day}.log"));
+    let parked = fs::OpenOptions::new().create(true).append(true).open(&archive)
+        .and_then(|mut target| {
+            let mut source = File::open(path)?;
+            std::io::copy(&mut source, &mut target).map(|_| ())
+        })
+        .and_then(|()| fs::remove_file(path));
+    if let Err(e) = parked {
+        eprintln!("TransPop: cannot archive log into {}: {e}", archive.display());
+    }
+}
+
+fn log_worker(
+    rx: &Receiver<LogRecord>,
+    dir: &Path,
+    probe_tx: &Sender<ProbeRequest>,
+) {
+    // One current log plus one archive per local day, all inside logs/. Only
+    // this thread owns them, so a day change is just close, park, reopen.
+    let path = dir.join("transpop.log");
+    if path.exists() {
+        let stale = file_day(&path).unwrap_or_else(|| local_day(None));
+        roll_log(&path, &stale);
+    }
+    let mut day = local_day(None);
+    // Logging is diagnostic only: this worker also relays WinEvents into probe
+    // requests, so a missing log file must not stop it.
+    let mut file = open_log(&path);
     let mut recent = HashMap::<usize, Instant>::new();
     let mut last_verbose = Instant::now();
     while let Ok(record) = rx.recv() {
@@ -2395,34 +2454,21 @@ fn log_worker(
                 } else { continue; }
             }
         };
-        let text = format!("{} {}\n", elapsed(), line);
-        let text_len = text.len() as u64;
-        if file.is_some() && written.saturating_add(text_len) > LOG_MAX_BYTES {
+        // A new local day parks yesterday's lines and starts the current log
+        // fresh, so a stray log never mixes two dates.
+        let today = local_day(None);
+        if today != day {
             if let Some(writer) = file.as_mut() {
                 if let Err(e) = writer.flush() {
-                    eprintln!("TransPop: cannot flush log before rotation: {e}");
+                    eprintln!("TransPop: cannot flush log before archiving: {e}");
                 }
             }
             drop(file.take()); // Windows cannot rename a file that is still open.
-            match fs::remove_file(&archive) {
-                Ok(()) => {},
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
-                Err(e) => eprintln!("TransPop: cannot delete log archive: {e}"),
-            }
-            if let Err(e) = fs::rename(&path, &archive) {
-                eprintln!("TransPop: cannot rotate log: {e}");
-            }
-            // If rename failed, truncate the closed log rather than allowing
-            // unbounded growth. On error, stop only the diagnostic writer.
-            file = match File::create(&path) {
-                Ok(value) => Some(BufWriter::new(value)),
-                Err(e) => {
-                    eprintln!("TransPop: cannot reopen log after rotation: {e}");
-                    None
-                }
-            };
-            written = 0;
+            roll_log(&path, &day);
+            day = today;
+            file = open_log(&path);
         }
+        let text = format!("{} {}\n", elapsed(), line);
         let mut failed = false;
         if let Some(writer) = file.as_mut() {
             if let Err(e) = writer.write_all(text.as_bytes()) {
@@ -2437,7 +2483,6 @@ fn log_worker(
             }
         }
         if failed { file = None; }
-        written = written.saturating_add(text_len);
     }
 }
 
@@ -2695,8 +2740,8 @@ fn log_global(line: impl Into<String>) {
 }
 
 // Network work never runs on the UI message loop. A manual check and an
-// automatic check with auto_update=off announce a found release in a foreground
-// prompt and download only after the user agrees; auto_update=on downloads and
+// automatic check with auto_install=off announce a found release in a foreground
+// prompt and download only after the user agrees; auto_install=on downloads and
 // installs verified releases in the background without interrupting typing.
 fn update_worker(base: PathBuf, manual: bool, log_tx: Sender<LogRecord>) {
     let release = match update::latest() {
@@ -2872,13 +2917,18 @@ fn main() {
         eprintln!("Cannot create {}: {e}", base.display());
         return;
     }
-    let logfile = base.join(format!("transpop-v{VERSION}.log"));
+    // Every log lives in logs/: transpop.log today, transpop-<yyyymmdd>.log before.
+    let logdir = base.join("logs");
+    if let Err(e) = fs::create_dir_all(&logdir) {
+        eprintln!("Cannot create {}: {e}", logdir.display());
+    }
     let (log_tx, log_rx) = mpsc::channel::<LogRecord>();
     LOG_TX.set(log_tx.clone()).ok();
     let (probe_tx, probe_rx) = mpsc::channel::<ProbeRequest>();
     let log_probe_tx = probe_tx.clone();
     let uia_probe_tx = probe_tx.clone();
-    thread::spawn(move || supervise_worker("log", || log_worker(&log_rx, &logfile, &log_probe_tx)));
+    let log_dir = logdir.clone();
+    thread::spawn(move || supervise_worker("log", || log_worker(&log_rx, &log_dir, &log_probe_tx)));
     // A self-update leaves the previous exe next to this one; it is the manual
     // rollback path until this process proves it reaches its message loop.
     if let Some(backup) = update::stale_backup() {
@@ -2890,6 +2940,9 @@ fn main() {
             log_line(&health_log, "UPDATE_BACKUP_REMOVED previous_version_healthy");
         });
     }
+    // A self-update leaves its verified download behind; the running exe is
+    // already replaced, so the whole staging directory is spent.
+    let _ = fs::remove_dir_all(base.join("update"));
     // Legacy plaintext keys must not survive an upgrade; failures are logged
     // and deliberately keep the app running.
     settings::migrate_plaintext_secrets(&base);
@@ -2898,7 +2951,6 @@ fn main() {
         let shortcut = settings::SettingsValues::from_file(&base).alt_output_shortcut;
         apply_shortcut(&shortcut);
     }
-    AUTO_UPDATE_ENABLED.store(config.auto_update, Ordering::Release);
     AUTO_INSTALL_ENABLED.store(config.auto_install, Ordering::Release);
     UPDATE_INTERVAL_MINUTES.store(config.update_interval_minutes, Ordering::Release);
     let configuration_status = config.readiness();
@@ -2926,7 +2978,8 @@ fn main() {
         candidate_worker(&probe_rx, &worker_log, &worker_ui, &translate_tx, &ready_tx)
     }));
     if !matches!(ready_rx.recv_timeout(Duration::from_secs(5)), Ok(true)) {
-        eprintln!("TransPop 候选读取线程初始化失败，详细原因见 transpop-v{VERSION}.log。");
+        eprintln!("TransPop 候选读取线程初始化失败，详细原因见 {}。",
+            logdir.join("transpop.log").display());
         log_line(&log_tx, "ABORT_UIA_READER_NOT_READY");
         thread::sleep(Duration::from_millis(150));
         return;
@@ -3054,8 +3107,7 @@ fn main() {
             }
         }
         log_line(&log_tx, format!("HOOKS_READY {}/5", hooks.len()));
-        let auto_update = config.auto_update;
-        if auto_update {
+        if config.update_interval_minutes != 0 {
             let update_base = base.clone();
             let update_log = log_tx.clone();
             thread::spawn(move || {
@@ -3083,7 +3135,7 @@ fn main() {
         }
         println!("托盘：左键暂停／恢复，右键菜单可打开设置、暂停或退出。");
         println!(r"命令：--settings、--pause、--resume、--quit；退出快捷键：Ctrl+Alt+Q。");
-        println!("日志：{}", base.join(format!("transpop-v{VERSION}.log")).display());
+        println!("日志：{}", logdir.join("transpop.log").display());
 
         let mut msg: MSG = mem::zeroed();
         let mut last_loading = Instant::now();
@@ -3163,11 +3215,14 @@ fn main() {
                                 }
                                 apply_shortcut(&values.alt_output_shortcut);
                                 let shortcut_on = ALT_OUTPUT_ENABLED.load(Ordering::Acquire);
-                                let was_auto_update = AUTO_UPDATE_ENABLED
-                                    .swap(values.auto_update, Ordering::AcqRel);
                                 AUTO_INSTALL_ENABLED.store(values.auto_install, Ordering::Release);
-                                let chosen_interval = values.update_interval_minutes
-                                    .parse::<u64>().unwrap_or(30).max(15);
+                                let was_manual = UPDATE_INTERVAL_MINUTES
+                                    .load(Ordering::Acquire) == 0;
+                                let chosen_interval = match values.update_interval_minutes
+                                    .parse::<u64>().unwrap_or(30) {
+                                    0 => 0,
+                                    minutes => minutes.max(15),
+                                };
                                 // The loop compares against this value every tick, so a
                                 // shortened interval takes effect without waiting.
                                 UPDATE_INTERVAL_MINUTES.store(chosen_interval, Ordering::Release);
@@ -3191,9 +3246,11 @@ fn main() {
                                 }
                                 log_global(format!("SETTINGS_SAVED provider={}", values.provider));
                                 log_global(format!(
-                                    "AUTO_UPDATE_SETTING enabled={} auto_install={} interval_minutes={chosen_interval}",
-                                    values.auto_update, values.auto_install));
-                                if values.auto_update && !was_auto_update {
+                                    "UPDATE_SETTING auto_install={} interval_minutes={chosen_interval}",
+                                    values.auto_install));
+                                // Leaving 仅手动 for a real interval: check once soon
+                                // instead of waiting a full interval from now.
+                                if chosen_interval != 0 && was_manual {
                                     let update_base = base.clone();
                                     let update_log = log_tx.clone();
                                     thread::spawn(move || {
@@ -3309,8 +3366,9 @@ fn main() {
                             TRANSLATION_PAUSED.load(Ordering::Acquire), tray.registered));
                         last_main_health = Instant::now();
                     }
-                    if AUTO_UPDATE_ENABLED.load(Ordering::Acquire)
-                        && last_update_check.elapsed() >= update_interval() {
+                    // update_interval() is Duration::MAX for 仅手动, so this
+                    // never fires unless the user picked a real interval.
+                    if last_update_check.elapsed() >= update_interval() {
                         last_update_check = Instant::now();
                         let update_base = base.clone();
                         let update_log = log_tx.clone();
