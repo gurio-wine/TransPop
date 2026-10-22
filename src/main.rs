@@ -38,7 +38,8 @@ use uiautomation::{
     core::{UIAutomation, UICondition, UIElement},
     patterns::{UISelectionPattern, UISelectionItemPattern, UILegacyIAccessiblePattern},
     events::{CustomEventHandlerFn, UIEventHandler, UIEventType},
-    types::{ControlType, Handle, TreeScope},
+    types::{ControlType, Handle, TreeScope, UIProperty},
+    variants::Variant,
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, HANDLE, HWND, POINT, RECT, ERROR_ALREADY_EXISTS},
@@ -128,7 +129,13 @@ const STATIC_CLASS: &str = "STATIC";
 const BUBBLE_CLASS: &str = "EDIT";
 const CONTROL_TITLE: &str = "TransPop-Event-Bubble-Control-042"; // Preserve --quit contract.
 const TRAY_RECEIVER_CLASS: &str = "TransPop-Tray-Receiver-059";
-const IME_PANEL_IDS: [&str; 2] = ["IME_Prediction_Window", "IME_Candidate_Window"];
+// Windows 10 exposes the pane as IME_Candidate_Window / IME_Prediction_Window.
+// Windows 11 (InputApp) renamed it to TEMPLATE_PART_CandidatePanel.
+const IME_PANEL_IDS: [&str; 3] = [
+    "IME_Prediction_Window",
+    "IME_Candidate_Window",
+    "TEMPLATE_PART_CandidatePanel",
+];
 // MSAA state flags are read-only; never select, focus, or send keys to IME.
 const STATE_SYSTEM_SELECTED: u32 = 0x0000_0002;
 const STATE_SYSTEM_FOCUSED: u32 = 0x0000_0004;
@@ -537,7 +544,8 @@ impl TranslatorConfig {
             azure_url: env_or("TRANSPOP_AZURE_URL", file.azure_url),
             azure_region: env_or("TRANSPOP_AZURE_REGION", file.azure_region),
             azure_key: env_or("TRANSPOP_AZURE_KEY", file.azure_key),
-            openai_url: env_or("TRANSPOP_OPENAI_URL", file.openai_url),
+            openai_url: settings::normalize_openai_url(
+                &env_or("TRANSPOP_OPENAI_URL", file.openai_url)),
             openai_model: env_or("TRANSPOP_OPENAI_MODEL", file.openai_model),
             openai_key: env_or("TRANSPOP_OPENAI_KEY", file.openai_key),
             timeout_seconds: file.timeout_seconds.parse::<u64>()
@@ -1117,7 +1125,7 @@ unsafe extern "system" fn native_callback(
     let class = window_class(hwnd);
     let ime_event = (EVENT_OBJECT_IME_SHOW..=EVENT_OBJECT_IME_CHANGE).contains(&event);
     if !ime_event && !is_ime_class(&class) { return; }
-    if class == "Windows.UI.Core.CoreWindow"
+    if is_ime_class(&class)
         && matches!(event, EVENT_OBJECT_SHOW | EVENT_OBJECT_NAMECHANGE
             | EVENT_OBJECT_LOCATIONCHANGE | EVENT_OBJECT_IME_SHOW
             | EVENT_OBJECT_IME_CHANGE) {
@@ -1284,8 +1292,10 @@ fn selected_candidate(panel: &UIElement, all: &UICondition, hint: Option<&Select
     let mut containers: Vec<UIElement> = vec![panel.clone()];
     for child in children.into_iter().take(48) {
         match child.get_control_type() {
-            Ok(ControlType::ListItem) => items.push(child),
-            Ok(ControlType::List) => containers.push(child),
+            // Win11 exposes the candidate pane as a popup menu, so its
+            // entries arrive as MenuItem children of a Menu.
+            Ok(ControlType::ListItem) | Ok(ControlType::MenuItem) => items.push(child),
+            Ok(ControlType::List) | Ok(ControlType::Menu) => containers.push(child),
             _ => {}
         }
     }
@@ -1315,28 +1325,75 @@ fn selected_candidate(panel: &UIElement, all: &UICondition, hint: Option<&Select
         hint.map(|hint| (hint.text.as_str(), hint.bounds))))
 }
 
+/// Rate-limits the Windows 11 diagnosis lines so a missing pane cannot flood
+/// the log while the user types.
+fn probe_log_due() -> bool {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    let now = EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    let last = LAST_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 2000 { return false; }
+    LAST_MS.store(now, Ordering::Relaxed);
+    true
+}
+
+/// Finds the candidate pane below `root`. Windows 10 keeps it a couple of
+/// levels down; Windows 11 calls it TEMPLATE_PART_CandidatePanel.
+fn find_panel_in(automation: &UIAutomation, all: &UICondition, root: &UIElement) -> Option<UIElement> {
+    if is_panel(&root.get_automation_id().unwrap_or_default()) {
+        return Some(root.clone());
+    }
+    for id in IME_PANEL_IDS {
+        let Ok(condition) = automation.create_property_condition(
+            UIProperty::AutomationId, Variant::from(id), None) else { continue };
+        if let Ok(panel) = root.find_first(TreeScope::Descendants, &condition) {
+            return Some(panel);
+        }
+    }
+    let children = root.find_all(TreeScope::Children, all).ok()?;
+    children.into_iter().take(48)
+        .find(|child| is_panel(&child.get_automation_id().unwrap_or_default()))
+}
+
+/// Locates the pane for one IME window. ElementFromHandle hands back an empty
+/// wrapper for some CoreWindow hosts (Windows 11 InputApp), so the pane is
+/// also searched among the desktop children owning the same process id.
+fn panel_for_hwnd(automation: &UIAutomation, all: &UICondition, hwnd: usize) -> Option<UIElement> {
+    if let Ok(root) = automation.element_from_handle(Handle::from(hwnd as isize)) {
+        if let Some(panel) = find_panel_in(automation, all, &root) { return Some(panel); }
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd as HWND, &mut pid) };
+    let via_pid = (|| {
+        if pid == 0 { return None; }
+        let desktop = automation.get_root_element().ok()?;
+        let siblings = desktop.find_all(TreeScope::Children, all).ok()?;
+        for sibling in siblings.into_iter().take(64) {
+            if sibling.get_process_id().ok() != Some(pid) { continue; }
+            if let Some(panel) = find_panel_in(automation, all, &sibling) {
+                return Some(panel);
+            }
+        }
+        None
+    })();
+    if probe_log_due() {
+        if via_pid.is_some() {
+            log_global(format!("PANEL_PID_FALLBACK hwnd=0x{hwnd:X} pid={pid}"));
+        } else {
+            log_global(format!("PANEL_MISS hwnd=0x{hwnd:X} pid={pid} class={:?}",
+                window_class(hwnd as HWND)));
+        }
+    }
+    via_pid
+}
+
 fn targeted_candidate(
     automation: &UIAutomation,
     all: &UICondition,
     hwnd: usize,
     hint: Option<&SelectionHint>,
 ) -> Result<Option<Candidate>, String> {
-    let root = automation.element_from_handle(Handle::from(hwnd as isize))
-        .map_err(|e| format!("element_from_handle: {e}"))?;
-    let mut panel = if is_panel(&root.get_automation_id().unwrap_or_default()) {
-        Some(root.clone())
-    } else { None };
-    if panel.is_none() {
-        let children = root.find_all(TreeScope::Children, all)
-            .map_err(|e| format!("window_children: {e}"))?;
-        for child in children.into_iter().take(48) {
-            if is_panel(&child.get_automation_id().unwrap_or_default()) {
-                panel = Some(child);
-                break;
-            }
-        }
-    }
-    let Some(panel) = panel else { return Ok(None); };
+    let Some(panel) = panel_for_hwnd(automation, all, hwnd) else { return Ok(None); };
     if panel.is_offscreen().unwrap_or(false) { return Ok(None); }
     let Some((text, selection_index, selection_source)) = selected_candidate(&panel, all, hint)? else { return Ok(None); };
     let rect = panel.get_bounding_rectangle()
@@ -1615,7 +1672,8 @@ fn uia_event_worker(
             });
             let plausible = MENU_OPEN.load(Ordering::Acquire)
                 && !name.trim().is_empty() && name.chars().count() <= 100
-                && matches!(event_type, Some(ControlType::ListItem) | Some(ControlType::Text));
+                && matches!(event_type, Some(ControlType::ListItem)
+                    | Some(ControlType::MenuItem) | Some(ControlType::Text));
             log_line(&cb_log, format!(
                 "UIA_SELECTION_EVENT type={event_type:?} name_chars={} bounds={} accepted={plausible}",
                 name.chars().count(), bounds.is_some()));
@@ -1726,8 +1784,10 @@ fn log_worker(
         let line = match record {
             LogRecord::Line(line) => line,
             LogRecord::Native(n) => {
+                // The host class differs between Windows 10 and Windows 11,
+                // so screen by the IME-ish class families instead of one name.
                 let eligible = n.hwnd != 0
-                    && n.class == "Windows.UI.Core.CoreWindow"
+                    && is_ime_class(&n.class)
                     && matches!(n.event, EVENT_OBJECT_SHOW | EVENT_OBJECT_NAMECHANGE
                         | EVENT_OBJECT_LOCATIONCHANGE | EVENT_OBJECT_IME_SHOW
                         | EVENT_OBJECT_IME_CHANGE);

@@ -8,10 +8,12 @@ use windows_sys::Win32::{
     Graphics::{
         Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE},
         Gdi::{
-            CreateFontW, CreateSolidBrush, DeleteObject, FillRect, GetMonitorInfoW, GetStockObject,
-            GetSysColor, InvalidateRect, MonitorFromPoint, MonitorFromWindow, SetBkColor, SetBkMode,
-            SetTextColor, COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, HFONT, HBRUSH, MONITORINFO,
-            MONITOR_DEFAULTTONEAREST,
+            CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawFocusRect, DrawTextW,
+            FillRect, FrameRect, GetMonitorInfoW, GetStockObject, GetSysColor, InvalidateRect,
+            MonitorFromPoint, MonitorFromWindow, Polyline, RedrawWindow, SelectObject, SetBkColor,
+            SetBkMode, SetTextColor, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT,
+            DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH, HFONT, MONITORINFO,
+            MONITOR_DEFAULTTONEAREST, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
         },
     },
     System::{
@@ -20,15 +22,17 @@ use windows_sys::Win32::{
     },
     UI::{
         Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
-        Controls::SetWindowTheme,
+        Controls::{SetWindowTheme, DRAWITEMSTRUCT, ODS_FOCUS},
         Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE},
         WindowsAndMessaging::{
-            AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
-            GetCursorPos, GetDlgItem, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-            GetParent, GetWindow, GetWindowTextLengthW, GetWindowTextW, IsWindow, PostMessageW, RegisterClassW,
-            SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-            ShowWindow, SystemParametersInfoW, DM_GETDEFID, GWLP_USERDATA, SPI_GETHIGHCONTRAST,
-            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, WM_CLOSE, WM_COMMAND, WNDCLASSW,
+            AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumChildWindows,
+            GetClassNameW, GetClientRect, GetCursorPos, GetDlgItem, GetSystemMetrics, GetParent,
+            GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+            IsWindow, IsWindowVisible, PostMessageW, RegisterClassW, SendMessageW, SetForegroundWindow,
+            SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW,
+            BN_CLICKED, DM_GETDEFID, GWLP_USERDATA, SPI_GETHIGHCONTRAST, SW_HIDE, SW_SHOW,
+            SW_SHOWNA,
+            SWP_NOACTIVATE, SWP_NOZORDER, WM_CLOSE, WM_COMMAND, WM_DRAWITEM, WM_GETFONT, WNDCLASSW,
             WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPED,
             WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
         },
@@ -38,10 +42,7 @@ use windows_sys::Win32::{
 const CLASS: &str = "TransPopNativeSettings061";
 const WM_SETFONT: u32 = 0x0030;
 const ES_AUTOHSCROLL: u32 = 0x0080;
-const BS_AUTOCHECKBOX: u32 = 0x0003;
-const BM_GETCHECK: u32 = 0x00F0;
-const BM_SETCHECK: u32 = 0x00F1;
-const BST_CHECKED: usize = 1;
+const BS_OWNERDRAW: u32 = 0x000B;
 const ES_PASSWORD: u32 = 0x0020;
 const CBS_DROPDOWN: u32 = 0x0002;
 const EM_SETREADONLY: u32 = 0x00CF;
@@ -58,6 +59,10 @@ const ID_OPENAI_REVEAL: u16 = 4104;
 const ID_AZURE_SECRET: u16 = 4105;
 const ID_OPENAI_SECRET: u16 = 4106;
 const ID_UPDATE: u16 = 4107;
+const ID_AUTOSTART: u16 = 4108;
+const ID_ALT_OUTPUT: u16 = 4109;
+const ID_AUTO_UPDATE: u16 = 4110;
+const ID_THEME: u16 = 4111;
 const EM_SETPASSWORDCHAR: u32 = 0x00CC;
 const WM_CTLCOLORSTATIC: u32 = 0x0138;
 const WM_CTLCOLOREDIT: u32 = 0x0133;
@@ -72,6 +77,7 @@ const EC_LEFT_RIGHT_MARGINS: usize = 0x0003;
 const TRANSPARENT: i32 = 1;
 const SS_ICON: u32 = 0x0003;
 const STM_SETICON: u32 = 0x0170;
+const PS_SOLID: i32 = 0;
 
 // One shared grid: 26 px side margin, 520 px of content, labels end at 136.
 const CLIENT_W: i32 = 572;
@@ -103,6 +109,7 @@ struct Colors {
     text: u32,
     secondary: u32,
     line: u32,
+    accent: u32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -113,15 +120,33 @@ enum Palette {
 }
 
 impl Palette {
-    unsafe fn detect() -> Self {
+    /// High contrast wins, then an explicit env override (screenshot hook), then
+    /// the saved in-app choice, then the Windows app theme.
+    unsafe fn detect(base: &Path) -> Self {
         if high_contrast_enabled() { return Self::HighContrast; }
-        // Explicit override first: it makes light and dark testable without
-        // flipping the whole desktop theme.
         match std::env::var("TRANSPOP_THEME").unwrap_or_default().to_ascii_lowercase().as_str() {
             "dark" => return Self::Dark,
             "light" => return Self::Light,
             _ => {}
         }
+        match ConfigFile::read(base).theme.as_str() {
+            "light" => Self::Light,
+            "dark" => Self::Dark,
+            _ => Self::from_windows(),
+        }
+    }
+
+    /// The theme the window follows while the saved choice is "system".
+    unsafe fn detect_system() -> Self {
+        if high_contrast_enabled() { return Self::HighContrast; }
+        match std::env::var("TRANSPOP_THEME").unwrap_or_default().to_ascii_lowercase().as_str() {
+            "dark" => Self::Dark,
+            "light" => Self::Light,
+            _ => Self::from_windows(),
+        }
+    }
+
+    unsafe fn from_windows() -> Self {
         if apps_use_light_theme() { Self::Light } else { Self::Dark }
     }
 
@@ -129,11 +154,11 @@ impl Palette {
         match self {
             Self::Light => Colors {
                 bg: 0x00FFFFFF, field: 0x00FFFFFF, text: 0x00202020,
-                secondary: 0x00606060, line: 0x00E2E2E2,
+                secondary: 0x00606060, line: 0x00E2E2E2, accent: 0x00D47800,
             },
             Self::Dark => Colors {
                 bg: 0x00202020, field: 0x002D2D2D, text: 0x00F0F0F0,
-                secondary: 0x00A0A0A0, line: 0x003C3C3C,
+                secondary: 0x00A0A0A0, line: 0x003C3C3C, accent: 0x00FFC24C,
             },
             Self::HighContrast => Colors {
                 bg: GetSysColor(COLOR_WINDOW),
@@ -141,6 +166,7 @@ impl Palette {
                 text: GetSysColor(COLOR_WINDOWTEXT),
                 secondary: GetSysColor(COLOR_GRAYTEXT),
                 line: GetSysColor(COLOR_GRAYTEXT),
+                accent: GetSysColor(COLOR_HIGHLIGHT),
             },
         }
     }
@@ -170,28 +196,59 @@ unsafe fn apps_use_light_theme() -> bool {
 /// reached through GWLP_USERDATA, because a Win32 child outlives any borrow.
 struct UiTheme {
     dark: bool,
+    /// Frame colour currently applied; Windows only repaints the non-client
+    /// area across a hide/show cycle, so a real change is tracked.
+    frame_dark: bool,
+    dpi: i32,
     colors: Colors,
     bg_brush: HBRUSH,
     field_brush: HBRUSH,
     line_brush: HBRUSH,
+    accent_brush: HBRUSH,
     /// Secondary-text statics, painted with the muted colour.
     notes: Vec<isize>,
     /// Hairline statics, painted with the line colour.
     lines: Vec<isize>,
+    /// Drop-downs whose closed field is painted by this theme.
+    combos: Vec<isize>,
 }
 
 impl UiTheme {
-    unsafe fn create(palette: Palette) -> Self {
-        let colors = palette.colors();
-        Self {
+    unsafe fn create(palette: Palette, dpi: i32) -> Self {
+        let mut theme = Self {
             dark: palette == Palette::Dark,
-            bg_brush: CreateSolidBrush(colors.bg),
-            field_brush: CreateSolidBrush(colors.field),
-            line_brush: CreateSolidBrush(colors.line),
-            colors,
+            frame_dark: palette == Palette::Dark,
+            dpi,
+            colors: palette.colors(),
+            bg_brush: ptr::null_mut(),
+            field_brush: ptr::null_mut(),
+            line_brush: ptr::null_mut(),
+            accent_brush: ptr::null_mut(),
             notes: Vec::new(),
             lines: Vec::new(),
-        }
+            combos: Vec::new(),
+        };
+        theme.rebuild_brushes();
+        theme
+    }
+
+    unsafe fn rebuild_brushes(&mut self) {
+        self.release();
+        self.bg_brush = CreateSolidBrush(self.colors.bg);
+        self.field_brush = CreateSolidBrush(self.colors.field);
+        self.line_brush = CreateSolidBrush(self.colors.line);
+        self.accent_brush = CreateSolidBrush(self.colors.accent);
+    }
+
+    /// Switches palette in place: brush handles change, control lists stay.
+    unsafe fn recolour(&mut self, palette: Palette) {
+        self.colors = palette.colors();
+        self.dark = palette == Palette::Dark;
+        self.rebuild_brushes();
+    }
+
+    fn is_combo(&self, control: HWND) -> bool {
+        self.combos.contains(&(control as isize))
     }
 
     unsafe fn colors_for(&self, control: HWND) -> (u32, HBRUSH) {
@@ -206,10 +263,107 @@ impl UiTheme {
     }
 
     unsafe fn release(&self) {
-        for brush in [self.bg_brush, self.field_brush, self.line_brush] {
+        for brush in [self.bg_brush, self.field_brush, self.line_brush, self.accent_brush] {
             if !brush.is_null() { DeleteObject(brush); }
         }
     }
+}
+
+/// Owner-drawn checkbox. The stock button ignores WM_CTLCOLORBTN, so a dark
+/// window would keep black labels (Windows 11 has no dark button theme either).
+/// Owner-drawn buttons keep no check state of their own, so the 0/1 flag lives
+/// in the control user data.
+unsafe fn button_checked(control: HWND) -> bool {
+    GetWindowLongPtrW(control, GWLP_USERDATA) == 1
+}
+
+unsafe fn set_button_checked(control: HWND, checked: bool) {
+    SetWindowLongPtrW(control, GWLP_USERDATA, if checked { 1 } else { 0 });
+    InvalidateRect(control, ptr::null(), 0);
+}
+
+unsafe fn draw_checkbox(item: &DRAWITEMSTRUCT, theme: &UiTheme) {
+    let s = |value: i32| value * theme.dpi / 96;
+    let hdc = item.hDC;
+    FillRect(hdc, &item.rcItem, theme.bg_brush);
+    let size = s(16).max(12);
+    let left = item.rcItem.left;
+    let top = (item.rcItem.top + item.rcItem.bottom - size) / 2;
+    let glyph = RECT { left, top, right: left + size, bottom: top + size };
+    let checked = button_checked(item.hwndItem);
+    if checked {
+        FillRect(hdc, &glyph, theme.accent_brush);
+        let pen = CreatePen(PS_SOLID, s(2).max(1), theme.colors.bg);
+        if !pen.is_null() {
+            let old = SelectObject(hdc, pen);
+            let points = [
+                POINT { x: left + size * 20 / 100, y: top + size * 52 / 100 },
+                POINT { x: left + size * 42 / 100, y: top + size * 74 / 100 },
+                POINT { x: left + size * 78 / 100, y: top + size * 28 / 100 },
+            ];
+            Polyline(hdc, points.as_ptr(), points.len() as i32);
+            SelectObject(hdc, old);
+            DeleteObject(pen);
+        }
+    } else {
+        let border = CreateSolidBrush(theme.colors.secondary);
+        if !border.is_null() {
+            FrameRect(hdc, &glyph, border);
+            DeleteObject(border);
+        }
+    }
+    let mut text = [0u16; 256];
+    let len = GetWindowTextW(item.hwndItem, text.as_mut_ptr(), text.len() as i32).max(0) as usize;
+    let font = SendMessageW(item.hwndItem, WM_GETFONT, 0, 0) as HFONT;
+    let old_font = if font.is_null() { ptr::null_mut() } else { SelectObject(hdc, font) };
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, theme.colors.text);
+    let mut area = RECT {
+        left: left + size + s(10),
+        top: item.rcItem.top,
+        right: item.rcItem.right,
+        bottom: item.rcItem.bottom,
+    };
+    DrawTextW(hdc, text.as_ptr(), len as i32, &mut area,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if !old_font.is_null() { SelectObject(hdc, old_font); }
+    if item.itemState & ODS_FOCUS != 0 { DrawFocusRect(hdc, &item.rcItem); }
+}
+
+/// Applies the palette to the frame and every child control. Runs on open and
+/// whenever the in-app theme picker changes, so no restart is needed.
+unsafe fn apply_window_theme(hwnd: HWND, theme: &mut UiTheme) {
+    let changed = theme.frame_dark != theme.dark;
+    theme.frame_dark = theme.dark;
+    let dark: u32 = if theme.dark { 1 } else { 0 };
+    // 20 is the current attribute; 19 is the pre-20H1 number, still worth a try.
+    if DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+        (&dark as *const u32).cast(), 4) != 0 {
+        let _ = DwmSetWindowAttribute(hwnd, 19, (&dark as *const u32).cast(), 4);
+    }
+    // The non-client area ignores runtime attribute flips until the window is
+    // re-shown, so a live switch costs one flicker.
+    if changed && IsWindowVisible(hwnd) != 0 {
+        ShowWindow(hwnd, SW_HIDE);
+        ShowWindow(hwnd, SW_SHOWNA);
+    }
+    unsafe extern "system" fn retheme(child: HWND, lp: isize) -> i32 {
+        let dark = *(lp as *const bool);
+        let mut class = [0u16; 32];
+        let len = GetClassNameW(child, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
+        let name = String::from_utf16_lossy(&class[..len]).to_ascii_lowercase();
+        // Checkboxes are owner-drawn and need no scheme.
+        let scheme = if !dark { "" }
+            else if name.contains("combobox") { "DarkMode_CFD" }
+            else if name.contains("edit") || name.contains("button") { "DarkMode_Explorer" }
+            else { return 1 };
+        let scheme = wide(scheme);
+        SetWindowTheme(child, scheme.as_ptr(), ptr::null());
+        1
+    }
+    EnumChildWindows(hwnd, Some(retheme), (&theme.dark as *const bool) as isize);
+    RedrawWindow(hwnd, ptr::null(), ptr::null_mut(),
+        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
@@ -229,8 +383,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
             // Windows 10 has no dark combobox theme, so the closed field is
             // painted unthemed and asks the parent for its colours.
             if (*theme).dark
-                && (lp as HWND == GetDlgItem(hwnd, ID_PROVIDER as i32)
-                    || GetParent(lp as HWND) == GetDlgItem(hwnd, ID_PROVIDER as i32)) {
+                && ((*theme).is_combo(lp as HWND) || (*theme).is_combo(GetParent(lp as HWND))) {
                 SetBkColor(wp as _, (*theme).colors.field);
                 SetTextColor(wp as _, (*theme).colors.text);
                 return (*theme).field_brush as isize;
@@ -249,6 +402,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
             SetTextColor(wp as _, (*theme).colors.text);
             (*theme).field_brush as isize
         }
+        WM_DRAWITEM => {
+            if theme.is_null() { return DefWindowProcW(hwnd, msg, wp, lp); }
+            draw_checkbox(&*(lp as *const DRAWITEMSTRUCT), &*theme);
+            1
+        }
         // Answer the dialog manager so IsDialogMessageW can route Enter to Save.
         DM_GETDEFID => ((DM_GETDEFID_ANSWER as isize) << 16) | ID_SAVE as isize,
         WM_KEYDOWN if wp as u16 == VK_ESCAPE => {
@@ -264,24 +422,43 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
         WM_COMMAND => {
             let id = (wp & 0xffff) as u16;
             let notify = ((wp >> 16) & 0xffff) as u16;
+            let control = lp as HWND;
+            // Owner-drawn checks do not flip themselves; mirror the click into
+            // the button state, then repaint.
+            if notify as u32 == BN_CLICKED
+                && matches!(id, ID_AUTOSTART | ID_ALT_OUTPUT | ID_AUTO_UPDATE
+                    | ID_AZURE_REVEAL | ID_OPENAI_REVEAL) {
+                let was_checked = button_checked(control);
+                set_button_checked(control, !was_checked);
+                if id == ID_AZURE_REVEAL || id == ID_OPENAI_REVEAL {
+                    // Password visibility is local to this dialog; it never persists
+                    // secrets or changes the saved values by itself.
+                    let secret_id = if id == ID_AZURE_REVEAL { ID_AZURE_SECRET } else { ID_OPENAI_SECRET };
+                    let edit = GetDlgItem(hwnd, secret_id as i32);
+                    if !edit.is_null() {
+                        SendMessageW(edit, EM_SETPASSWORDCHAR,
+                            if was_checked { '*' as usize } else { 0 }, 0);
+                        InvalidateRect(edit, ptr::null(), 1);
+                    }
+                }
+                return 0;
+            }
+            if id == ID_THEME && notify == CBN_SELCHANGE && !theme.is_null() {
+                let palette = match SendMessageW(control, CB_GETCURSEL, 0, 0) {
+                    1 => Palette::Light,
+                    2 => Palette::Dark,
+                    _ => Palette::detect_system(),
+                };
+                let theme = theme as *mut UiTheme;
+                (*theme).recolour(palette);
+                apply_window_theme(hwnd, &mut *theme);
+                return 0;
+            }
             let outgoing = if id == ID_SAVE || id == IDOK { WM_APP_SETTINGS_SAVE }
                 else if id == ID_CANCEL || id == IDCANCEL { WM_APP_SETTINGS_CANCEL }
                 else if id == ID_PROVIDER && notify == CBN_SELCHANGE { WM_APP_SETTINGS_PROVIDER }
                 else if id == ID_UPDATE { WM_APP_SETTINGS_UPDATE }
                 else { 0 };
-            if id == ID_AZURE_REVEAL || id == ID_OPENAI_REVEAL {
-                // Password visibility is local to this dialog; it never persists
-                // secrets or changes the saved values by itself.
-                let secret_id = if id == ID_AZURE_REVEAL { ID_AZURE_SECRET } else { ID_OPENAI_SECRET };
-                let edit = GetDlgItem(hwnd, secret_id as i32);
-                let checkbox = GetDlgItem(hwnd, id as i32);
-                if !edit.is_null() && !checkbox.is_null() {
-                    let shown = SendMessageW(checkbox, BM_GETCHECK, 0, 0) as usize == BST_CHECKED;
-                    SendMessageW(edit, EM_SETPASSWORDCHAR, if shown { 0 } else { '*' as usize }, 0);
-                    InvalidateRect(edit, ptr::null(), 1);
-                }
-                return 0;
-            }
             if outgoing != 0 {
                 let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
                 if !main.is_null() { PostMessageW(main, outgoing, 0, 0); }
@@ -309,12 +486,51 @@ pub struct ConfigFile {
     pub debounce_ms: String,
     pub alt_output: bool,
     pub auto_update: bool,
+    pub theme: String,
 }
 
 pub const DEFAULT_AZURE_URL: &str =
     "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=en";
 pub const DEFAULT_OPENAI_URL: &str = "https://api.openai.com/v1/chat/completions";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
+
+/// Canonical Chat Completions endpoint. Accepts the shapes people paste: a bare
+/// host, .../v1, .../v1/, .../v1/chat, the full endpoint with or without a
+/// trailing slash; any query string survives untouched.
+pub fn normalize_openai_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() { return String::new(); }
+    let (endpoint, suffix) = match trimmed.find(['?', '#']) {
+        Some(index) => (&trimmed[..index], &trimmed[index..]),
+        None => (trimmed, ""),
+    };
+    let mut path = endpoint.trim_end_matches('/').to_string();
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with("/chat/completions") {
+        // Already canonical.
+    } else if lower.ends_with("/chat") {
+        path.push_str("/completions");
+    } else if lower.ends_with("/v1") {
+        path.push_str("/chat/completions");
+    } else {
+        // Keep whatever path prefix the provider documents, but give a bare
+        // host the conventional /v1 root.
+        let after_scheme = path.find("://").map_or(0, |index| index + 3);
+        if !path[after_scheme..].contains('/') { path.push_str("/v1"); }
+        path.push_str("/chat/completions");
+    }
+    path.push_str(suffix);
+    path
+}
+
+/// Only the three documented values ever reach the file.
+pub fn normalize_theme(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "light" => "light".into(),
+        "dark" => "dark".into(),
+        _ => "system".into(),
+    }
+}
 
 /// Only explicit off-values disable a boolean setting.
 pub fn truthy(value: &str, default: bool) -> bool {
@@ -342,13 +558,14 @@ impl ConfigFile {
             azure_url: get("azure_url", DEFAULT_AZURE_URL),
             azure_region: get("azure_region", ""),
             azure_key: super::secret::open(&get("azure_key", "")),
-            openai_url: get("openai_url", DEFAULT_OPENAI_URL),
+            openai_url: normalize_openai_url(&get("openai_url", DEFAULT_OPENAI_URL)),
             openai_model: get("openai_model", DEFAULT_OPENAI_MODEL),
             openai_key: super::secret::open(&get("openai_key", "")),
             timeout_seconds: get("timeout_seconds", "8"),
             debounce_ms: get("debounce_ms", "300"),
-            alt_output: flag("alt_output", false),
+            alt_output: flag("alt_output", true),
             auto_update: flag("auto_update", true),
+            theme: normalize_theme(&get("theme", "system")),
         }
     }
 
@@ -375,7 +592,8 @@ debounce_ms=300\n\
 # auto_update=on checks GitHub Releases at startup and every 6 hours and installs\n\
 # a newer release after verifying the digest GitHub publishes for its asset.\n\
 auto_update=on\n\
-alt_output=false\n";
+alt_output=on\n\
+theme=system\n";
         let _ = fs::OpenOptions::new().write(true).create_new(true).open(&path)
             .and_then(|mut file| file.write_all(sample.as_bytes()));
     }
@@ -394,6 +612,7 @@ pub struct SettingsValues {
     pub debounce_ms: String,
     pub alt_output: bool,
     pub auto_update: bool,
+    pub theme: String,
 }
 impl SettingsValues {
     pub fn from_file(base: &Path) -> Self {
@@ -410,6 +629,7 @@ impl SettingsValues {
             debounce_ms: file.debounce_ms,
             alt_output: file.alt_output,
             auto_update: file.auto_update,
+            theme: file.theme,
         }
     }
 
@@ -439,6 +659,9 @@ impl SettingsValues {
         if !self.debounce_ms.parse::<u64>().is_ok_and(|n| (100..=1000).contains(&n)) {
             return Err("翻译防抖请设置为 100–1000 毫秒".into());
         }
+        if !["system", "light", "dark"].contains(&self.theme.as_str()) {
+            return Err("未知的主题设置".into());
+        }
         for v in [ &self.azure_url, &self.azure_region, &self.azure_key,
                    &self.openai_url, &self.openai_model, &self.openai_key ] {
             if v.contains('\n') || v.contains('\r') { return Err("配置值不能包含换行".into()); }
@@ -447,7 +670,12 @@ impl SettingsValues {
     }
 
     pub fn save(&self, base: &Path) -> Result<(), String> {
-        self.validate()?;
+        // Store the canonical endpoint and theme so the file, the form and the
+        // translator all agree on one spelling.
+        let mut values = self.clone();
+        values.openai_url = normalize_openai_url(&self.openai_url);
+        values.theme = normalize_theme(&self.theme);
+        values.validate()?;
         let path = base.join("translator.conf");
         // A failed read is not an empty file: rewriting from an empty base
         // would silently drop user comments and unknown keys.
@@ -458,22 +686,23 @@ impl SettingsValues {
         };
         // Keys are sealed with DPAPI for the current Windows user before they
         // reach the file; a seal failure keeps the old file untouched.
-        let sealed_azure = super::secret::seal(&self.azure_key)
+        let sealed_azure = super::secret::seal(&values.azure_key)
             .map_err(|e| format!("无法加密保存 Azure API Key（{e}）"))?;
-        let sealed_openai = super::secret::seal(&self.openai_key)
+        let sealed_openai = super::secret::seal(&values.openai_key)
             .map_err(|e| format!("无法加密保存 OpenAI API Key（{e}）"))?;
         let entries = [
-            ("provider", self.provider.clone()),
-            ("azure_url", self.azure_url.clone()),
-            ("azure_region", self.azure_region.clone()),
+            ("provider", values.provider.clone()),
+            ("azure_url", values.azure_url.clone()),
+            ("azure_region", values.azure_region.clone()),
             ("azure_key", sealed_azure),
-            ("openai_url", self.openai_url.clone()),
-            ("openai_model", self.openai_model.clone()),
+            ("openai_url", values.openai_url.clone()),
+            ("openai_model", values.openai_model.clone()),
             ("openai_key", sealed_openai),
-            ("timeout_seconds", self.timeout_seconds.clone()),
-            ("debounce_ms", self.debounce_ms.clone()),
-            ("alt_output", if self.alt_output { "true".to_string() } else { "false".to_string() }),
-            ("auto_update", if self.auto_update { "on".to_string() } else { "off".to_string() }),
+            ("timeout_seconds", values.timeout_seconds.clone()),
+            ("debounce_ms", values.debounce_ms.clone()),
+            ("alt_output", if values.alt_output { "true".to_string() } else { "false".to_string() }),
+            ("auto_update", if values.auto_update { "on".to_string() } else { "off".to_string() }),
+            ("theme", values.theme.clone()),
         ];
         let mut seen = std::collections::HashSet::<String>::new();
         let mut result = String::new();
@@ -546,7 +775,6 @@ pub struct SettingsWindow {
     service_title: HWND,
     service_divider: HWND,
     provider: HWND,
-    hint: HWND,
     connection_title: HWND,
     connection_divider: HWND,
     azure: [(HWND, HWND); 3],
@@ -562,12 +790,12 @@ pub struct SettingsWindow {
     debounce: HWND,
     debounce_unit: HWND,
     autostart: HWND,
-    autostart_help: HWND,
     alt_output: HWND,
     auto_update: HWND,
     update_button: HWND,
     footer_divider: HWND,
-    footer_note: HWND,
+    theme_label: HWND,
+    theme_picker: HWND,
     save_button: HWND,
     cancel_button: HWND,
 }
@@ -593,17 +821,9 @@ impl SettingsWindow {
 
         // One boxed paint state. Its address goes into GWLP_USERDATA and must
         // stay valid while the SettingsWindow itself is moved into the caller.
-        let mut theme = Box::new(UiTheme::create(Palette::detect()));
+        let mut theme = Box::new(UiTheme::create(Palette::detect(&base), dpi));
         let theme_ptr: *mut UiTheme = &mut *theme;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, theme_ptr as isize);
-        if theme.dark {
-            let enabled: u32 = 1;
-            // 20 is the current attribute; 19 is the pre-20H1 number, still worth a try.
-            if DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
-                (&enabled as *const u32).cast(), 4) != 0 {
-                let _ = DwmSetWindowAttribute(hwnd, 19, (&enabled as *const u32).cast(), 4);
-            }
-        }
 
         let font_face = wide("Segoe UI");
         let font = CreateFontW(-scale(14), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, font_face.as_ptr());
@@ -649,8 +869,6 @@ impl SettingsWindow {
         // theme colours on that child, a drop-down list paints itself.
         let provider_edit = GetWindow(provider, GW_CHILD);
         if !provider_edit.is_null() { SendMessageW(provider_edit, EM_SETREADONLY, 1, 0); }
-        let hint = create("STATIC", "", 0, 0);
-        set_font(hint, note_font);
 
         // Service connection; only visible for providers that need credentials.
         let connection_divider = create("STATIC", "", 0, 0);
@@ -673,8 +891,8 @@ impl SettingsWindow {
             field("模型名称", &values.openai_model, 0),
             field("API Key", &values.openai_key, ID_OPENAI_SECRET),
         ];
-        let azure_reveal = create("BUTTON", "显示", ID_AZURE_REVEAL, BS_AUTOCHECKBOX | WS_TABSTOP);
-        let openai_reveal = create("BUTTON", "显示", ID_OPENAI_REVEAL, BS_AUTOCHECKBOX | WS_TABSTOP);
+        let azure_reveal = create("BUTTON", "显示", ID_AZURE_REVEAL, BS_OWNERDRAW | WS_TABSTOP);
+        let openai_reveal = create("BUTTON", "显示", ID_OPENAI_REVEAL, BS_OWNERDRAW | WS_TABSTOP);
 
         // Translation behaviour.
         let behavior_divider = create("STATIC", "", 0, 0);
@@ -683,13 +901,13 @@ impl SettingsWindow {
         let timeout_label = create("STATIC", "请求超时", 0, 0);
         let timeout = create("EDIT", &values.timeout_seconds, 0,
             WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL);
-        let timeout_unit = create("STATIC", "秒（2–30）", 0, 0);
+        let timeout_unit = create("STATIC", "秒", 0, 0);
         let debounce_label = create("STATIC", "翻译防抖", 0, 0);
         let debounce = create("EDIT", &values.debounce_ms, 0,
             WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL);
         let debounce_unit = create("STATIC", "ms", 0, 0);
-        let autostart = create("BUTTON", "登录 Windows 时自动启动", 0,
-            BS_AUTOCHECKBOX | WS_TABSTOP);
+        let autostart = create("BUTTON", "登录 Windows 时自动启动", ID_AUTOSTART,
+            BS_OWNERDRAW | WS_TABSTOP);
         // An unreadable registry state must not look like "disabled": the next
         // Save would then delete a working autostart entry. Assume enabled.
         let previously_enabled = match super::startup::enabled_for_current_exe() {
@@ -699,19 +917,27 @@ impl SettingsWindow {
                 true
             }
         };
-        SendMessageW(autostart, BM_SETCHECK, if previously_enabled { BST_CHECKED } else { 0 }, 0);
-        let autostart_help = create("STATIC", "仅当前用户 · 移动后需重新启用", 0, 0);
-        set_font(autostart_help, note_font);
-        let alt_output = create("BUTTON", "轻按左 Alt：取消拼音并输入英文（实验性）", 0,
-            BS_AUTOCHECKBOX | WS_TABSTOP);
-        SendMessageW(alt_output, BM_SETCHECK, if values.alt_output { BST_CHECKED } else { 0 }, 0);
-        let auto_update = create("BUTTON", "自动检查并安装 GitHub 更新", 0,
-            BS_AUTOCHECKBOX | WS_TABSTOP);
-        SendMessageW(auto_update, BM_SETCHECK, if values.auto_update { BST_CHECKED } else { 0 }, 0);
+        set_button_checked(autostart, previously_enabled);
+        let alt_output = create("BUTTON", "轻按左 Alt：取消拼音并输入英文", ID_ALT_OUTPUT,
+            BS_OWNERDRAW | WS_TABSTOP);
+        set_button_checked(alt_output, values.alt_output);
+        let auto_update = create("BUTTON", "自动检查并安装 GitHub 更新", ID_AUTO_UPDATE,
+            BS_OWNERDRAW | WS_TABSTOP);
+        set_button_checked(auto_update, values.auto_update);
         let update_button = create("BUTTON", "检查更新", ID_UPDATE, WS_TABSTOP);
         let footer_divider = create("STATIC", "", 0, 0);
-        let footer_note = create("STATIC", "在线翻译会将候选文字发送给服务商", 0, 0);
-        set_font(footer_note, note_font);
+        // In-app theme switch: system, light, dark.
+        let theme_label = create("STATIC", "主题", 0, 0);
+        set_font(theme_label, note_font);
+        let theme_picker = create("COMBOBOX", "", ID_THEME, CBS_DROPDOWN | WS_TABSTOP);
+        for label in ["跟随系统", "浅色", "深色"] {
+            let item = wide(label);
+            SendMessageW(theme_picker, CB_ADDSTRING, 0, item.as_ptr() as isize);
+        }
+        let theme_pos = match values.theme.as_str() { "light" => 1, "dark" => 2, _ => 0 };
+        SendMessageW(theme_picker, CB_SETCURSEL, theme_pos, 0);
+        let picker_edit = GetWindow(theme_picker, GW_CHILD);
+        if !picker_edit.is_null() { SendMessageW(picker_edit, EM_SETREADONLY, 1, 0); }
         let save_button = create("BUTTON", "保存设置", ID_SAVE, WS_TABSTOP | 0x00000001); // BS_DEFPUSHBUTTON
         let cancel_button = create("BUTTON", "取消", ID_CANCEL, WS_TABSTOP);
 
@@ -725,36 +951,22 @@ impl SettingsWindow {
             }
         }
         // Which statics are secondary text and which are hairlines.
-        for control in [subtitle, hint, autostart_help, footer_note] {
-            (*theme_ptr).notes.push(control as isize);
-        }
+        (*theme_ptr).notes.push(subtitle as isize);
         for control in [service_divider, connection_divider, behavior_divider, footer_divider] {
             (*theme_ptr).lines.push(control as isize);
         }
-        if (*theme_ptr).dark {
-            // Documented opt-in for dark edit/combo/button chrome. Without it the
-            // controls keep their light theme and paint over the dark page.
-            let scheme = wide("DarkMode_Explorer");
-            for control in [provider, azure[0].1, azure[1].1, azure[2].1,
-                            openai[0].1, openai[1].1, openai[2].1,
-                            timeout, debounce, azure_reveal, openai_reveal,
-                            autostart, alt_output, auto_update,
-                            update_button, save_button, cancel_button] {
-                if !control.is_null() { SetWindowTheme(control, scheme.as_ptr(), ptr::null()); }
-            }
-            // The picker's dropdown button only has a dark rendering in the
-            // file-dialog scheme; the explorer one paints it white.
-            let picker_scheme = wide("DarkMode_CFD");
-            SetWindowTheme(provider, picker_scheme.as_ptr(), ptr::null());
-        }
+        // Drop-downs whose closed field the theme has to paint itself.
+        (*theme_ptr).combos.push(provider as isize);
+        (*theme_ptr).combos.push(theme_picker as isize);
+        apply_window_theme(hwnd, &mut *theme_ptr);
 
         let this = Self { hwnd, base, dpi, font, title_font, section_font, note_font, theme,
-            brand_mark: mark, heading, subtitle, service_title, service_divider, provider, hint,
+            brand_mark: mark, heading, subtitle, service_title, service_divider, provider,
             connection_title, connection_divider, azure, openai, azure_reveal, openai_reveal,
             behavior_title, behavior_divider, timeout_label, timeout, timeout_unit,
-            debounce_label, debounce, debounce_unit, autostart, autostart_help, alt_output,
-            auto_update, update_button, footer_divider, footer_note, save_button, cancel_button };
-        this.update_provider();
+            debounce_label, debounce, debounce_unit, autostart, alt_output,
+            auto_update, update_button, footer_divider, theme_label, theme_picker,
+            save_button, cancel_button };
         this.apply_layout(true);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
@@ -795,9 +1007,7 @@ impl SettingsWindow {
         place(self.service_title, MARGIN_X, y, 460, 22);
         y += 28;
         place(self.provider, MARGIN_X, y, CONTENT_W, 30);
-        y += 34;
-        place(self.hint, MARGIN_X, y, CONTENT_W, 34);
-        y += 34 + 18;
+        y += 30 + 22;
 
         // Separator before 服务连接, or before 翻译行为 when there is none.
         place(self.behavior_divider, MARGIN_X, y, CONTENT_W, 1);
@@ -847,7 +1057,6 @@ impl SettingsWindow {
         y += 28 + 14;
 
         place(self.autostart, MARGIN_X, y, 300, 24);
-        place(self.autostart_help, 336, y + 2, 210, 20);
         place(self.alt_output, MARGIN_X, y + 30, CONTENT_W, 24);
         place(self.auto_update, MARGIN_X, y + 60, 380, 24);
         place(self.update_button, 450, y + 57, 96, 30);
@@ -855,7 +1064,8 @@ impl SettingsWindow {
 
         place(self.footer_divider, MARGIN_X, y + 14, CONTENT_W, 1);
         y += 14 + 1 + 14;
-        place(self.footer_note, MARGIN_X, y + 8, 320, 20);
+        place(self.theme_label, MARGIN_X, y + 6, 40, 20);
+        place(self.theme_picker, 70, y + 2, 150, 30);
         place(self.cancel_button, 342, y, 84, 32);
         place(self.save_button, 434, y, 112, 32);
         y + 32 + 18
@@ -904,15 +1114,9 @@ impl SettingsWindow {
          y.max(work.top).min((work.bottom - height).max(work.top)))
     }
 
+    /// The connection block appears or disappears with the provider, so the
+    /// frame has to take its height from layout() again.
     pub unsafe fn update_provider(&self) {
-        let index = SendMessageW(self.provider, CB_GETCURSEL, 0, 0);
-        let hint = match index {
-            0 => "无需 API Key · 使用微软 Edge 非公开翻译端点，可能失效或限流。",
-            1 => "Azure 官方翻译服务 · 需要密钥，部分资源需要填写区域。",
-            2 => "支持 OpenAI 兼容的 Chat Completions 接口 · 远程 HTTPS／本机 HTTP。",
-            _ => "关闭在线翻译 · 不向服务商发送输入文字。",
-        };
-        SetWindowTextW(self.hint, wide(hint).as_ptr());
         self.apply_layout(false);
     }
 
@@ -939,15 +1143,20 @@ impl SettingsWindow {
             openai_key: Self::get_text(self.openai[2].1),
             timeout_seconds: Self::get_text(self.timeout),
             debounce_ms: Self::get_text(self.debounce),
-            alt_output: SendMessageW(self.alt_output, BM_GETCHECK, 0, 0) as usize == BST_CHECKED,
-            auto_update: SendMessageW(self.auto_update, BM_GETCHECK, 0, 0) as usize == BST_CHECKED,
+            alt_output: button_checked(self.alt_output),
+            auto_update: button_checked(self.auto_update),
+            theme: match SendMessageW(self.theme_picker, CB_GETCURSEL, 0, 0) {
+                1 => "light".to_string(),
+                2 => "dark".to_string(),
+                _ => "system".to_string(),
+            },
         }
     }
     pub unsafe fn autostart_checked(&self) -> bool {
-        SendMessageW(self.autostart, BM_GETCHECK, 0, 0) as usize == BST_CHECKED
+        button_checked(self.autostart)
     }
     pub unsafe fn set_autostart_checked(&self, checked: bool) {
-        SendMessageW(self.autostart, BM_SETCHECK, if checked { BST_CHECKED } else { 0 }, 0);
+        set_button_checked(self.autostart, checked);
     }
     pub fn base(&self) -> &Path { &self.base }
 
@@ -1071,5 +1280,40 @@ mod tests {
         assert_eq!(fs::read_to_string(base.join("translator.conf")).unwrap(), text);
         let _ = fs::remove_dir_all(&base);
     }
-}
 
+    #[test]
+    fn openai_url_accepts_base_paths_and_appends_the_endpoint() {
+        let cases = [
+            ("https://api.example.com", "https://api.example.com/v1/chat/completions"),
+            ("https://api.example.com/", "https://api.example.com/v1/chat/completions"),
+            ("https://api.example.com/v1", "https://api.example.com/v1/chat/completions"),
+            ("https://api.example.com/v1/", "https://api.example.com/v1/chat/completions"),
+            ("https://api.example.com/v1/chat", "https://api.example.com/v1/chat/completions"),
+            ("https://api.example.com/v1/chat/", "https://api.example.com/v1/chat/completions"),
+            ("https://api.example.com/v1/chat/completions",
+                "https://api.example.com/v1/chat/completions"),
+            ("https://api.example.com/v1/chat/completions/",
+                "https://api.example.com/v1/chat/completions"),
+            ("https://api.example.com/api/v3", "https://api.example.com/api/v3/chat/completions"),
+            ("  https://api.example.com/v1?x=1  ",
+                "https://api.example.com/v1/chat/completions?x=1"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(normalize_openai_url(input), expected, "input {input}");
+        }
+        assert_eq!(normalize_openai_url(""), "");
+    }
+
+    #[test]
+    fn theme_defaults_to_system_and_alt_output_is_on_by_default() {
+        let base = temp_base("defaults");
+        fs::create_dir_all(&base).unwrap();
+        let file = ConfigFile::read(&base);
+        assert_eq!(file.theme, "system");
+        assert!(file.alt_output, "Alt text output should default to on");
+        assert_eq!(normalize_theme(" Dark "), "dark");
+        assert_eq!(normalize_theme("LIGHT"), "light");
+        assert_eq!(normalize_theme("auto"), "system");
+        let _ = fs::remove_dir_all(&base);
+    }
+}
