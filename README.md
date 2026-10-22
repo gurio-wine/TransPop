@@ -20,7 +20,7 @@ cargo build --release
 ## 使用
 
 - 托盘图标：左键暂停 / 恢复，右键菜单可打开设置、检查更新、暂停或退出
-- 设置窗口标题旁显示当前版本；可开关后台自动更新、选择检查间隔（15 分钟起），也可点「立即检查」
+- 设置窗口标题旁显示当前版本；可分别开关「检查更新」和「自动更新」、选择检查间隔（15 分钟起），也可点「立即检查」
 - 快捷键：`Ctrl+Alt+Q` 退出
 - 命令行：`--settings`、`--pause`、`--resume`、`--quit`
 
@@ -34,10 +34,11 @@ cargo build --release
 | `timeout_seconds` | 请求超时，2–30 秒 |
 | `debounce_ms` | 翻译防抖，100–1000 毫秒 |
 | `alt_output` | `true` 时启用轻按左 Alt 直接输入英文 |
-| `auto_update` | `on`（默认）时在后台检查并自动安装新版本，`off` 关闭（手动「立即检查」仍可用） |
+| `auto_update` | `on`（默认）时在后台定时检查 GitHub 新版本，`off` 关闭（手动「立即检查」仍可用） |
+| `auto_install` | `on`（默认）时发现新版本直接后台下载安装，`off` 时只弹窗询问 |
 | `update_interval_minutes` | 后台检查间隔，单位分钟，最小 15，默认 360 |
 
-也可以用环境变量覆盖（仅运行时生效，不会写回文件）：`TRANSPOP_PROVIDER`、`TRANSPOP_AZURE_KEY`、`TRANSPOP_AZURE_URL`、`TRANSPOP_AZURE_REGION`、`TRANSPOP_OPENAI_KEY`、`TRANSPOP_OPENAI_URL`、`TRANSPOP_OPENAI_MODEL`、`TRANSPOP_AUTO_UPDATE`、`TRANSPOP_UPDATE_INTERVAL_MINUTES`。
+也可以用环境变量覆盖（仅运行时生效，不会写回文件）：`TRANSPOP_PROVIDER`、`TRANSPOP_AZURE_KEY`、`TRANSPOP_AZURE_URL`、`TRANSPOP_AZURE_REGION`、`TRANSPOP_OPENAI_KEY`、`TRANSPOP_OPENAI_URL`、`TRANSPOP_OPENAI_MODEL`、`TRANSPOP_AUTO_UPDATE`、`TRANSPOP_AUTO_INSTALL`、`TRANSPOP_UPDATE_INTERVAL_MINUTES`。
 
 > API Key 保存时使用 Windows DPAPI 加密（`dpapi:` 前缀，仅当前 Windows 用户可解密）；旧版遗留的明文密钥会在启动时自动重新加密。公共机器上仍建议改用环境变量。
 
@@ -45,7 +46,7 @@ cargo build --release
 
 ## 自动更新
 
-启动 20 秒后以及之后每隔 `update_interval_minutes`（默认 360 分钟，可在设置窗口选择 15 分钟到 1 天），TransPop 会查询 GitHub Releases 的最新版本。`auto_update=on`（默认）时全程后台完成：不弹窗、不抢焦点，下载后用 GitHub 公布的 `sha256` 摘要校验，通过后替换自身并自动重启到新版本（新进程会等旧进程退出后再启动）。手动点「立即检查」时仍先弹窗告知版本并询问是否更新，确认后才下载，下载过程在同一窗口显示进度。
+启动 20 秒后以及之后每隔 `update_interval_minutes`（默认 360 分钟，可在设置窗口选择 15 分钟到 1 天），TransPop 会查询 GitHub Releases 的最新版本。这两个开关互相独立：`auto_update` 决定要不要定时检查，`auto_install` 决定查到之后怎么办。`auto_update=on` + `auto_install=on`（默认）时全程后台完成：不弹窗、不抢焦点，下载后用 GitHub 公布的 `sha256` 摘要校验，通过后替换自身并自动重启到新版本（新进程会等旧进程退出后再启动）。`auto_install=off` 时只弹出前台窗口告知版本并询问，确认后才下载，下载过程在同一窗口显示进度。手动点「立即检查」始终走询问流程。
 
 无法直连 github.com 时，更新检查与下载会自动改用 GitHub 反向代理（`ghfast.top`、`gh.llkk.cc`、`ghproxy.net`）。镜像模式下必须有两个相互独立的镜像公布同一版本号与同一 `sha256`，才会下载并安装，避免单个代理投毒；仍无法更新时可用环境变量 `TRANSPOP_UPDATE_MIRROR=https://你的代理` 指定可信代理。选择「稍后」则本次不下载，下次检查或手动检查时再询问。托盘右键「检查更新...」或设置窗口的「检查更新」可手动触发同一流程。更新文件存放在 `%LOCALAPPDATA%\TransPop\update\`。
 

@@ -64,6 +64,7 @@ const ID_ALT_OUTPUT: u16 = 4109;
 const ID_AUTO_UPDATE: u16 = 4110;
 const ID_THEME: u16 = 4111;
 const ID_UPDATE_INTERVAL: u16 = 4112;
+const ID_AUTO_INSTALL: u16 = 4113;
 const EM_SETPASSWORDCHAR: u32 = 0x00CC;
 const WM_CTLCOLORSTATIC: u32 = 0x0138;
 const WM_CTLCOLOREDIT: u32 = 0x0133;
@@ -428,7 +429,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
             // the button state, then repaint.
             if notify as u32 == BN_CLICKED
                 && matches!(id, ID_AUTOSTART | ID_ALT_OUTPUT | ID_AUTO_UPDATE
-                    | ID_AZURE_REVEAL | ID_OPENAI_REVEAL) {
+                    | ID_AUTO_INSTALL | ID_AZURE_REVEAL | ID_OPENAI_REVEAL) {
                 let was_checked = button_checked(control);
                 set_button_checked(control, !was_checked);
                 if id == ID_AZURE_REVEAL || id == ID_OPENAI_REVEAL {
@@ -487,6 +488,7 @@ pub struct ConfigFile {
     pub debounce_ms: String,
     pub alt_output: bool,
     pub auto_update: bool,
+    pub auto_install: bool,
     pub update_interval_minutes: String,
     pub theme: String,
 }
@@ -580,6 +582,7 @@ impl ConfigFile {
             debounce_ms: get("debounce_ms", "300"),
             alt_output: flag("alt_output", true),
             auto_update: flag("auto_update", true),
+            auto_install: flag("auto_install", true),
             update_interval_minutes: get("update_interval_minutes",
                 &DEFAULT_UPDATE_INTERVAL.to_string()),
             theme: normalize_theme(&get("theme", "system")),
@@ -606,10 +609,12 @@ openai_key=\n\
 # A local OpenAI-compatible endpoint can use http://127.0.0.1:PORT/v1/chat/completions.\n\
 timeout_seconds=8\n\
 debounce_ms=300\n\
-# auto_update=on checks GitHub Releases in the background and installs a\n\
-# newer release after verifying the digest GitHub publishes for its asset.\n\
-# update_interval_minutes is the pause between background checks (min 15).\n\
+# auto_update=on checks GitHub Releases in the background every\n\
+# update_interval_minutes (min 15); auto_install=on then downloads and installs\n\
+# a newer release after verifying the digest GitHub publishes for its asset,\n\
+# while auto_install=off only announces the release and waits for a click.\n\
 auto_update=on\n\
+auto_install=on\n\
 update_interval_minutes=360\n\
 alt_output=on\n\
 theme=system\n";
@@ -631,6 +636,7 @@ pub struct SettingsValues {
     pub debounce_ms: String,
     pub alt_output: bool,
     pub auto_update: bool,
+    pub auto_install: bool,
     pub update_interval_minutes: String,
     pub theme: String,
 }
@@ -649,6 +655,7 @@ impl SettingsValues {
             debounce_ms: file.debounce_ms,
             alt_output: file.alt_output,
             auto_update: file.auto_update,
+            auto_install: file.auto_install,
             update_interval_minutes: file.update_interval_minutes,
             theme: file.theme,
         }
@@ -726,7 +733,7 @@ impl SettingsValues {
             ("debounce_ms", values.debounce_ms.clone()),
             ("alt_output", if values.alt_output { "true".to_string() } else { "false".to_string() }),
             ("auto_update", if values.auto_update { "on".to_string() } else { "off".to_string() }),
-
+            ("auto_install", if values.auto_install { "on".to_string() } else { "off".to_string() }),
             ("update_interval_minutes", values.update_interval_minutes.clone()),
             ("theme", values.theme.clone()),
         ];
@@ -818,6 +825,7 @@ pub struct SettingsWindow {
     autostart: HWND,
     alt_output: HWND,
     auto_update: HWND,
+    auto_install: HWND,
     update_interval: HWND,
     update_intervals: Vec<u32>,
     update_button: HWND,
@@ -949,9 +957,13 @@ impl SettingsWindow {
         let alt_output = create("BUTTON", "Alt 输入英文", ID_ALT_OUTPUT,
             BS_OWNERDRAW | WS_TABSTOP);
         set_button_checked(alt_output, values.alt_output);
+        // Two separate switches: checking for a release and installing it.
         let auto_update = create("BUTTON", "检查更新", ID_AUTO_UPDATE,
             BS_OWNERDRAW | WS_TABSTOP);
         set_button_checked(auto_update, values.auto_update);
+        let auto_install = create("BUTTON", "自动更新", ID_AUTO_INSTALL,
+            BS_OWNERDRAW | WS_TABSTOP);
+        set_button_checked(auto_install, values.auto_install);
         // Interval between background checks; the current value may be one
         // the presets no longer offer, so it is kept as an extra entry.
         let update_interval = create("COMBOBOX", "", ID_UPDATE_INTERVAL,
@@ -1009,7 +1021,7 @@ impl SettingsWindow {
             connection_title, connection_divider, azure, openai, azure_reveal, openai_reveal,
             behavior_title, behavior_divider, timeout_label, timeout, timeout_unit,
             debounce_label, debounce, debounce_unit, autostart, alt_output,
-            auto_update, update_interval, update_intervals: intervals,
+            auto_update, auto_install, update_interval, update_intervals: intervals,
             update_button, footer_divider, theme_label, theme_picker,
             save_button, cancel_button };
         this.apply_layout(true);
@@ -1106,7 +1118,8 @@ impl SettingsWindow {
         place(self.auto_update, MARGIN_X, y + 60, 120, 24);
         place(self.update_interval, 154, y + 57, 150, 30);
         place(self.update_button, 450, y + 57, 96, 30);
-        y += 57 + 30;
+        place(self.auto_install, MARGIN_X, y + 90, CONTENT_W, 24);
+        y += 90 + 30;
 
         place(self.footer_divider, MARGIN_X, y + 14, CONTENT_W, 1);
         y += 14 + 1 + 14;
@@ -1191,6 +1204,7 @@ impl SettingsWindow {
             debounce_ms: Self::get_text(self.debounce),
             alt_output: button_checked(self.alt_output),
             auto_update: button_checked(self.auto_update),
+            auto_install: button_checked(self.auto_install),
             update_interval_minutes: {
                 let index = SendMessageW(self.update_interval, CB_GETCURSEL, 0, 0);
                 let minutes = self.update_intervals.get(index.max(0) as usize)
@@ -1362,7 +1376,15 @@ mod tests {
         fs::create_dir_all(&base).unwrap();
         let values = SettingsValues::from_file(&base);
         assert_eq!(values.update_interval_minutes, "360");
-        assert!(values.auto_update);
+        assert!(values.auto_update, "checking defaults to on");
+        assert!(values.auto_install, "installing defaults to on");
+        let mut quiet = values.clone();
+        quiet.provider = "bing".into();
+        quiet.auto_install = false;
+        quiet.save(&base).unwrap();
+        let text = fs::read_to_string(base.join("translator.conf")).unwrap();
+        assert!(text.contains("auto_install=off"), "auto_install not saved: {text}");
+        assert_eq!(SettingsValues::from_file(&base).update_interval_minutes, "360");
         let mut short = values.clone();
         short.provider = "bing".into();
         short.update_interval_minutes = "14".into();

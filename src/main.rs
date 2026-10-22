@@ -186,6 +186,8 @@ static CONFIG_REVISION: AtomicU64 = AtomicU64::new(0);
 static CONFIG_ENABLED: AtomicBool = AtomicBool::new(false);
 static ALT_OUTPUT_ENABLED: AtomicBool = AtomicBool::new(false);
 static AUTO_UPDATE_ENABLED: AtomicBool = AtomicBool::new(true);
+// Separate from AUTO_UPDATE_ENABLED: checking and installing are two switches.
+static AUTO_INSTALL_ENABLED: AtomicBool = AtomicBool::new(true);
 // Minutes between background update checks; the settings window owns it.
 static UPDATE_INTERVAL_MINUTES: AtomicU64 = AtomicU64::new(360);
 static READY_TRANSLATION: OnceLock<Mutex<Option<ReadyTranslation>>> = OnceLock::new();
@@ -546,6 +548,7 @@ struct TranslatorConfig {
     timeout_seconds: u64,
     debounce_ms: u64,
     auto_update: bool,
+    auto_install: bool,
     update_interval_minutes: u64,
 }
 
@@ -572,6 +575,8 @@ impl TranslatorConfig {
                 .unwrap_or(300).clamp(100, 1000),
             auto_update: settings::truthy(
                 &env_or("TRANSPOP_AUTO_UPDATE", String::new()), file.auto_update),
+            auto_install: settings::truthy(
+                &env_or("TRANSPOP_AUTO_INSTALL", String::new()), file.auto_install),
             update_interval_minutes: env_or("TRANSPOP_UPDATE_INTERVAL_MINUTES",
                 file.update_interval_minutes).parse::<u64>().unwrap_or(360).max(15),
         }
@@ -2363,7 +2368,7 @@ fn update_worker(base: PathBuf, manual: bool, log_tx: Sender<LogRecord>) {
     log_line(&log_tx, format!("UPDATE_AVAILABLE remote={}", release.tag));
     // A scheduled check installs silently: no window may steal focus while
     // the user is typing into the IME candidate window. A manual check asks.
-    let auto_install = !manual;
+    let auto_install = !manual && AUTO_INSTALL_ENABLED.load(Ordering::Acquire);
     let mut prompt = if auto_install {
         log_line(&log_tx, "UPDATE_AUTO_INSTALL");
         None
@@ -2543,6 +2548,7 @@ fn main() {
     let config = TranslatorConfig::load(&base);
     ALT_OUTPUT_ENABLED.store(settings::SettingsValues::from_file(&base).alt_output, Ordering::Release);
     AUTO_UPDATE_ENABLED.store(config.auto_update, Ordering::Release);
+    AUTO_INSTALL_ENABLED.store(config.auto_install, Ordering::Release);
     UPDATE_INTERVAL_MINUTES.store(config.update_interval_minutes, Ordering::Release);
     let configuration_status = config.readiness();
     CONFIG_ENABLED.store(configuration_status.is_ok(), Ordering::Release);
@@ -2798,6 +2804,7 @@ fn main() {
                                 ALT_OUTPUT_ENABLED.store(values.alt_output, Ordering::Release);
                                 let was_auto_update = AUTO_UPDATE_ENABLED
                                     .swap(values.auto_update, Ordering::AcqRel);
+                                AUTO_INSTALL_ENABLED.store(values.auto_install, Ordering::Release);
                                 let chosen_interval = values.update_interval_minutes
                                     .parse::<u64>().unwrap_or(360).max(15);
                                 // The loop compares against this value every tick, so a
@@ -2819,8 +2826,9 @@ fn main() {
                                     log_global(format!("AUTOSTART_CHANGED enabled={wants_autostart}"));
                                 }
                                 log_global(format!("SETTINGS_SAVED provider={}", values.provider));
-                                log_global(format!("AUTO_UPDATE_SETTING enabled={} interval_minutes={chosen_interval}",
-                                    values.auto_update));
+                                log_global(format!(
+                                    "AUTO_UPDATE_SETTING enabled={} auto_install={} interval_minutes={chosen_interval}",
+                                    values.auto_update, values.auto_install));
                                 if values.auto_update && !was_auto_update {
                                     let update_base = base.clone();
                                     let update_log = log_tx.clone();
