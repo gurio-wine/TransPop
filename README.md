@@ -20,13 +20,13 @@ cargo build --release
 ## 使用
 
 - 托盘图标：左键暂停 / 恢复，右键菜单可打开设置、检查更新、暂停或退出
-- 设置窗口标题旁显示当前版本；可分别开关「检查更新」和「自动更新」、选择检查间隔（15 分钟起），也可点「立即检查」
+- 设置窗口分四个标签：翻译 / 外观 / 系统 / 关于，改动即改即存，没有保存按钮，关掉窗口也不会丢
 - 快捷键：`Ctrl+Alt+Q` 退出
 - 命令行：`--settings`、`--pause`、`--resume`、`--quit`
 
 ## 配置
 
-配置文件：`%LOCALAPPDATA%\TransPop\translator.conf`（首次运行自动生成，默认 `provider=off`，不联网）。托盘「设置...」或 `--settings` 打开设置窗口，保存后立即生效。
+配置文件：`%LOCALAPPDATA%\TransPop\translator.conf`（首次运行自动生成，默认 `provider=off`，不联网）。托盘「设置...」或 `--settings` 打开设置窗口，改动即刻写入并立即生效。
 
 | 键 | 说明 |
 |---|---|
@@ -48,7 +48,7 @@ cargo build --release
 
 启动 20 秒后以及之后每隔 `update_interval_minutes`（默认 30 分钟，可在设置窗口选择 15 分钟到 1 天），TransPop 会查询 GitHub Releases 的最新版本。这两个开关互相独立：`auto_update` 决定要不要定时检查，`auto_install` 决定查到之后怎么办。`auto_update=on` + `auto_install=on`（默认）时全程后台完成：不弹窗、不抢焦点，下载后用 GitHub 公布的 `sha256` 摘要校验，通过后替换自身并自动重启到新版本（新进程会等旧进程退出后再启动）。`auto_install=off` 时只弹出前台窗口告知版本并询问，确认后才下载，下载过程在同一窗口显示进度。手动点「立即检查」始终走询问流程。
 
-无法直连 github.com 时，更新检查与下载会自动改用 GitHub 反向代理（`ghfast.top`、`gh.llkk.cc`、`ghproxy.net`）。镜像模式下必须有两个相互独立的镜像公布同一版本号与同一 `sha256`，才会下载并安装，避免单个代理投毒；仍无法更新时可用环境变量 `TRANSPOP_UPDATE_MIRROR=https://你的代理` 指定可信代理。选择「稍后」则本次不下载，下次检查或手动检查时再询问。托盘右键「检查更新...」或设置窗口的「检查更新」可手动触发同一流程。更新文件存放在 `%LOCALAPPDATA%\TransPop\update\`。
+无法直连 github.com 时，更新检查与下载会自动改用 GitHub 反向代理（`ghfast.top`、`gh.llkk.cc`、`ghproxy.net`）。镜像模式下必须有两个相互独立的镜像公布同一版本号与同一 `sha256`，才会下载并安装，避免单个代理投毒；仍无法更新时可用环境变量 `TRANSPOP_UPDATE_MIRROR=https://你的代理` 指定可信代理。选择「稍后」则本次不下载，下次检查或手动检查时再询问。托盘右键「检查更新...」或设置窗口「系统」页的「立即检查」可手动触发同一流程。更新文件存放在 `%LOCALAPPDATA%\TransPop\update\`。
 
 更新时旧版本会先改名为 `transpop.exe.old`。新版本成功进入消息循环并稳定运行 30 秒后才删除该备份；若新版本启动即崩溃，旧的 `transpop.exe.old` 会保留，可手动改回 `transpop.exe` 回滚。
 

@@ -12,7 +12,7 @@ use windows_sys::Win32::{
             FillRect, FrameRect, GetMonitorInfoW, GetStockObject, GetSysColor, InvalidateRect,
             MonitorFromPoint, MonitorFromWindow, Polyline, RedrawWindow, SelectObject, SetBkColor,
             SetBkMode, SetTextColor, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT,
-            DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH, HFONT, MONITORINFO,
+            DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH, HFONT, MONITORINFO,
             MONITOR_DEFAULTTONEAREST, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
         },
     },
@@ -29,7 +29,7 @@ use windows_sys::Win32::{
             GetClassNameW, GetClientRect, GetCursorPos, GetDlgItem, GetSystemMetrics, GetParent,
             GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
             IsWindow, IsWindowVisible, PostMessageW, RegisterClassW, SendMessageW, SetForegroundWindow,
-            SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW,
+            SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW,
             BN_CLICKED, DM_GETDEFID, GWLP_USERDATA, SPI_GETHIGHCONTRAST, SW_HIDE, SW_SHOW,
             SW_SHOWNA,
             SWP_NOACTIVATE, SWP_NOZORDER, WM_CLOSE, WM_COMMAND, WM_DRAWITEM, WM_GETFONT, WNDCLASSW,
@@ -52,7 +52,6 @@ const CB_GETCURSEL: u32 = 0x0147;
 const CB_SETCURSEL: u32 = 0x014E;
 const CBN_SELCHANGE: u16 = 1;
 const ID_PROVIDER: u16 = 4100;
-const ID_SAVE: u16 = 4101;
 const ID_CANCEL: u16 = 4102;
 const ID_AZURE_REVEAL: u16 = 4103;
 const ID_OPENAI_REVEAL: u16 = 4104;
@@ -65,14 +64,20 @@ const ID_AUTO_UPDATE: u16 = 4110;
 const ID_THEME: u16 = 4111;
 const ID_UPDATE_INTERVAL: u16 = 4112;
 const ID_AUTO_INSTALL: u16 = 4113;
+// One owner-drawn button per tab, in display order.
+const ID_TAB_TRANSLATE: u16 = 4120;
+const ID_TAB_APPEARANCE: u16 = 4121;
+const ID_TAB_SYSTEM: u16 = 4122;
+const ID_TAB_ABOUT: u16 = 4123;
+/// Edit notification sent when the field loses focus; the moment a typed
+/// value is considered final, which is what makes save-on-change safe.
+const EN_KILLFOCUS: u16 = 0x0200;
 const EM_SETPASSWORDCHAR: u32 = 0x00CC;
 const WM_CTLCOLORSTATIC: u32 = 0x0138;
 const WM_CTLCOLOREDIT: u32 = 0x0133;
 const WM_CTLCOLORLISTBOX: u32 = 0x0134;
 const WM_ERASEBKGND: u32 = 0x0014;
 const WM_KEYDOWN: u32 = 0x0100;
-const DM_GETDEFID_ANSWER: usize = 0x534B; // DC_HASDEFID
-const IDOK: u16 = 1;
 const IDCANCEL: u16 = 2;
 const EM_SETMARGINS: u32 = 0x00D3;
 const EC_LEFT_RIGHT_MARGINS: usize = 0x0003;
@@ -83,23 +88,32 @@ const PS_SOLID: i32 = 0;
 
 // One shared grid: 26 px side margin, 520 px of content, labels end at 136.
 const CLIENT_W: i32 = 572;
+const CLIENT_H: i32 = 560;
 const MARGIN_X: i32 = 26;
 const CONTENT_W: i32 = 520;
 const LABEL_W: i32 = 118;
 const FIELD_X: i32 = 154;
 const FIELD_W: i32 = 392;
 const SECRET_W: i32 = 323;
+// Tab strip and the single content origin every page shares.
+const TAB_Y: i32 = 96;
+const TAB_W: i32 = 118;
+const TAB_H: i32 = 30;
+const TAB_GAP: i32 = 6;
+const CONTENT_TOP: i32 = 150;
 const WINDOW_STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
 const WINDOW_EX_STYLE: u32 = WS_EX_APPWINDOW;
 const WM_APP_SETTINGS_SAVE: u32 = super::WM_APP + 30;
 const WM_APP_SETTINGS_CANCEL: u32 = super::WM_APP + 31;
 const WM_APP_SETTINGS_PROVIDER: u32 = super::WM_APP + 32;
 const WM_APP_SETTINGS_UPDATE: u32 = super::WM_APP + 33;
+const WM_APP_SETTINGS_PAGE: u32 = super::WM_APP + 34;
 
 pub const SAVE_MESSAGE: u32 = WM_APP_SETTINGS_SAVE;
 pub const CANCEL_MESSAGE: u32 = WM_APP_SETTINGS_CANCEL;
 pub const PROVIDER_MESSAGE: u32 = WM_APP_SETTINGS_PROVIDER;
 pub const UPDATE_MESSAGE: u32 = WM_APP_SETTINGS_UPDATE;
+pub const PAGE_MESSAGE: u32 = WM_APP_SETTINGS_PAGE;
 
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
 
@@ -213,6 +227,9 @@ struct UiTheme {
     lines: Vec<isize>,
     /// Drop-downs whose closed field is painted by this theme.
     combos: Vec<isize>,
+    /// Owner-drawn tab buttons, and which page is showing.
+    tabs: Vec<isize>,
+    page: usize,
 }
 
 impl UiTheme {
@@ -229,6 +246,8 @@ impl UiTheme {
             notes: Vec::new(),
             lines: Vec::new(),
             combos: Vec::new(),
+            tabs: Vec::new(),
+            page: 0,
         };
         theme.rebuild_brushes();
         theme
@@ -251,6 +270,10 @@ impl UiTheme {
 
     fn is_combo(&self, control: HWND) -> bool {
         self.combos.contains(&(control as isize))
+    }
+
+    fn tab_index(&self, control: HWND) -> Option<usize> {
+        self.tabs.iter().position(|tab| *tab == control as isize)
     }
 
     unsafe fn colors_for(&self, control: HWND) -> (u32, HBRUSH) {
@@ -332,6 +355,45 @@ unsafe fn draw_checkbox(item: &DRAWITEMSTRUCT, theme: &UiTheme) {
     if item.itemState & ODS_FOCUS != 0 { DrawFocusRect(hdc, &item.rcItem); }
 }
 
+/// Owner-drawn tab: a filled card for the page that is showing and plain text
+/// for the rest. The stock tab control paints a light strip on Windows 10 that
+/// no theme call can darken, so the strip is drawn here like the checkboxes.
+unsafe fn draw_tab(item: &DRAWITEMSTRUCT, theme: &UiTheme, index: usize) {
+    let s = |value: i32| value * theme.dpi / 96;
+    let hdc = item.hDC;
+    let active = theme.page == index;
+    FillRect(hdc, &item.rcItem, theme.bg_brush);
+    let mut area = item.rcItem;
+    if active {
+        let mut card = item.rcItem;
+        card.bottom -= s(2);
+        FillRect(hdc, &card, theme.field_brush);
+        // Underline the active tab against the page background.
+        let underline = RECT {
+            left: item.rcItem.left,
+            top: item.rcItem.bottom - s(2),
+            right: item.rcItem.right,
+            bottom: item.rcItem.bottom,
+        };
+        FillRect(hdc, &underline, theme.accent_brush);
+    }
+    let mut text = [0u16; 64];
+    let len = GetWindowTextW(item.hwndItem, text.as_mut_ptr(), text.len() as i32).max(0) as usize;
+    let font = SendMessageW(item.hwndItem, WM_GETFONT, 0, 0) as HFONT;
+    let old_font = if font.is_null() { ptr::null_mut() } else { SelectObject(hdc, font) };
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, if active { theme.colors.text } else { theme.colors.secondary });
+    DrawTextW(hdc, text.as_ptr(), len as i32, &mut area,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if !old_font.is_null() { SelectObject(hdc, old_font); }
+    if item.itemState & ODS_FOCUS != 0 {
+        let mut focus = item.rcItem;
+        focus.left += s(2);
+        focus.right -= s(2);
+        DrawFocusRect(hdc, &focus);
+    }
+}
+
 /// Applies the palette to the frame and every child control. Runs on open and
 /// whenever the in-app theme picker changes, so no restart is needed.
 unsafe fn apply_window_theme(hwnd: HWND, theme: &mut UiTheme) {
@@ -406,11 +468,15 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
         }
         WM_DRAWITEM => {
             if theme.is_null() { return DefWindowProcW(hwnd, msg, wp, lp); }
-            draw_checkbox(&*(lp as *const DRAWITEMSTRUCT), &*theme);
+            let item = &*(lp as *const DRAWITEMSTRUCT);
+            match (*theme).tab_index(item.hwndItem) {
+                Some(index) => draw_tab(item, &*theme, index),
+                None => draw_checkbox(item, &*theme),
+            }
             1
         }
-        // Answer the dialog manager so IsDialogMessageW can route Enter to Save.
-        DM_GETDEFID => ((DM_GETDEFID_ANSWER as isize) << 16) | ID_SAVE as isize,
+        // No default button: Enter must never dismiss a form that saves itself.
+        DM_GETDEFID => 0,
         WM_KEYDOWN if wp as u16 == VK_ESCAPE => {
             let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
             if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_CANCEL, 0, 0); }
@@ -425,6 +491,19 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
             let id = (wp & 0xffff) as u16;
             let notify = ((wp >> 16) & 0xffff) as u16;
             let control = lp as HWND;
+            // Tabs only repaint the page; the window keeps one size.
+            if notify as u32 == BN_CLICKED
+                && matches!(id, ID_TAB_TRANSLATE | ID_TAB_APPEARANCE | ID_TAB_SYSTEM | ID_TAB_ABOUT) {
+                let page = match id {
+                    ID_TAB_APPEARANCE => 1,
+                    ID_TAB_SYSTEM => 2,
+                    ID_TAB_ABOUT => 3,
+                    _ => 0,
+                };
+                let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
+                if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_PAGE, page, 0); }
+                return 0;
+            }
             // Owner-drawn checks do not flip themselves; mirror the click into
             // the button state, then repaint.
             if notify as u32 == BN_CLICKED
@@ -442,7 +521,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
                             if was_checked { '*' as usize } else { 0 }, 0);
                         InvalidateRect(edit, ptr::null(), 1);
                     }
+                    return 0;
                 }
+                // A real switch: apply it now, exactly like the Save button did.
+                let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
+                if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0); }
                 return 0;
             }
             if id == ID_THEME && notify == CBN_SELCHANGE && !theme.is_null() {
@@ -454,11 +537,28 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
                 let theme = theme as *mut UiTheme;
                 (*theme).recolour(palette);
                 apply_window_theme(hwnd, &mut *theme);
+                // The choice has to outlive the dialog, so it is saved too.
+                let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
+                if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0); }
                 return 0;
             }
-            let outgoing = if id == ID_SAVE || id == IDOK { WM_APP_SETTINGS_SAVE }
-                else if id == ID_CANCEL || id == IDCANCEL { WM_APP_SETTINGS_CANCEL }
-                else if id == ID_PROVIDER && notify == CBN_SELCHANGE { WM_APP_SETTINGS_PROVIDER }
+            // Save-on-change: every committed edit reports the same message the
+            // Save button used to send, so the main loop keeps one apply path.
+            if id == ID_PROVIDER && notify == CBN_SELCHANGE {
+                let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
+                if !main.is_null() {
+                    PostMessageW(main, WM_APP_SETTINGS_PROVIDER, 0, 0);
+                    PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0);
+                }
+                return 0;
+            }
+            let committed = notify == CBN_SELCHANGE || notify == EN_KILLFOCUS;
+            if committed {
+                let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
+                if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0); }
+                return 0;
+            }
+            let outgoing = if id == ID_CANCEL || id == IDCANCEL { WM_APP_SETTINGS_CANCEL }
                 else if id == ID_UPDATE { WM_APP_SETTINGS_UPDATE }
                 else { 0 };
             if outgoing != 0 {
@@ -829,11 +929,16 @@ pub struct SettingsWindow {
     update_interval: HWND,
     update_intervals: Vec<u32>,
     update_button: HWND,
+    startup_title: HWND,
+    update_title: HWND,
+    interval_caption: HWND,
     footer_divider: HWND,
     theme_label: HWND,
     theme_picker: HWND,
-    save_button: HWND,
-    cancel_button: HWND,
+    tabs: [HWND; 4],
+    status: HWND,
+    close_button: HWND,
+    about_text: HWND,
 }
 
 impl SettingsWindow {
@@ -890,6 +995,18 @@ impl SettingsWindow {
         let subtitle = create("STATIC", &format!("偏好设置 · v{}", super::VERSION), 0, 0);
         set_font(subtitle, note_font);
         let service_divider = create("STATIC", "", 0, 0);
+
+        // Tab strip: four owner-drawn buttons, one page each. Owner drawing
+        // keeps the selected tab readable in the dark palette, which the
+        // stock tab control cannot do on Windows 10.
+        let tab_translate = create("BUTTON", "翻译", ID_TAB_TRANSLATE,
+            BS_OWNERDRAW | WS_TABSTOP);
+        let tab_appearance = create("BUTTON", "外观", ID_TAB_APPEARANCE,
+            BS_OWNERDRAW | WS_TABSTOP);
+        let tab_system = create("BUTTON", "系统", ID_TAB_SYSTEM,
+            BS_OWNERDRAW | WS_TABSTOP);
+        let tab_about = create("BUTTON", "关于", ID_TAB_ABOUT,
+            BS_OWNERDRAW | WS_TABSTOP);
 
         // Translation service.
         let service_title = create("STATIC", "翻译服务", 0, 0);
@@ -980,10 +1097,15 @@ impl SettingsWindow {
         let interval_edit = GetWindow(update_interval, GW_CHILD);
         if !interval_edit.is_null() { SendMessageW(interval_edit, EM_SETREADONLY, 1, 0); }
         let update_button = create("BUTTON", "立即检查", ID_UPDATE, WS_TABSTOP);
+        let startup_title = create("STATIC", "启动", 0, 0);
+        set_font(startup_title, section_font);
+        let update_title = create("STATIC", "更新", 0, 0);
+        set_font(update_title, section_font);
+        let interval_caption = create("STATIC", "检查间隔", 0, 0);
         let footer_divider = create("STATIC", "", 0, 0);
         // In-app theme switch: system, light, dark.
         let theme_label = create("STATIC", "主题", 0, 0);
-        set_font(theme_label, note_font);
+        set_font(theme_label, section_font);
         let theme_picker = create("COMBOBOX", "", ID_THEME, CBS_DROPDOWN | WS_TABSTOP);
         for label in ["跟随系统", "浅色", "深色"] {
             let item = wide(label);
@@ -993,8 +1115,15 @@ impl SettingsWindow {
         SendMessageW(theme_picker, CB_SETCURSEL, theme_pos, 0);
         let picker_edit = GetWindow(theme_picker, GW_CHILD);
         if !picker_edit.is_null() { SendMessageW(picker_edit, EM_SETREADONLY, 1, 0); }
-        let save_button = create("BUTTON", "保存设置", ID_SAVE, WS_TABSTOP | 0x00000001); // BS_DEFPUSHBUTTON
-        let cancel_button = create("BUTTON", "取消", ID_CANCEL, WS_TABSTOP);
+        // No Save button: every change applies at once, so the footer only
+        // needs a status line for rejected values and a way to close.
+        let status = create("STATIC", "", 0, 0);
+        set_font(status, note_font);
+        let close_button = create("BUTTON", "关闭", ID_CANCEL,
+            WS_TABSTOP | 0x00000001); // BS_DEFPUSHBUTTON
+        let about_text = create("STATIC", &format!(
+            "TransPop v{}\r\n\r\n在微软拼音候选窗下方实时显示英文翻译。\r\n\r\n仓库：github.com/gurio-wine/TransPop\r\n许可：MIT",
+            super::VERSION), 0, 0);
 
         // A slightly inset caret keeps addresses off the field frame.
         let pad = scale(8);
@@ -1014,6 +1143,9 @@ impl SettingsWindow {
         (*theme_ptr).combos.push(provider as isize);
         (*theme_ptr).combos.push(theme_picker as isize);
         (*theme_ptr).combos.push(update_interval as isize);
+        for tab in [tab_translate, tab_appearance, tab_system, tab_about] {
+            (*theme_ptr).tabs.push(tab as isize);
+        }
         apply_window_theme(hwnd, &mut *theme_ptr);
 
         let this = Self { hwnd, base, dpi, font, title_font, section_font, note_font, theme,
@@ -1022,8 +1154,10 @@ impl SettingsWindow {
             behavior_title, behavior_divider, timeout_label, timeout, timeout_unit,
             debounce_label, debounce, debounce_unit, autostart, alt_output,
             auto_update, auto_install, update_interval, update_intervals: intervals,
-            update_button, footer_divider, theme_label, theme_picker,
-            save_button, cancel_button };
+            update_button, startup_title, update_title, interval_caption,
+            footer_divider, theme_label, theme_picker,
+            tabs: [tab_translate, tab_appearance, tab_system, tab_about],
+            status, close_button, about_text };
         this.apply_layout(true);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
@@ -1060,50 +1194,41 @@ impl SettingsWindow {
         place(self.subtitle, 75, 44, 470, 20);
         place(self.service_divider, MARGIN_X, 80, CONTENT_W, 1);
 
-        let mut y = 98;
-        place(self.service_title, MARGIN_X, y, 460, 22);
-        y += 28;
-        place(self.provider, MARGIN_X, y, CONTENT_W, 30);
-        y += 30 + 22;
+        // Tab strip: a fixed row under the header.
+        for (index, tab) in self.tabs.iter().enumerate() {
+            place(*tab, MARGIN_X + index as i32 * (TAB_W + TAB_GAP), TAB_Y, TAB_W, TAB_H);
+        }
 
-        // Separator before 服务连接, or before 翻译行为 when there is none.
-        place(self.behavior_divider, MARGIN_X, y, CONTENT_W, 1);
-        y += 18;
-
+        // The three pages share one origin; only the active page is shown, so
+        // every page can use the same coordinates without fighting.
+        let top = CONTENT_TOP;
         let selected = SendMessageW(self.provider, CB_GETCURSEL, 0, 0);
         let advanced = selected == 1 || selected == 2;
-        for (label, edit) in self.azure {
-            show(label, selected == 1);
-            show(edit, selected == 1);
-        }
-        for (label, edit) in self.openai {
-            show(label, selected == 2);
-            show(edit, selected == 2);
-        }
-        show(self.connection_title, advanced);
-        show(self.connection_divider, advanced);
-        show(self.azure_reveal, selected == 1);
-        show(self.openai_reveal, selected == 2);
+        let translating = (*self.theme).page == 0;
+        let appearance = (*self.theme).page == 1;
+        let system = (*self.theme).page == 2;
+        let about = (*self.theme).page == 3;
 
-        if advanced {
-            place(self.connection_title, MARGIN_X, y, 460, 22);
-            y += 28;
-            let rows = if selected == 1 { &self.azure } else { &self.openai };
-            let reveal = if selected == 1 { self.azure_reveal } else { self.openai_reveal };
-            for (row, (label, edit)) in rows.iter().enumerate() {
-                place(*label, MARGIN_X, y + 4, LABEL_W, 22);
-                let width = if row == 2 { SECRET_W } else { FIELD_W };
-                place(*edit, FIELD_X, y, width, 28);
-                if row == 2 { place(reveal, 485, y + 3, 61, 22); }
-                if row < 2 { y += 36; }
-            }
-            y += 28 + 18;
-            place(self.connection_divider, MARGIN_X, y, CONTENT_W, 1);
-            y += 18;
+        // Translation page. The credential block only exists for providers that
+        // need one, so 翻译行为 slides up instead of leaving a hole.
+        place(self.service_title, MARGIN_X, top, 460, 22);
+        place(self.provider, MARGIN_X, top + 28, CONTENT_W, 30);
+        let mut y = top + 74;
+        place(self.connection_title, MARGIN_X, y, 460, 22);
+        let rows = if selected == 1 { &self.azure } else { &self.openai };
+        let reveal = if selected == 1 { self.azure_reveal } else { self.openai_reveal };
+        for (row, (label, edit)) in rows.iter().enumerate() {
+            let row_y = y + 28 + row as i32 * 36;
+            place(*label, MARGIN_X, row_y + 4, LABEL_W, 22);
+            let width = if row == 2 { SECRET_W } else { FIELD_W };
+            place(*edit, FIELD_X, row_y, width, 28);
+            if row == 2 { place(reveal, 485, row_y + 3, 61, 22); }
         }
-
+        if advanced { y += 28 + 2 * 36 + 28; }
+        place(self.behavior_divider, MARGIN_X, y, CONTENT_W, 1);
+        y += 18;
         place(self.behavior_title, MARGIN_X, y, 460, 22);
-        y += 28;
+        y += 32;
         place(self.timeout_label, MARGIN_X, y + 4, LABEL_W, 22);
         place(self.timeout, FIELD_X, y, 90, 28);
         place(self.timeout_unit, FIELD_X + 98, y + 4, 140, 22);
@@ -1111,23 +1236,59 @@ impl SettingsWindow {
         place(self.debounce_label, MARGIN_X, y + 4, LABEL_W, 22);
         place(self.debounce, FIELD_X, y, 84, 28);
         place(self.debounce_unit, FIELD_X + 92, y + 4, 60, 22);
-        y += 28 + 14;
 
-        place(self.autostart, MARGIN_X, y, 300, 24);
-        place(self.alt_output, MARGIN_X, y + 30, CONTENT_W, 24);
-        place(self.auto_update, MARGIN_X, y + 60, 120, 24);
-        place(self.update_interval, 154, y + 57, 150, 30);
-        place(self.update_button, 450, y + 57, 96, 30);
-        place(self.auto_install, MARGIN_X, y + 90, CONTENT_W, 24);
-        y += 90 + 30;
+        // Appearance page.
+        place(self.theme_label, MARGIN_X, top, 460, 22);
+        place(self.theme_picker, MARGIN_X, top + 28, 220, 30);
 
-        place(self.footer_divider, MARGIN_X, y + 14, CONTENT_W, 1);
-        y += 14 + 1 + 14;
-        place(self.theme_label, MARGIN_X, y + 6, 40, 20);
-        place(self.theme_picker, 70, y + 2, 150, 30);
-        place(self.cancel_button, 342, y, 84, 32);
-        place(self.save_button, 434, y, 112, 32);
-        y + 32 + 18
+        // System page: two titled groups with a rule between them, so startup
+        // and updates never read as one pile of switches.
+        place(self.startup_title, MARGIN_X, top, 460, 22);
+        place(self.autostart, MARGIN_X, top + 28, CONTENT_W, 24);
+        place(self.alt_output, MARGIN_X, top + 58, CONTENT_W, 24);
+        place(self.connection_divider, MARGIN_X, top + 100, CONTENT_W, 1);
+        place(self.update_title, MARGIN_X, top + 118, 460, 22);
+        place(self.auto_update, MARGIN_X, top + 146, CONTENT_W, 24);
+        place(self.interval_caption, MARGIN_X, top + 179, LABEL_W, 22);
+        place(self.update_interval, FIELD_X, top + 175, 160, 30);
+        place(self.auto_install, MARGIN_X, top + 215, CONTENT_W, 24);
+        place(self.update_button, MARGIN_X, top + 249, 112, 30);
+
+        // About page.
+        place(self.about_text, MARGIN_X, top, CONTENT_W, 200);
+
+        for control in [self.service_title, self.provider] { show(control, translating); }
+        for (label, edit) in self.azure {
+            show(label, translating && selected == 1);
+            show(edit, translating && selected == 1);
+        }
+        for (label, edit) in self.openai {
+            show(label, translating && selected == 2);
+            show(edit, translating && selected == 2);
+        }
+        show(self.connection_title, translating && advanced);
+        show(self.azure_reveal, translating && selected == 1);
+        show(self.openai_reveal, translating && selected == 2);
+        for control in [self.behavior_divider, self.behavior_title, self.timeout_label,
+                        self.timeout, self.timeout_unit, self.debounce_label, self.debounce,
+                        self.debounce_unit] {
+            show(control, translating);
+        }
+        show(self.theme_label, appearance);
+        show(self.theme_picker, appearance);
+        for control in [self.autostart, self.alt_output, self.auto_update, self.auto_install,
+                        self.update_interval, self.update_button, self.startup_title,
+                        self.update_title, self.interval_caption] {
+            show(control, system);
+        }
+        show(self.connection_divider, system);
+        show(self.about_text, about);
+
+        // Footer: status on the left, close on the right.
+        place(self.footer_divider, MARGIN_X, CLIENT_H - 62, CONTENT_W, 1);
+        place(self.status, MARGIN_X, CLIENT_H - 48, 380, 22);
+        place(self.close_button, 434, CLIENT_H - 54, 112, 32);
+        CLIENT_H
     }
 
     /// Resizes the frame to the client area the layout needs. Centring happens
@@ -1173,10 +1334,56 @@ impl SettingsWindow {
          y.max(work.top).min((work.bottom - height).max(work.top)))
     }
 
-    /// The connection block appears or disappears with the provider, so the
-    /// frame has to take its height from layout() again.
+    /// Provider switches only move controls inside the fixed frame.
     pub unsafe fn update_provider(&self) {
         self.apply_layout(false);
+    }
+
+    /// Switches the visible page. The frame keeps its size, so the dialog
+    /// never jumps when the user browses tabs.
+    pub unsafe fn show_page(&self, page: usize) {
+        let page = page.min(3);
+        let theme = self.theme.as_ref() as *const UiTheme as *mut UiTheme;
+        unsafe { (*theme).page = page; }
+        self.layout();
+        for tab in self.tabs {
+            if !tab.is_null() { InvalidateRect(tab, ptr::null(), 0); }
+        }
+    }
+
+    /// Re-reads translator.conf into the widgets. Only used after a rejected
+    /// value, so the form never keeps something that failed to save and then
+    /// writes it again on the next keystroke.
+    pub unsafe fn reload_fields(&self) {
+        let values = SettingsValues::from_file(&self.base);
+        let set = |control: HWND, text: &str| {
+            if !control.is_null() {
+                let wide = wide(text);
+                SetWindowTextW(control, wide.as_ptr());
+            }
+        };
+        set(self.azure[0].1, &values.azure_url);
+        set(self.azure[1].1, &values.azure_region);
+        set(self.openai[0].1, &values.openai_url);
+        set(self.openai[1].1, &values.openai_model);
+        set(self.timeout, &values.timeout_seconds);
+        set(self.debounce, &values.debounce_ms);
+        set_button_checked(self.autostart, self.autostart_checked());
+        set_button_checked(self.alt_output, values.alt_output);
+        set_button_checked(self.auto_update, values.auto_update);
+        set_button_checked(self.auto_install, values.auto_install);
+        let current: u32 = values.update_interval_minutes.parse()
+            .unwrap_or(DEFAULT_UPDATE_INTERVAL);
+        if let Some(index) = self.update_intervals.iter().position(|m| *m == current) {
+            SendMessageW(self.update_interval, CB_SETCURSEL, index, 0);
+        }
+    }
+
+    /// Footer feedback for a value that could not be applied.
+    pub unsafe fn set_status(&self, text: &str) {
+        if self.status.is_null() { return; }
+        let message = wide(text);
+        SetWindowTextW(self.status, message.as_ptr());
     }
 
     unsafe fn get_text(hwnd: HWND) -> String {

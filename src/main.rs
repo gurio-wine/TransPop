@@ -2769,6 +2769,12 @@ fn main() {
                     if let Some(ref settings_ui) = settings_window { settings_ui.update_provider(); }
                     continue;
                 }
+                settings::PAGE_MESSAGE if msg.hwnd == control => {
+                    if let Some(ref settings_ui) = settings_window {
+                        settings_ui.show_page(msg.wParam);
+                    }
+                    continue;
+                }
                 settings::UPDATE_MESSAGE if msg.hwnd == control => {
                     log_global("UPDATE_CHECK_MANUAL");
                     let update_base = base.clone();
@@ -2785,7 +2791,6 @@ fn main() {
                     if let Some(ref settings_ui) = settings_window {
                         let values = settings_ui.gather();
                         let settings_file_base = settings_ui.base().to_path_buf();
-                        let settings_dialog_hwnd = settings_ui.hwnd;
                         let wants_autostart = settings_ui.autostart_checked();
                         match values.save(&settings_file_base) {
                             Ok(()) => {
@@ -2852,27 +2857,21 @@ fn main() {
                                         state.text.clear();
                                     }
                                 }
-                                if let Some(reason) = autostart_error {
-                                    // Keep the form open so the registry write can be retried.
-                                    let caption = wide("TransPop 开机自启");
-                                    let message = wide(&format!(
-                                        "翻译设置已保存并已生效，但开机自启修改失败：\n{reason}"
-                                    ));
-                                    windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
-                                        settings_dialog_hwnd, message.as_ptr(), caption.as_ptr(), 0x00000010);
-                                } else {
-                                    ShowWindow(hwnd, SW_HIDE);
-                                    if !shadow.is_null() { ShowWindow(shadow, SW_HIDE); }
-                                    if let Some(settings_ui) = settings_window.take() { settings_ui.close(); }
-                                    log_global("SETTINGS_APPLIED");
-                                }
+                                // Save-on-change: the window stays open, so a rejected
+                                // value is reported in the footer instead of a modal box.
+                                let status = match autostart_error {
+                                    Some(reason) => format!("开机自启修改失败：{reason}"),
+                                    None => "已保存".to_string(),
+                                };
+                                settings_ui.set_status(&status);
+                                log_global("SETTINGS_APPLIED");
                             }
                             Err(reason) => {
                                 log_global("SETTINGS_SAVE_REJECTED");
-                                let caption = wide("TransPop 设置");
-                                let message = wide(&reason);
-                                windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
-                                    settings_dialog_hwnd, message.as_ptr(), caption.as_ptr(), 0x00000010);
+                                settings_ui.set_status(&reason);
+                                // A rejected value must not be what the next save
+                                // persists, so restore the field that failed.
+                                settings_ui.reload_fields();
                             }
                         }
                     }
