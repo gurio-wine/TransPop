@@ -14,11 +14,12 @@ use std::{
     time::Duration,
 };
 
-use serde_json::Value;
-
-const RELEASE_API: &str = "https://api.github.com/repos/gurio-wine/TransPop/releases/latest";
+// GitHub's web redirect carries the tag and the release page publishes the
+// asset digest, so no API endpoint (and no API rate limit) is involved.
+const REPO: &str = "https://github.com/gurio-wine/TransPop";
+const RELEASES_LATEST: &str = "https://github.com/gurio-wine/TransPop/releases/latest";
 const ASSET_NAME: &str = "transpop.exe";
-const MAX_API_BODY: u64 = 262_144;
+const MAX_PAGE_BODY: u64 = 262_144;
 // A release executable is about 2 MiB; refuse anything unreasonably larger.
 const MAX_DOWNLOAD: u64 = 32 * 1024 * 1024;
 const USER_AGENT: &str = concat!("TransPop/", env!("CARGO_PKG_VERSION"));
@@ -41,38 +42,48 @@ fn agent(timeout: Duration) -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(timeout).build()
 }
 
+/// The tag GitHub redirects /releases/latest to.
+fn tag_from_url(url: &str) -> Option<String> {
+    let tail = url.split("/releases/tag/").nth(1)?;
+    let tag = tail.split(['?', '#']).next()?.trim_matches('/');
+    (!tag.is_empty() && tag.starts_with('v')).then(|| tag.to_owned())
+}
+
+/// The release page lists the asset link and the digest GitHub computed for
+/// it; both must be present or the download is not trusted.
+fn digest_from_assets(html: &str, tag: &str) -> Option<String> {
+    let link = html.find(&format!("/releases/download/{tag}/{ASSET_NAME}"))?;
+    let start = link + html.get(link..)?.find("sha256:")? + "sha256:".len();
+    let digest = html.get(start..start + 64)?;
+    digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        .then(|| digest.to_ascii_lowercase())
+}
+
 /// The newest published release that carries a verifiable transpop.exe.
 pub fn latest() -> Result<Release, String> {
+    // Redirects are followed; the final URL is /releases/tag/<tag>.
     let response = agent(Duration::from_secs(20))
-        .get(RELEASE_API)
+        .get(RELEASES_LATEST)
         .set("User-Agent", USER_AGENT)
-        .set("Accept", "application/vnd.github+json")
-        .set("X-GitHub-Api-Version", "2022-11-28")
+        .call()
+        .map_err(transport_error)?;
+    let tag = tag_from_url(response.get_url())
+        .ok_or_else(|| "release page has no tag".to_string())?;
+    let page = agent(Duration::from_secs(20))
+        .get(&format!("{REPO}/releases/expanded_assets/{tag}"))
+        .set("User-Agent", USER_AGENT)
         .call()
         .map_err(transport_error)?;
     let mut body = String::new();
-    response.into_reader().take(MAX_API_BODY).read_to_string(&mut body)
+    page.into_reader().take(MAX_PAGE_BODY).read_to_string(&mut body)
         .map_err(|_| "response read error".to_string())?;
-    let json: Value = serde_json::from_str(&body)
-        .map_err(|_| "response JSON error".to_string())?;
-    let tag = json.get("tag_name").and_then(Value::as_str)
-        .ok_or_else(|| "release has no tag".to_string())?.to_owned();
-    let assets = json.get("assets").and_then(Value::as_array)
-        .ok_or_else(|| "release has no assets".to_string())?;
-    for asset in assets {
-        if asset.get("name").and_then(Value::as_str) != Some(ASSET_NAME) { continue; }
-        let url = asset.get("browser_download_url").and_then(Value::as_str).unwrap_or("");
-        let digest = asset.get("digest").and_then(Value::as_str).unwrap_or("");
-        let sha256 = digest.strip_prefix("sha256:").unwrap_or("");
-        // GitHub pins the asset digest; without it the bytes cannot be trusted.
-        if !url.starts_with("https://github.com/") || sha256.len() != 64 {
-            return Err("release asset has no trusted digest".to_string());
-        }
-        return Ok(Release {
-            tag, url: url.to_owned(), sha256: sha256.to_ascii_lowercase(),
-        });
-    }
-    Err("release has no transpop.exe asset".to_string())
+    let sha256 = digest_from_assets(&body, &tag)
+        .ok_or_else(|| "release asset has no trusted digest".to_string())?;
+    Ok(Release {
+        url: format!("{REPO}/releases/download/{tag}/{ASSET_NAME}"),
+        tag,
+        sha256,
+    })
 }
 
 fn parse_version(text: &str) -> Option<[u64; 3]> {
@@ -229,6 +240,22 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
         assert_eq!(sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    }
+
+    #[test]
+    fn tag_and_digest_are_read_from_the_release_pages() {
+        assert_eq!(tag_from_url("https://github.com/o/r/releases/tag/v1.2.3").as_deref(),
+            Some("v1.2.3"));
+        assert_eq!(tag_from_url("https://github.com/o/r/releases/tag/"), None);
+        assert_eq!(tag_from_url("https://github.com/o/r/releases"), None);
+        let digest = "a".repeat(64);
+        let html = format!(
+            "<a href=\"/o/r/releases/download/v1.2.3/transpop.exe\">x</a> sha256:{digest}",
+        );
+        assert_eq!(digest_from_assets(&html, "v1.2.3"), Some(digest.clone()));
+        // Wrong tag or missing digest must not be trusted.
+        assert_eq!(digest_from_assets(&html, "v9.9.9"), None);
+        assert_eq!(digest_from_assets("sha256:nothex", "v1.2.3"), None);
     }
 
     #[test]
