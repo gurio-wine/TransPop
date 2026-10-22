@@ -186,6 +186,8 @@ static CONFIG_REVISION: AtomicU64 = AtomicU64::new(0);
 static CONFIG_ENABLED: AtomicBool = AtomicBool::new(false);
 static ALT_OUTPUT_ENABLED: AtomicBool = AtomicBool::new(false);
 static AUTO_UPDATE_ENABLED: AtomicBool = AtomicBool::new(true);
+// Minutes between background update checks; the settings window owns it.
+static UPDATE_INTERVAL_MINUTES: AtomicU64 = AtomicU64::new(360);
 static READY_TRANSLATION: OnceLock<Mutex<Option<ReadyTranslation>>> = OnceLock::new();
 static ALT_GESTURE: OnceLock<Mutex<AltGesture>> = OnceLock::new();
 static PENDING_COMMIT: OnceLock<Mutex<Option<PendingCommit>>> = OnceLock::new();
@@ -218,7 +220,12 @@ const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const HEALTH_INTERVAL: Duration = Duration::from_secs(60);
 // Give the first update check time to lose to interactive startup work.
 const UPDATE_CHECK_DELAY: Duration = Duration::from_secs(20);
-const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+// Floor for the user-chosen check interval: never hammer GitHub.
+const MIN_UPDATE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+fn update_interval() -> Duration {
+    Duration::from_secs(UPDATE_INTERVAL_MINUTES.load(Ordering::Acquire) * 60)
+        .max(MIN_UPDATE_INTERVAL)
+}
 // Reaching the message loop is the health signal for a freshly self-updated
 // executable; the previous binary stays available for rollback until then.
 const UPDATE_HEALTH_DELAY: Duration = Duration::from_secs(30);
@@ -539,6 +546,7 @@ struct TranslatorConfig {
     timeout_seconds: u64,
     debounce_ms: u64,
     auto_update: bool,
+    update_interval_minutes: u64,
 }
 
 impl TranslatorConfig {
@@ -564,6 +572,8 @@ impl TranslatorConfig {
                 .unwrap_or(300).clamp(100, 1000),
             auto_update: settings::truthy(
                 &env_or("TRANSPOP_AUTO_UPDATE", String::new()), file.auto_update),
+            update_interval_minutes: env_or("TRANSPOP_UPDATE_INTERVAL_MINUTES",
+                file.update_interval_minutes).parse::<u64>().unwrap_or(360).max(15),
         }
     }
 
@@ -2331,8 +2341,10 @@ fn log_global(line: impl Into<String>) {
     if let Some(tx) = LOG_TX.get() { log_line(tx, line); }
 }
 
-// Network work never runs on the UI message loop. A found release is announced
-// in a foreground prompt first; the download starts only after the user agrees.
+// Network work never runs on the UI message loop. A manual check and an
+// automatic check with auto_update=off announce a found release in a foreground
+// prompt and download only after the user agrees; auto_update=on downloads and
+// installs verified releases in the background without interrupting typing.
 fn update_worker(base: PathBuf, manual: bool, log_tx: Sender<LogRecord>) {
     let release = match update::latest() {
         Ok(release) => release,
@@ -2349,39 +2361,55 @@ fn update_worker(base: PathBuf, manual: bool, log_tx: Sender<LogRecord>) {
         return;
     }
     log_line(&log_tx, format!("UPDATE_AVAILABLE remote={}", release.tag));
-    let Some(mut prompt) = (unsafe { update_ui::UpdatePrompt::open(&release.tag) }) else {
-        log_line(&log_tx, "UPDATE_PROMPT_FAILED");
-        return;
+    // A scheduled check installs silently: no window may steal focus while
+    // the user is typing into the IME candidate window. A manual check asks.
+    let auto_install = !manual;
+    let mut prompt = if auto_install {
+        log_line(&log_tx, "UPDATE_AUTO_INSTALL");
+        None
+    } else {
+        let Some(mut prompt) = (unsafe { update_ui::UpdatePrompt::open(&release.tag) }) else {
+            log_line(&log_tx, "UPDATE_PROMPT_FAILED");
+            return;
+        };
+        if !unsafe { prompt.wait_for_decision() } {
+            unsafe { prompt.close() };
+            log_line(&log_tx, "UPDATE_POSTPONED");
+            return;
+        }
+        Some(prompt)
     };
-    if !unsafe { prompt.wait_for_decision() } {
-        unsafe { prompt.close() };
-        log_line(&log_tx, "UPDATE_POSTPONED");
-        return;
-    }
+    let had_prompt = prompt.is_some();
     log_line(&log_tx, format!("UPDATE_DOWNLOAD_STARTED remote={}", release.tag));
-    unsafe { prompt.start_download() };
+    if let Some(prompt) = prompt.as_mut() { unsafe { prompt.start_download() }; }
     let download_dir = base.join("update");
     let downloaded = match update::download(&release, &download_dir, &mut |percent| {
-        unsafe {
-            prompt.set_percent(percent);
-            prompt.pump();
+        if let Some(prompt) = prompt.as_mut() {
+            unsafe {
+                prompt.set_percent(percent);
+                prompt.pump();
+            }
         }
     }) {
         Ok(path) => path,
         Err(reason) => {
-            unsafe { prompt.close() };
+            if let Some(prompt) = prompt.take() { unsafe { prompt.close() }; }
             log_line(&log_tx, format!("UPDATE_DOWNLOAD_FAILED {reason}"));
-            update_notice("自动更新", &format!("下载新版本 {} 失败：{reason}", release.tag));
+            if had_prompt {
+                update_notice("自动更新", &format!("下载新版本 {} 失败：{reason}", release.tag));
+            }
             return;
         }
     };
     log_line(&log_tx, "UPDATE_DOWNLOADED_AND_VERIFIED");
-    unsafe {
-        prompt.install();
-        prompt.pump();
+    if let Some(prompt) = prompt.as_mut() {
+        unsafe {
+            prompt.install();
+            prompt.pump();
+        }
     }
     let applied = update::apply(&downloaded);
-    unsafe { prompt.close() };
+    if let Some(prompt) = prompt.take() { unsafe { prompt.close() }; }
     match applied {
         Ok(()) => {
             log_line(&log_tx, format!("UPDATE_APPLIED version={} restarting", release.tag));
@@ -2390,7 +2418,9 @@ fn update_worker(base: PathBuf, manual: bool, log_tx: Sender<LogRecord>) {
         }
         Err(reason) => {
             log_line(&log_tx, format!("UPDATE_APPLY_FAILED {reason}"));
-            update_notice("自动更新", &format!("安装新版本失败：{reason}"));
+            if had_prompt {
+                update_notice("自动更新", &format!("安装新版本失败：{reason}"));
+            }
         }
     }
 }
@@ -2513,6 +2543,7 @@ fn main() {
     let config = TranslatorConfig::load(&base);
     ALT_OUTPUT_ENABLED.store(settings::SettingsValues::from_file(&base).alt_output, Ordering::Release);
     AUTO_UPDATE_ENABLED.store(config.auto_update, Ordering::Release);
+    UPDATE_INTERVAL_MINUTES.store(config.update_interval_minutes, Ordering::Release);
     let configuration_status = config.readiness();
     CONFIG_ENABLED.store(configuration_status.is_ok(), Ordering::Release);
     let provider_label = config.provider.clone();
@@ -2767,6 +2798,11 @@ fn main() {
                                 ALT_OUTPUT_ENABLED.store(values.alt_output, Ordering::Release);
                                 let was_auto_update = AUTO_UPDATE_ENABLED
                                     .swap(values.auto_update, Ordering::AcqRel);
+                                let chosen_interval = values.update_interval_minutes
+                                    .parse::<u64>().unwrap_or(360).max(15);
+                                // The loop compares against this value every tick, so a
+                                // shortened interval takes effect without waiting.
+                                UPDATE_INTERVAL_MINUTES.store(chosen_interval, Ordering::Release);
                                 if values.alt_output && keyboard_hook.is_null() {
                                     keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL,
                                         Some(alt_keyboard_callback), instance, 0);
@@ -2783,7 +2819,8 @@ fn main() {
                                     log_global(format!("AUTOSTART_CHANGED enabled={wants_autostart}"));
                                 }
                                 log_global(format!("SETTINGS_SAVED provider={}", values.provider));
-                                log_global(format!("AUTO_UPDATE_SETTING enabled={}", values.auto_update));
+                                log_global(format!("AUTO_UPDATE_SETTING enabled={} interval_minutes={chosen_interval}",
+                                    values.auto_update));
                                 if values.auto_update && !was_auto_update {
                                     let update_base = base.clone();
                                     let update_log = log_tx.clone();
@@ -2904,7 +2941,7 @@ fn main() {
                         last_main_health = Instant::now();
                     }
                     if AUTO_UPDATE_ENABLED.load(Ordering::Acquire)
-                        && last_update_check.elapsed() >= UPDATE_INTERVAL {
+                        && last_update_check.elapsed() >= update_interval() {
                         last_update_check = Instant::now();
                         let update_base = base.clone();
                         let update_log = log_tx.clone();

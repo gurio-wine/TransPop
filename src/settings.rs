@@ -63,6 +63,7 @@ const ID_AUTOSTART: u16 = 4108;
 const ID_ALT_OUTPUT: u16 = 4109;
 const ID_AUTO_UPDATE: u16 = 4110;
 const ID_THEME: u16 = 4111;
+const ID_UPDATE_INTERVAL: u16 = 4112;
 const EM_SETPASSWORDCHAR: u32 = 0x00CC;
 const WM_CTLCOLORSTATIC: u32 = 0x0138;
 const WM_CTLCOLOREDIT: u32 = 0x0133;
@@ -486,7 +487,21 @@ pub struct ConfigFile {
     pub debounce_ms: String,
     pub alt_output: bool,
     pub auto_update: bool,
+    pub update_interval_minutes: String,
     pub theme: String,
+}
+
+/// Update check intervals offered in the settings window, in minutes.
+pub const UPDATE_INTERVALS: [u32; 7] = [15, 30, 60, 180, 360, 720, 1440];
+
+pub const DEFAULT_UPDATE_INTERVAL: u32 = 360;
+
+/// Self-describing label: the picker sits next to the checkbox, so the
+/// value itself has to say what it counts.
+pub fn interval_label(minutes: u32) -> String {
+    if minutes >= 1440 { format!("\u{6bcf} {} \u{5929}", minutes / 1440) }
+    else if minutes >= 60 { format!("\u{6bcf} {} \u{5c0f}\u{65f6}", minutes / 60) }
+    else { format!("\u{6bcf} {minutes} \u{5206}\u{949f}") }
 }
 
 pub const DEFAULT_AZURE_URL: &str =
@@ -565,6 +580,8 @@ impl ConfigFile {
             debounce_ms: get("debounce_ms", "300"),
             alt_output: flag("alt_output", true),
             auto_update: flag("auto_update", true),
+            update_interval_minutes: get("update_interval_minutes",
+                &DEFAULT_UPDATE_INTERVAL.to_string()),
             theme: normalize_theme(&get("theme", "system")),
         }
     }
@@ -589,9 +606,11 @@ openai_key=\n\
 # A local OpenAI-compatible endpoint can use http://127.0.0.1:PORT/v1/chat/completions.\n\
 timeout_seconds=8\n\
 debounce_ms=300\n\
-# auto_update=on checks GitHub Releases at startup and every 6 hours and installs\n\
-# a newer release after verifying the digest GitHub publishes for its asset.\n\
+# auto_update=on checks GitHub Releases in the background and installs a\n\
+# newer release after verifying the digest GitHub publishes for its asset.\n\
+# update_interval_minutes is the pause between background checks (min 15).\n\
 auto_update=on\n\
+update_interval_minutes=360\n\
 alt_output=on\n\
 theme=system\n";
         let _ = fs::OpenOptions::new().write(true).create_new(true).open(&path)
@@ -612,6 +631,7 @@ pub struct SettingsValues {
     pub debounce_ms: String,
     pub alt_output: bool,
     pub auto_update: bool,
+    pub update_interval_minutes: String,
     pub theme: String,
 }
 impl SettingsValues {
@@ -629,6 +649,7 @@ impl SettingsValues {
             debounce_ms: file.debounce_ms,
             alt_output: file.alt_output,
             auto_update: file.auto_update,
+            update_interval_minutes: file.update_interval_minutes,
             theme: file.theme,
         }
     }
@@ -658,6 +679,9 @@ impl SettingsValues {
         }
         if !self.debounce_ms.parse::<u64>().is_ok_and(|n| (100..=1000).contains(&n)) {
             return Err("翻译防抖请设置为 100–1000 毫秒".into());
+        }
+        if !self.update_interval_minutes.parse::<u32>().is_ok_and(|n| n >= 15) {
+            return Err("检查间隔请设置为 15 分钟以上".into());
         }
         if !["system", "light", "dark"].contains(&self.theme.as_str()) {
             return Err("未知的主题设置".into());
@@ -702,6 +726,8 @@ impl SettingsValues {
             ("debounce_ms", values.debounce_ms.clone()),
             ("alt_output", if values.alt_output { "true".to_string() } else { "false".to_string() }),
             ("auto_update", if values.auto_update { "on".to_string() } else { "off".to_string() }),
+
+            ("update_interval_minutes", values.update_interval_minutes.clone()),
             ("theme", values.theme.clone()),
         ];
         let mut seen = std::collections::HashSet::<String>::new();
@@ -792,6 +818,8 @@ pub struct SettingsWindow {
     autostart: HWND,
     alt_output: HWND,
     auto_update: HWND,
+    update_interval: HWND,
+    update_intervals: Vec<u32>,
     update_button: HWND,
     footer_divider: HWND,
     theme_label: HWND,
@@ -906,7 +934,7 @@ impl SettingsWindow {
         let debounce = create("EDIT", &values.debounce_ms, 0,
             WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL);
         let debounce_unit = create("STATIC", "ms", 0, 0);
-        let autostart = create("BUTTON", "登录 Windows 时自动启动", ID_AUTOSTART,
+        let autostart = create("BUTTON", "开机自启", ID_AUTOSTART,
             BS_OWNERDRAW | WS_TABSTOP);
         // An unreadable registry state must not look like "disabled": the next
         // Save would then delete a working autostart entry. Assume enabled.
@@ -918,13 +946,28 @@ impl SettingsWindow {
             }
         };
         set_button_checked(autostart, previously_enabled);
-        let alt_output = create("BUTTON", "轻按左 Alt：取消拼音并输入英文", ID_ALT_OUTPUT,
+        let alt_output = create("BUTTON", "Alt 输入英文", ID_ALT_OUTPUT,
             BS_OWNERDRAW | WS_TABSTOP);
         set_button_checked(alt_output, values.alt_output);
-        let auto_update = create("BUTTON", "自动检查 GitHub 更新", ID_AUTO_UPDATE,
+        let auto_update = create("BUTTON", "检查更新", ID_AUTO_UPDATE,
             BS_OWNERDRAW | WS_TABSTOP);
         set_button_checked(auto_update, values.auto_update);
-        let update_button = create("BUTTON", "检查更新", ID_UPDATE, WS_TABSTOP);
+        // Interval between background checks; the current value may be one
+        // the presets no longer offer, so it is kept as an extra entry.
+        let update_interval = create("COMBOBOX", "", ID_UPDATE_INTERVAL,
+            CBS_DROPDOWN | WS_TABSTOP);
+        let current: u32 = values.update_interval_minutes.parse().unwrap_or(DEFAULT_UPDATE_INTERVAL);
+        let mut intervals = UPDATE_INTERVALS.to_vec();
+        if !intervals.contains(&current) { intervals.push(current); intervals.sort_unstable(); }
+        for minutes in &intervals {
+            let item = wide(&interval_label(*minutes));
+            SendMessageW(update_interval, CB_ADDSTRING, 0, item.as_ptr() as isize);
+        }
+        let interval_pos = intervals.iter().position(|m| *m == current).unwrap_or(0);
+        SendMessageW(update_interval, CB_SETCURSEL, interval_pos, 0);
+        let interval_edit = GetWindow(update_interval, GW_CHILD);
+        if !interval_edit.is_null() { SendMessageW(interval_edit, EM_SETREADONLY, 1, 0); }
+        let update_button = create("BUTTON", "立即检查", ID_UPDATE, WS_TABSTOP);
         let footer_divider = create("STATIC", "", 0, 0);
         // In-app theme switch: system, light, dark.
         let theme_label = create("STATIC", "主题", 0, 0);
@@ -958,6 +1001,7 @@ impl SettingsWindow {
         // Drop-downs whose closed field the theme has to paint itself.
         (*theme_ptr).combos.push(provider as isize);
         (*theme_ptr).combos.push(theme_picker as isize);
+        (*theme_ptr).combos.push(update_interval as isize);
         apply_window_theme(hwnd, &mut *theme_ptr);
 
         let this = Self { hwnd, base, dpi, font, title_font, section_font, note_font, theme,
@@ -965,7 +1009,8 @@ impl SettingsWindow {
             connection_title, connection_divider, azure, openai, azure_reveal, openai_reveal,
             behavior_title, behavior_divider, timeout_label, timeout, timeout_unit,
             debounce_label, debounce, debounce_unit, autostart, alt_output,
-            auto_update, update_button, footer_divider, theme_label, theme_picker,
+            auto_update, update_interval, update_intervals: intervals,
+            update_button, footer_divider, theme_label, theme_picker,
             save_button, cancel_button };
         this.apply_layout(true);
         ShowWindow(hwnd, SW_SHOW);
@@ -1058,7 +1103,8 @@ impl SettingsWindow {
 
         place(self.autostart, MARGIN_X, y, 300, 24);
         place(self.alt_output, MARGIN_X, y + 30, CONTENT_W, 24);
-        place(self.auto_update, MARGIN_X, y + 60, 380, 24);
+        place(self.auto_update, MARGIN_X, y + 60, 120, 24);
+        place(self.update_interval, 154, y + 57, 150, 30);
         place(self.update_button, 450, y + 57, 96, 30);
         y += 57 + 30;
 
@@ -1145,6 +1191,12 @@ impl SettingsWindow {
             debounce_ms: Self::get_text(self.debounce),
             alt_output: button_checked(self.alt_output),
             auto_update: button_checked(self.auto_update),
+            update_interval_minutes: {
+                let index = SendMessageW(self.update_interval, CB_GETCURSEL, 0, 0);
+                let minutes = self.update_intervals.get(index.max(0) as usize)
+                    .copied().unwrap_or(DEFAULT_UPDATE_INTERVAL);
+                minutes.to_string()
+            },
             theme: match SendMessageW(self.theme_picker, CB_GETCURSEL, 0, 0) {
                 1 => "light".to_string(),
                 2 => "dark".to_string(),
@@ -1302,6 +1354,25 @@ mod tests {
             assert_eq!(normalize_openai_url(input), expected, "input {input}");
         }
         assert_eq!(normalize_openai_url(""), "");
+    }
+
+    #[test]
+    fn update_interval_defaults_to_six_hours_and_rejects_under_a_quarter_hour() {
+        let base = temp_base("interval");
+        fs::create_dir_all(&base).unwrap();
+        let values = SettingsValues::from_file(&base);
+        assert_eq!(values.update_interval_minutes, "360");
+        assert!(values.auto_update);
+        let mut short = values.clone();
+        short.provider = "bing".into();
+        short.update_interval_minutes = "14".into();
+        assert!(short.validate().is_err(), "14 minutes must be rejected");
+        short.update_interval_minutes = "15".into();
+        assert!(short.validate().is_ok(), "15 minutes must be accepted");
+        assert_eq!(interval_label(15), "\u{6bcf} 15 \u{5206}\u{949f}");
+        assert_eq!(interval_label(360), "\u{6bcf} 6 \u{5c0f}\u{65f6}");
+        assert_eq!(interval_label(1440), "\u{6bcf} 1 \u{5929}");
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
