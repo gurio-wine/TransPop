@@ -59,7 +59,7 @@ use windows_sys::Win32::{
         Input::KeyboardAndMouse::{
             RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
             GetAsyncKeyState, SendInput, INPUT, INPUT_0, KEYBDINPUT, INPUT_KEYBOARD,
-            KEYEVENTF_UNICODE, KEYEVENTF_KEYUP, VK_LMENU, VK_RMENU, VK_CONTROL, VK_SHIFT, VK_ESCAPE,
+            KEYEVENTF_UNICODE, KEYEVENTF_KEYUP, VK_LMENU, VK_ESCAPE,
         },
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
@@ -185,6 +185,11 @@ static TRANSLATION_SERIAL: AtomicU64 = AtomicU64::new(0);
 static CONFIG_REVISION: AtomicU64 = AtomicU64::new(0);
 static CONFIG_ENABLED: AtomicBool = AtomicBool::new(false);
 static ALT_OUTPUT_ENABLED: AtomicBool = AtomicBool::new(false);
+// Virtual-key code of the one-shot shortcut that pastes the translation, or
+// 0 when the user turned it off. Modifiers are read live, so any key works.
+static ALT_OUTPUT_KEY: AtomicU32 = AtomicU32::new(0);
+// Modifier bits (settings::MOD_*) the trigger key must be pressed with.
+static ALT_OUTPUT_MODS: AtomicU32 = AtomicU32::new(0);
 static AUTO_UPDATE_ENABLED: AtomicBool = AtomicBool::new(true);
 // Separate from AUTO_UPDATE_ENABLED: checking and installing are two switches.
 static AUTO_INSTALL_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -324,6 +329,46 @@ fn send_escape_key() -> bool {
     ];
     unsafe { SendInput(2, keys.as_ptr(), mem::size_of::<INPUT>() as i32) == 2 }
 }
+/// Publishes one shortcut spec to the keyboard hook: the virtual key to watch
+/// and whether the feature is on at all.
+fn apply_shortcut(spec: &str) {
+    match settings::parse_shortcut(spec) {
+        Some((mods, vk)) => {
+            ALT_OUTPUT_MODS.store(mods as u32, Ordering::Release);
+            ALT_OUTPUT_KEY.store(vk, Ordering::Release);
+            ALT_OUTPUT_ENABLED.store(true, Ordering::Release);
+        }
+        None => {
+            ALT_OUTPUT_MODS.store(0, Ordering::Release);
+            ALT_OUTPUT_KEY.store(0, Ordering::Release);
+            ALT_OUTPUT_ENABLED.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// The modifier bit a virtual key stands for, so the trigger itself never
+/// counts as an extra modifier held down.
+fn modifier_bit(vk: u32) -> u32 {
+    match vk as u16 {
+        0x10 | 0xA0 | 0xA1 => settings::MOD_SHIFT as u32,
+        0x11 | 0xA2 | 0xA3 => settings::MOD_CTRL as u32,
+        0x12 | 0xA4 | 0xA5 => settings::MOD_ALT as u32,
+        0x5B | 0x5C => settings::MOD_WIN as u32,
+        _ => 0,
+    }
+}
+
+/// Modifiers physically down right now, as settings::MOD_* bits.
+fn modifiers_down() -> u32 {
+    let held = |vk: u16| unsafe { GetAsyncKeyState(vk as i32) } < 0;
+    let mut bits = 0;
+    if held(0x11) { bits |= settings::MOD_CTRL as u32; }
+    if held(0x10) { bits |= settings::MOD_SHIFT as u32; }
+    if held(0x12) { bits |= settings::MOD_ALT as u32; }
+    if held(0x5B) || held(0x5C) { bits |= settings::MOD_WIN as u32; }
+    bits
+}
+
 fn still_eligible(info: &ReadyTranslation, focus: usize, require_menu: bool) -> bool {
     ALT_OUTPUT_ENABLED.load(Ordering::Acquire)
         && !TRANSLATION_PAUSED.load(Ordering::Acquire)
@@ -356,10 +401,13 @@ fn process_alt_commit() {
     // Never react to held modifiers, additional real keyboard input, a
     // changed focus or a late translation. The injected Escape is marked
     // LLKHF_INJECTED and deliberately excluded from PHYSICAL_KEY_EVENTS.
+    // Only modifiers the shortcut does not ask for veto the commit; a chord
+    // like Ctrl+K legitimately keeps Ctrl down while the key is released.
+    let allowed = ALT_OUTPUT_MODS.load(Ordering::Acquire)
+        | modifier_bit(ALT_OUTPUT_KEY.load(Ordering::Acquire));
     if action.started.elapsed() > Duration::from_millis(if action.stage == 0 { 650 } else { 850 })
         || action.input_generation != PHYSICAL_KEY_EVENTS.load(Ordering::Acquire)
-        || [VK_LMENU, VK_RMENU, VK_CONTROL, VK_SHIFT].iter()
-            .any(|&key| unsafe { GetAsyncKeyState(key as i32) } < 0) {
+        || modifiers_down() & !allowed != 0 {
         log_global("ALT_COMMIT_ABORT modifier_or_timeout");
         return;
     }
@@ -424,17 +472,23 @@ fn process_alt_commit() {
 
 unsafe extern "system" fn alt_keyboard_callback(code: i32, wparam: usize, lparam: isize) -> isize {
     if code >= 0 && lparam != 0 && ALT_OUTPUT_ENABLED.load(Ordering::Relaxed) {
+        let trigger = ALT_OUTPUT_KEY.load(Ordering::Relaxed);
+        if trigger == 0 { return CallNextHookEx(ptr::null_mut(), code, wparam, lparam); }
         let event = &*(lparam as *const KBDLLHOOKSTRUCT);
         if event.flags & LLKHF_INJECTED == 0 {
             let down = wparam == WM_KEYDOWN as usize || wparam == WM_SYSKEYDOWN as usize;
             let up = wparam == WM_KEYUP as usize || wparam == WM_SYSKEYUP as usize;
             if let Ok(mut g) = ALT_GESTURE.get_or_init(|| Mutex::new(AltGesture::default())).lock() {
-                if event.vkCode == VK_LMENU as u32
-                    || (event.vkCode == 0x12 && event.flags & 0x01 == 0) {
+                if event.vkCode == trigger
+                    || (trigger == VK_LMENU as u32 && event.vkCode == 0x12
+                        && event.flags & 0x01 == 0) {
                     if down && g.down.is_none() {
                         g.down = Some(Instant::now());
-                        g.chord = [VK_CONTROL, VK_SHIFT, VK_RMENU].iter()
-                            .any(|&key| GetAsyncKeyState(key as i32) < 0);
+                        // A chord only fires when exactly the configured
+                        // modifiers are held; anything else is a real chord.
+                        let own = modifier_bit(trigger);
+                        let expected = ALT_OUTPUT_MODS.load(Ordering::Relaxed) | own;
+                        g.chord = modifiers_down() | own != expected;
                     } else if up {
                         let eligible_tap = g.down.take().is_some_and(|t| t.elapsed() < ALT_TAP_MAX)
                             && !g.chord;
@@ -2546,7 +2600,10 @@ fn main() {
     // and deliberately keep the app running.
     settings::migrate_plaintext_secrets(&base);
     let config = TranslatorConfig::load(&base);
-    ALT_OUTPUT_ENABLED.store(settings::SettingsValues::from_file(&base).alt_output, Ordering::Release);
+    {
+        let shortcut = settings::SettingsValues::from_file(&base).alt_output_shortcut;
+        apply_shortcut(&shortcut);
+    }
     AUTO_UPDATE_ENABLED.store(config.auto_update, Ordering::Release);
     AUTO_INSTALL_ENABLED.store(config.auto_install, Ordering::Release);
     UPDATE_INTERVAL_MINUTES.store(config.update_interval_minutes, Ordering::Release);
@@ -2806,7 +2863,8 @@ fn main() {
                                     }
                                     autostart_error = Some(reason);
                                 }
-                                ALT_OUTPUT_ENABLED.store(values.alt_output, Ordering::Release);
+                                apply_shortcut(&values.alt_output_shortcut);
+                                let shortcut_on = ALT_OUTPUT_ENABLED.load(Ordering::Acquire);
                                 let was_auto_update = AUTO_UPDATE_ENABLED
                                     .swap(values.auto_update, Ordering::AcqRel);
                                 AUTO_INSTALL_ENABLED.store(values.auto_install, Ordering::Release);
@@ -2815,18 +2873,21 @@ fn main() {
                                 // The loop compares against this value every tick, so a
                                 // shortened interval takes effect without waiting.
                                 UPDATE_INTERVAL_MINUTES.store(chosen_interval, Ordering::Release);
-                                if values.alt_output && keyboard_hook.is_null() {
+                                if shortcut_on && keyboard_hook.is_null() {
                                     keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL,
                                         Some(alt_keyboard_callback), instance, 0);
                                     log_global(if keyboard_hook.is_null() { "ALT_HOOK_INSTALL_FAILED" } else { "ALT_HOOK_INSTALLED" });
-                                } else if !values.alt_output && !keyboard_hook.is_null() {
+                                } else if !shortcut_on && !keyboard_hook.is_null() {
                                     UnhookWindowsHookEx(keyboard_hook);
                                     keyboard_hook = ptr::null_mut();
                                     log_global("ALT_HOOK_REMOVED");
                                 }
                                 clear_ready_translation();
                                 cancel_pending_commit();
-                                log_global(format!("ALT_OUTPUT_SETTING enabled={}", values.alt_output));
+                                log_global(format!(
+                                    "ALT_OUTPUT_SETTING enabled={shortcut_on} shortcut={} ({})",
+                                    values.alt_output_shortcut,
+                                    settings::shortcut_label(&values.alt_output_shortcut)));
                                 if autostart_error.is_none() {
                                     log_global(format!("AUTOSTART_CHANGED enabled={wants_autostart}"));
                                 }

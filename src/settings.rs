@@ -59,7 +59,11 @@ const ID_AZURE_SECRET: u16 = 4105;
 const ID_OPENAI_SECRET: u16 = 4106;
 const ID_UPDATE: u16 = 4107;
 const ID_AUTOSTART: u16 = 4108;
-const ID_ALT_OUTPUT: u16 = 4109;
+const ID_SHORTCUT_KEY: u16 = 4109;
+const ID_MOD_SHIFT: u16 = 4114;
+const ID_MOD_CTRL: u16 = 4115;
+const ID_MOD_ALT: u16 = 4116;
+const ID_MOD_WIN: u16 = 4117;
 const ID_AUTO_UPDATE: u16 = 4110;
 const ID_THEME: u16 = 4111;
 const ID_UPDATE_INTERVAL: u16 = 4112;
@@ -68,6 +72,7 @@ const ID_AUTO_INSTALL: u16 = 4113;
 const ID_TAB_TRANSLATE: u16 = 4120;
 const ID_TAB_APPEARANCE: u16 = 4121;
 const ID_TAB_SYSTEM: u16 = 4122;
+const ID_TAB_SHORTCUT: u16 = 4124;
 const ID_TAB_ABOUT: u16 = 4123;
 /// Edit notification sent when the field loses focus; the moment a typed
 /// value is considered final, which is what makes save-on-change safe.
@@ -88,7 +93,7 @@ const PS_SOLID: i32 = 0;
 
 // One shared grid: 26 px side margin, 520 px of content, labels end at 136.
 const CLIENT_W: i32 = 572;
-const CLIENT_H: i32 = 560;
+const CLIENT_H: i32 = 500;
 const MARGIN_X: i32 = 26;
 const CONTENT_W: i32 = 520;
 const LABEL_W: i32 = 118;
@@ -97,7 +102,7 @@ const FIELD_W: i32 = 392;
 const SECRET_W: i32 = 323;
 // Tab strip and the single content origin every page shares.
 const TAB_Y: i32 = 96;
-const TAB_W: i32 = 118;
+const TAB_W: i32 = 100;
 const TAB_H: i32 = 30;
 const TAB_GAP: i32 = 6;
 const CONTENT_TOP: i32 = 150;
@@ -394,6 +399,7 @@ unsafe fn draw_tab(item: &DRAWITEMSTRUCT, theme: &UiTheme, index: usize) {
     }
 }
 
+
 /// Applies the palette to the frame and every child control. Runs on open and
 /// whenever the in-app theme picker changes, so no restart is needed.
 unsafe fn apply_window_theme(hwnd: HWND, theme: &mut UiTheme) {
@@ -493,11 +499,13 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
             let control = lp as HWND;
             // Tabs only repaint the page; the window keeps one size.
             if notify as u32 == BN_CLICKED
-                && matches!(id, ID_TAB_TRANSLATE | ID_TAB_APPEARANCE | ID_TAB_SYSTEM | ID_TAB_ABOUT) {
+                && matches!(id, ID_TAB_TRANSLATE | ID_TAB_APPEARANCE | ID_TAB_SYSTEM
+                    | ID_TAB_SHORTCUT | ID_TAB_ABOUT) {
                 let page = match id {
                     ID_TAB_APPEARANCE => 1,
                     ID_TAB_SYSTEM => 2,
-                    ID_TAB_ABOUT => 3,
+                    ID_TAB_SHORTCUT => 3,
+                    ID_TAB_ABOUT => 4,
                     _ => 0,
                 };
                 let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
@@ -507,8 +515,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
             // Owner-drawn checks do not flip themselves; mirror the click into
             // the button state, then repaint.
             if notify as u32 == BN_CLICKED
-                && matches!(id, ID_AUTOSTART | ID_ALT_OUTPUT | ID_AUTO_UPDATE
-                    | ID_AUTO_INSTALL | ID_AZURE_REVEAL | ID_OPENAI_REVEAL) {
+                && matches!(id, ID_AUTOSTART | ID_AUTO_UPDATE | ID_MOD_SHIFT | ID_MOD_CTRL
+                    | ID_MOD_ALT | ID_MOD_WIN | ID_AUTO_INSTALL
+                    | ID_AZURE_REVEAL | ID_OPENAI_REVEAL) {
                 let was_checked = button_checked(control);
                 set_button_checked(control, !was_checked);
                 if id == ID_AZURE_REVEAL || id == ID_OPENAI_REVEAL {
@@ -586,7 +595,7 @@ pub struct ConfigFile {
     pub openai_key: String,
     pub timeout_seconds: String,
     pub debounce_ms: String,
-    pub alt_output: bool,
+    pub alt_output_shortcut: String,
     pub auto_update: bool,
     pub auto_install: bool,
     pub update_interval_minutes: String,
@@ -597,6 +606,162 @@ pub struct ConfigFile {
 pub const UPDATE_INTERVALS: [u32; 7] = [15, 30, 60, 180, 360, 720, 1440];
 
 pub const DEFAULT_UPDATE_INTERVAL: u32 = 30;
+
+/// Shortcut that pastes the translation instead of the Chinese candidate.
+pub const DEFAULT_SHORTCUT: &str = "lalt";
+
+/// Modifier bits of a shortcut spec, in the order the label prints them.
+pub const MOD_CTRL: u8 = 1;
+pub const MOD_SHIFT: u8 = 2;
+pub const MOD_ALT: u8 = 4;
+pub const MOD_WIN: u8 = 8;
+
+/// Keys the shortcut editor can name and the config file may hold. One table
+/// serves both directions, so the spelling cannot drift.
+pub const SHORTCUT_KEYS: [(&str, u32); 58] = [
+    ("lalt", 0xA4), ("ralt", 0xA5), ("lctrl", 0xA2), ("rctrl", 0xA3),
+    ("lshift", 0xA0), ("rshift", 0xA1), ("lwin", 0x5B), ("rwin", 0x5C),
+    ("space", 0x20), ("enter", 0x0D), ("tab", 0x09), ("backspace", 0x08),
+    ("esc", 0x1B), ("insert", 0x2D), ("delete", 0x2E), ("home", 0x24),
+    ("end", 0x23), ("pageup", 0x21), ("pagedown", 0x22),
+    ("left", 0x25), ("up", 0x26), ("right", 0x27), ("down", 0x28),
+    ("capslock", 0x14), ("numlock", 0x90), ("scrolllock", 0x91),
+    ("pause", 0x13), ("printscreen", 0x2C), ("apps", 0x5D),
+    ("oem_1", 0xBA), ("oem_plus", 0xBB), ("oem_comma", 0xBC),
+    ("oem_minus", 0xBD), ("oem_period", 0xBE), ("oem_2", 0xBF),
+    ("oem_3", 0xC0), ("oem_4", 0xDB), ("oem_5", 0xDC), ("oem_6", 0xDD),
+    ("oem_7", 0xDE),
+    ("num0", 0x60), ("num1", 0x61), ("num2", 0x62), ("num3", 0x63),
+    ("num4", 0x64), ("num5", 0x65), ("num6", 0x66), ("num7", 0x67),
+    ("num8", 0x68), ("num9", 0x69), ("num_multiply", 0x6A), ("num_add", 0x6B),
+    ("num_subtract", 0x6D), ("num_decimal", 0x6E), ("num_divide", 0x6F),
+    ("mute", 0xAD), ("volumeup", 0xAF), ("volumedown", 0xAE),
+];
+
+const LETTERS: [&str; 26] = ["a","b","c","d","e","f","g","h","i","j","k","l",
+    "m","n","o","p","q","r","s","t","u","v","w","x","y","z"];
+const DIGITS: [&str; 10] = ["0","1","2","3","4","5","6","7","8","9"];
+const FKEYS: [&str; 24] = ["f1","f2","f3","f4","f5","f6","f7","f8","f9","f10",
+    "f11","f12","f13","f14","f15","f16","f17","f18","f19","f20",
+    "f21","f22","f23","f24"];
+
+/// Keys offered in the settings page. The config file accepts every name in
+/// SHORTCUT_KEYS, so a hand-edited chord keeps working even when it is not
+/// listed here.
+pub const SHORTCUT_CHOICES: [(&str, u32); 31] = [
+    ("\u{5de6} Alt", 0xA4), ("\u{53f3} Alt", 0xA5),
+    ("\u{5de6} Ctrl", 0xA2), ("\u{53f3} Ctrl", 0xA3),
+    ("\u{5de6} Shift", 0xA0), ("\u{53f3} Shift", 0xA1),
+    ("Space", 0x20), ("Enter", 0x0D), ("Tab", 0x09), ("Backspace", 0x08),
+    ("Esc", 0x1B), ("Insert", 0x2D), ("Delete", 0x2E), ("Home", 0x24),
+    ("End", 0x23), ("Page Up", 0x21), ("Page Down", 0x22),
+    ("Left", 0x25), ("Up", 0x26), ("Right", 0x27), ("Down", 0x28),
+    ("F1", 0x70), ("F2", 0x71), ("F3", 0x72), ("F4", 0x73),
+    ("F5", 0x74), ("F6", 0x75), ("F7", 0x76), ("F8", 0x77),
+    ("F9", 0x78), ("F10", 0x79),
+];
+
+/// First entry is the off switch, so an empty choice is always expressible.
+fn shortcut_key_items() -> Vec<String> {
+    let mut items = vec!["\u{672a}\u{8bbe}\u{7f6e}".to_string()];
+    items.extend(SHORTCUT_CHOICES.iter().map(|(name, _)| (*name).to_string()));
+    items
+}
+
+/// Canonical spelling of a shortcut. Anything unreadable becomes `none`, which
+/// is the safe state: no shortcut at all rather than a surprise keystroke.
+pub fn normalize_shortcut(spec: &str) -> String {
+    match parse_shortcut(spec) {
+        Some((mods, vk)) => shortcut_spec(mods, vk),
+        None => "none".to_string(),
+    }
+}
+
+/// `(modifiers, virtual key)` for a stored spec, or None when it is off.
+pub fn parse_shortcut(spec: &str) -> Option<(u8, u32)> {
+    let spec = spec.trim().to_ascii_lowercase();
+    if spec.is_empty() || spec == "none" || spec == "off" { return None; }
+    let mut mods = 0u8;
+    for part in spec.split('+') {
+        match part.trim() {
+            "ctrl" | "control" => mods |= MOD_CTRL,
+            "shift" => mods |= MOD_SHIFT,
+            "alt" => mods |= MOD_ALT,
+            "win" => mods |= MOD_WIN,
+            key => return shortcut_key(key).map(|vk| (mods, vk)),
+        }
+    }
+    None
+}
+
+fn shortcut_key(name: &str) -> Option<u32> {
+    if let Some((_, vk)) = SHORTCUT_KEYS.iter().find(|(n, _)| *n == name) { return Some(*vk); }
+    let bytes = name.as_bytes();
+    if bytes.len() == 1 {
+        if bytes[0].is_ascii_lowercase() { return Some(bytes[0].to_ascii_uppercase() as u32); }
+        if bytes[0].is_ascii_digit() { return Some(bytes[0] as u32); }
+    }
+    if let Some(number) = name.strip_prefix('f').and_then(|n| n.parse::<u32>().ok()) {
+        if (1..=24).contains(&number) { return Some(0x70 + number - 1); }
+    }
+    None
+}
+
+fn shortcut_name(vk: u32) -> Option<&'static str> {
+    if (0x41..=0x5A).contains(&vk) { return Some(LETTERS[(vk - 0x41) as usize]); }
+    if (0x30..=0x39).contains(&vk) { return Some(DIGITS[(vk - 0x30) as usize]); }
+    if (0x70..=0x87).contains(&vk) { return Some(FKEYS[(vk - 0x70) as usize]); }
+    SHORTCUT_KEYS.iter().find(|(_, code)| *code == vk).map(|(name, _)| *name)
+}
+
+/// Inverse of parse_shortcut, in the same modifier order the label shows.
+pub fn shortcut_spec(mods: u8, vk: u32) -> String {
+    let Some(key) = shortcut_name(vk) else { return "none".to_string(); };
+    let mut parts: Vec<&str> = Vec::new();
+    if mods & MOD_CTRL != 0 { parts.push("ctrl"); }
+    if mods & MOD_SHIFT != 0 { parts.push("shift"); }
+    if mods & MOD_ALT != 0 { parts.push("alt"); }
+    if mods & MOD_WIN != 0 { parts.push("win"); }
+    parts.push(key);
+    parts.join("+")
+}
+
+/// Human label for the settings window; the config file keeps the spec.
+pub fn shortcut_label(spec: &str) -> String {
+    let Some((mods, vk)) = parse_shortcut(spec) else { return "\u{672a}\u{8bbe}\u{7f6e}".to_string(); };
+    let mut parts: Vec<String> = Vec::new();
+    if mods & MOD_CTRL != 0 { parts.push("Ctrl".into()); }
+    if mods & MOD_SHIFT != 0 { parts.push("Shift".into()); }
+    if mods & MOD_ALT != 0 { parts.push("Alt".into()); }
+    if mods & MOD_WIN != 0 { parts.push("Win".into()); }
+    let name = shortcut_name(vk).unwrap_or("?");
+    let pretty = match name {
+        "lalt" => "\u{5de6} Alt".to_string(),
+        "ralt" => "\u{53f3} Alt".to_string(),
+        "lctrl" => "\u{5de6} Ctrl".to_string(),
+        "rctrl" => "\u{53f3} Ctrl".to_string(),
+        "lshift" => "\u{5de6} Shift".to_string(),
+        "rshift" => "\u{53f3} Shift".to_string(),
+        "space" => "\u{7a7a}\u{683c}".to_string(),
+        "pageup" => "Page Up".to_string(),
+        "pagedown" => "Page Down".to_string(),
+        "capslock" => "Caps Lock".to_string(),
+        "numlock" => "Num Lock".to_string(),
+        "scrolllock" => "Scroll Lock".to_string(),
+        "printscreen" => "Print Screen".to_string(),
+        "backspace" => "Backspace".to_string(),
+        other if other.len() == 1 => other.to_ascii_uppercase(),
+        other if other.starts_with('f') && other[1..].bytes().all(|b| b.is_ascii_digit())
+            => other.to_ascii_uppercase(),
+        other => {
+            let mut chars = other.chars();
+            chars.next().map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())
+                .unwrap_or_default()
+        }
+    };
+    parts.push(pretty);
+    parts.join(" + ")
+}
 
 /// Self-describing label: the picker sits next to the checkbox, so the
 /// value itself has to say what it counts.
@@ -680,7 +845,10 @@ impl ConfigFile {
             openai_key: super::secret::open(&get("openai_key", "")),
             timeout_seconds: get("timeout_seconds", "8"),
             debounce_ms: get("debounce_ms", "300"),
-            alt_output: flag("alt_output", true),
+            // Older configs only had a boolean; keep a disabled setting disabled.
+            alt_output_shortcut: normalize_shortcut(&get("alt_output_shortcut",
+                if map.get("alt_output").is_some_and(|v| !truthy(v, true)) { "none" }
+                else { DEFAULT_SHORTCUT })),
             auto_update: flag("auto_update", true),
             auto_install: flag("auto_install", true),
             update_interval_minutes: get("update_interval_minutes",
@@ -716,7 +884,9 @@ debounce_ms=300\n\
 auto_update=on\n\
 auto_install=on\n\
 update_interval_minutes=30\n\
-alt_output=on\n\
+# alt_output_shortcut is pressed once (no chord) to paste the translation\n\
+# instead of the Chinese candidate. Write none to disable it.\n\
+alt_output_shortcut=lalt\n\
 theme=system\n";
         let _ = fs::OpenOptions::new().write(true).create_new(true).open(&path)
             .and_then(|mut file| file.write_all(sample.as_bytes()));
@@ -734,7 +904,7 @@ pub struct SettingsValues {
     pub openai_key: String,
     pub timeout_seconds: String,
     pub debounce_ms: String,
-    pub alt_output: bool,
+    pub alt_output_shortcut: String,
     pub auto_update: bool,
     pub auto_install: bool,
     pub update_interval_minutes: String,
@@ -753,7 +923,7 @@ impl SettingsValues {
             openai_key: file.openai_key,
             timeout_seconds: file.timeout_seconds,
             debounce_ms: file.debounce_ms,
-            alt_output: file.alt_output,
+            alt_output_shortcut: file.alt_output_shortcut,
             auto_update: file.auto_update,
             auto_install: file.auto_install,
             update_interval_minutes: file.update_interval_minutes,
@@ -831,7 +1001,7 @@ impl SettingsValues {
             ("openai_key", sealed_openai),
             ("timeout_seconds", values.timeout_seconds.clone()),
             ("debounce_ms", values.debounce_ms.clone()),
-            ("alt_output", if values.alt_output { "true".to_string() } else { "false".to_string() }),
+            ("alt_output_shortcut", values.alt_output_shortcut.clone()),
             ("auto_update", if values.auto_update { "on".to_string() } else { "off".to_string() }),
             ("auto_install", if values.auto_install { "on".to_string() } else { "off".to_string() }),
             ("update_interval_minutes", values.update_interval_minutes.clone()),
@@ -904,7 +1074,6 @@ pub struct SettingsWindow {
     theme: Box<UiTheme>,
     brand_mark: HWND,
     heading: HWND,
-    subtitle: HWND,
     service_title: HWND,
     service_divider: HWND,
     provider: HWND,
@@ -923,7 +1092,13 @@ pub struct SettingsWindow {
     debounce: HWND,
     debounce_unit: HWND,
     autostart: HWND,
-    alt_output: HWND,
+    shortcut_label: HWND,
+    shortcut_key: HWND,
+    mod_shift: HWND,
+    mod_ctrl: HWND,
+    mod_alt: HWND,
+    mod_win: HWND,
+    shortcut_hint: HWND,
     auto_update: HWND,
     auto_install: HWND,
     update_interval: HWND,
@@ -932,12 +1107,9 @@ pub struct SettingsWindow {
     startup_title: HWND,
     update_title: HWND,
     interval_caption: HWND,
-    footer_divider: HWND,
     theme_label: HWND,
     theme_picker: HWND,
-    tabs: [HWND; 4],
-    status: HWND,
-    close_button: HWND,
+    tabs: [HWND; 5],
     about_text: HWND,
 }
 
@@ -984,7 +1156,7 @@ impl SettingsWindow {
         };
         let values = SettingsValues::from_file(&base);
 
-        // Header: mark, product name, one quiet subtitle line.
+        // Header: mark and product name only; version lives on 关于.
         let mark = create("STATIC", "", 0, SS_ICON);
         let brand_icon = super::load_brand_icon(false);
         if !mark.is_null() && !brand_icon.is_null() {
@@ -992,8 +1164,7 @@ impl SettingsWindow {
         }
         let heading = create("STATIC", "TransPop", 0, 0);
         set_font(heading, title_font);
-        let subtitle = create("STATIC", &format!("偏好设置 · v{}", super::VERSION), 0, 0);
-        set_font(subtitle, note_font);
+
         let service_divider = create("STATIC", "", 0, 0);
 
         // Tab strip: four owner-drawn buttons, one page each. Owner drawing
@@ -1004,6 +1175,8 @@ impl SettingsWindow {
         let tab_appearance = create("BUTTON", "外观", ID_TAB_APPEARANCE,
             BS_OWNERDRAW | WS_TABSTOP);
         let tab_system = create("BUTTON", "系统", ID_TAB_SYSTEM,
+            BS_OWNERDRAW | WS_TABSTOP);
+        let tab_shortcut = create("BUTTON", "快捷键", ID_TAB_SHORTCUT,
             BS_OWNERDRAW | WS_TABSTOP);
         let tab_about = create("BUTTON", "关于", ID_TAB_ABOUT,
             BS_OWNERDRAW | WS_TABSTOP);
@@ -1071,9 +1244,7 @@ impl SettingsWindow {
             }
         };
         set_button_checked(autostart, previously_enabled);
-        let alt_output = create("BUTTON", "Alt 输入英文", ID_ALT_OUTPUT,
-            BS_OWNERDRAW | WS_TABSTOP);
-        set_button_checked(alt_output, values.alt_output);
+
         // Two separate switches: checking for a release and installing it.
         let auto_update = create("BUTTON", "检查更新", ID_AUTO_UPDATE,
             BS_OWNERDRAW | WS_TABSTOP);
@@ -1102,7 +1273,6 @@ impl SettingsWindow {
         let update_title = create("STATIC", "更新", 0, 0);
         set_font(update_title, section_font);
         let interval_caption = create("STATIC", "检查间隔", 0, 0);
-        let footer_divider = create("STATIC", "", 0, 0);
         // In-app theme switch: system, light, dark.
         let theme_label = create("STATIC", "主题", 0, 0);
         set_font(theme_label, section_font);
@@ -1115,12 +1285,37 @@ impl SettingsWindow {
         SendMessageW(theme_picker, CB_SETCURSEL, theme_pos, 0);
         let picker_edit = GetWindow(theme_picker, GW_CHILD);
         if !picker_edit.is_null() { SendMessageW(picker_edit, EM_SETREADONLY, 1, 0); }
-        // No Save button: every change applies at once, so the footer only
-        // needs a status line for rejected values and a way to close.
-        let status = create("STATIC", "", 0, 0);
-        set_font(status, note_font);
-        let close_button = create("BUTTON", "关闭", ID_CANCEL,
-            WS_TABSTOP | 0x00000001); // BS_DEFPUSHBUTTON
+        // No Save button and no footer: every change applies at once and the
+        // caption bar already closes the window.
+        let shortcut_caption = create("STATIC", "输入英文", 0, 0);
+        set_font(shortcut_caption, section_font);
+        // One key list plus modifier switches covers any single key or chord
+        // without needing a modal capture loop inside the window procedure.
+        let shortcut_key = create("COMBOBOX", "", ID_SHORTCUT_KEY,
+            CBS_DROPDOWN | WS_TABSTOP);
+        let key_items = shortcut_key_items();
+        for item in &key_items {
+            let text = wide(item);
+            SendMessageW(shortcut_key, CB_ADDSTRING, 0, text.as_ptr() as isize);
+        }
+        let (saved_mods, saved_vk) = parse_shortcut(&values.alt_output_shortcut)
+            .unwrap_or((0, 0));
+        let key_index = SHORTCUT_CHOICES.iter().position(|(_, vk)| *vk == saved_vk)
+            .map(|index| index as isize + 1).unwrap_or(0);
+        SendMessageW(shortcut_key, CB_SETCURSEL, key_index as usize, 0);
+        let key_edit = GetWindow(shortcut_key, GW_CHILD);
+        if !key_edit.is_null() { SendMessageW(key_edit, EM_SETREADONLY, 1, 0); }
+        let mod_shift = create("BUTTON", "Shift", ID_MOD_SHIFT, BS_OWNERDRAW | WS_TABSTOP);
+        let mod_ctrl = create("BUTTON", "Ctrl", ID_MOD_CTRL, BS_OWNERDRAW | WS_TABSTOP);
+        let mod_alt = create("BUTTON", "Alt", ID_MOD_ALT, BS_OWNERDRAW | WS_TABSTOP);
+        let mod_win = create("BUTTON", "Win", ID_MOD_WIN, BS_OWNERDRAW | WS_TABSTOP);
+        set_button_checked(mod_shift, saved_mods & MOD_SHIFT != 0);
+        set_button_checked(mod_ctrl, saved_mods & MOD_CTRL != 0);
+        set_button_checked(mod_alt, saved_mods & MOD_ALT != 0);
+        set_button_checked(mod_win, saved_mods & MOD_WIN != 0);
+        let shortcut_hint = create("STATIC",
+            "不按下方的修饰键时，单按这个键即可；选「未设置」则功能关闭。", 0, 0);
+        set_font(shortcut_hint, note_font);
         let about_text = create("STATIC", &format!(
             "TransPop v{}\r\n\r\n在微软拼音候选窗下方实时显示英文翻译。\r\n\r\n仓库：github.com/gurio-wine/TransPop\r\n许可：MIT",
             super::VERSION), 0, 0);
@@ -1135,29 +1330,30 @@ impl SettingsWindow {
             }
         }
         // Which statics are secondary text and which are hairlines.
-        (*theme_ptr).notes.push(subtitle as isize);
-        for control in [service_divider, connection_divider, behavior_divider, footer_divider] {
+        for control in [service_divider, connection_divider, behavior_divider] {
             (*theme_ptr).lines.push(control as isize);
         }
         // Drop-downs whose closed field the theme has to paint itself.
         (*theme_ptr).combos.push(provider as isize);
         (*theme_ptr).combos.push(theme_picker as isize);
         (*theme_ptr).combos.push(update_interval as isize);
-        for tab in [tab_translate, tab_appearance, tab_system, tab_about] {
+        for tab in [tab_translate, tab_appearance, tab_system, tab_shortcut, tab_about] {
             (*theme_ptr).tabs.push(tab as isize);
         }
         apply_window_theme(hwnd, &mut *theme_ptr);
 
         let this = Self { hwnd, base, dpi, font, title_font, section_font, note_font, theme,
-            brand_mark: mark, heading, subtitle, service_title, service_divider, provider,
+            brand_mark: mark, heading, service_title, service_divider, provider,
             connection_title, connection_divider, azure, openai, azure_reveal, openai_reveal,
             behavior_title, behavior_divider, timeout_label, timeout, timeout_unit,
-            debounce_label, debounce, debounce_unit, autostart, alt_output,
+            debounce_label, debounce, debounce_unit, autostart,
+            shortcut_label: shortcut_caption, shortcut_key, mod_shift, mod_ctrl,
+            mod_alt, mod_win, shortcut_hint,
             auto_update, auto_install, update_interval, update_intervals: intervals,
             update_button, startup_title, update_title, interval_caption,
-            footer_divider, theme_label, theme_picker,
-            tabs: [tab_translate, tab_appearance, tab_system, tab_about],
-            status, close_button, about_text };
+            theme_label, theme_picker,
+            tabs: [tab_translate, tab_appearance, tab_system, tab_shortcut, tab_about],
+            about_text };
         this.apply_layout(true);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
@@ -1191,7 +1387,7 @@ impl SettingsWindow {
 
         place(self.brand_mark, MARGIN_X, 18, 34, 34);
         place(self.heading, 74, 12, 440, 32);
-        place(self.subtitle, 75, 44, 470, 20);
+
         place(self.service_divider, MARGIN_X, 80, CONTENT_W, 1);
 
         // Tab strip: a fixed row under the header.
@@ -1207,7 +1403,8 @@ impl SettingsWindow {
         let translating = (*self.theme).page == 0;
         let appearance = (*self.theme).page == 1;
         let system = (*self.theme).page == 2;
-        let about = (*self.theme).page == 3;
+        let shortcuts = (*self.theme).page == 3;
+        let about = (*self.theme).page == 4;
 
         // Translation page. The credential block only exists for providers that
         // need one, so 翻译行为 slides up instead of leaving a hole.
@@ -1245,14 +1442,22 @@ impl SettingsWindow {
         // and updates never read as one pile of switches.
         place(self.startup_title, MARGIN_X, top, 460, 22);
         place(self.autostart, MARGIN_X, top + 28, CONTENT_W, 24);
-        place(self.alt_output, MARGIN_X, top + 58, CONTENT_W, 24);
-        place(self.connection_divider, MARGIN_X, top + 100, CONTENT_W, 1);
-        place(self.update_title, MARGIN_X, top + 118, 460, 22);
-        place(self.auto_update, MARGIN_X, top + 146, CONTENT_W, 24);
-        place(self.interval_caption, MARGIN_X, top + 179, LABEL_W, 22);
-        place(self.update_interval, FIELD_X, top + 175, 160, 30);
-        place(self.auto_install, MARGIN_X, top + 215, CONTENT_W, 24);
-        place(self.update_button, MARGIN_X, top + 249, 112, 30);
+        place(self.connection_divider, MARGIN_X, top + 70, CONTENT_W, 1);
+        place(self.update_title, MARGIN_X, top + 88, 460, 22);
+        place(self.auto_update, MARGIN_X, top + 116, CONTENT_W, 24);
+        place(self.interval_caption, MARGIN_X, top + 149, LABEL_W, 22);
+        place(self.update_interval, FIELD_X, top + 145, 160, 30);
+        place(self.auto_install, MARGIN_X, top + 185, CONTENT_W, 24);
+        place(self.update_button, MARGIN_X, top + 219, 112, 30);
+
+        // 快捷键 page: one key, then the modifiers it is combined with.
+        place(self.shortcut_label, MARGIN_X, top, 460, 22);
+        place(self.shortcut_key, MARGIN_X, top + 28, 220, 30);
+        place(self.mod_shift, MARGIN_X, top + 74, 120, 24);
+        place(self.mod_ctrl, MARGIN_X + 132, top + 74, 120, 24);
+        place(self.mod_alt, MARGIN_X, top + 104, 120, 24);
+        place(self.mod_win, MARGIN_X + 132, top + 104, 120, 24);
+        place(self.shortcut_hint, MARGIN_X, top + 144, CONTENT_W, 44);
 
         // About page.
         place(self.about_text, MARGIN_X, top, CONTENT_W, 200);
@@ -1276,18 +1481,18 @@ impl SettingsWindow {
         }
         show(self.theme_label, appearance);
         show(self.theme_picker, appearance);
-        for control in [self.autostart, self.alt_output, self.auto_update, self.auto_install,
+        for control in [self.autostart, self.auto_update, self.auto_install,
                         self.update_interval, self.update_button, self.startup_title,
                         self.update_title, self.interval_caption] {
             show(control, system);
         }
+        for control in [self.shortcut_label, self.shortcut_key, self.mod_shift,
+                        self.mod_ctrl, self.mod_alt, self.mod_win, self.shortcut_hint] {
+            show(control, shortcuts);
+        }
         show(self.connection_divider, system);
         show(self.about_text, about);
 
-        // Footer: status on the left, close on the right.
-        place(self.footer_divider, MARGIN_X, CLIENT_H - 62, CONTENT_W, 1);
-        place(self.status, MARGIN_X, CLIENT_H - 48, 380, 22);
-        place(self.close_button, 434, CLIENT_H - 54, 112, 32);
         CLIENT_H
     }
 
@@ -1342,7 +1547,7 @@ impl SettingsWindow {
     /// Switches the visible page. The frame keeps its size, so the dialog
     /// never jumps when the user browses tabs.
     pub unsafe fn show_page(&self, page: usize) {
-        let page = page.min(3);
+        let page = page.min(4);
         let theme = self.theme.as_ref() as *const UiTheme as *mut UiTheme;
         unsafe { (*theme).page = page; }
         self.layout();
@@ -1369,7 +1574,14 @@ impl SettingsWindow {
         set(self.timeout, &values.timeout_seconds);
         set(self.debounce, &values.debounce_ms);
         set_button_checked(self.autostart, self.autostart_checked());
-        set_button_checked(self.alt_output, values.alt_output);
+        let (mods, vk) = parse_shortcut(&values.alt_output_shortcut).unwrap_or((0, 0));
+        let index = SHORTCUT_CHOICES.iter().position(|(_, code)| *code == vk)
+            .map(|index| index as usize + 1).unwrap_or(0);
+        SendMessageW(self.shortcut_key, CB_SETCURSEL, index, 0);
+        set_button_checked(self.mod_shift, mods & MOD_SHIFT != 0);
+        set_button_checked(self.mod_ctrl, mods & MOD_CTRL != 0);
+        set_button_checked(self.mod_alt, mods & MOD_ALT != 0);
+        set_button_checked(self.mod_win, mods & MOD_WIN != 0);
         set_button_checked(self.auto_update, values.auto_update);
         set_button_checked(self.auto_install, values.auto_install);
         let current: u32 = values.update_interval_minutes.parse()
@@ -1379,12 +1591,10 @@ impl SettingsWindow {
         }
     }
 
-    /// Footer feedback for a value that could not be applied.
-    pub unsafe fn set_status(&self, text: &str) {
-        if self.status.is_null() { return; }
-        let message = wide(text);
-        SetWindowTextW(self.status, message.as_ptr());
-    }
+    /// There is no footer any more; a rejected value could not be applied, so
+    /// the dialog shows the reason inline where the shortcut is captured and
+    /// the caller only logs the event.
+    pub unsafe fn set_status(&self, _text: &str) {}
 
     unsafe fn get_text(hwnd: HWND) -> String {
         if hwnd.is_null() { return String::new(); }
@@ -1409,7 +1619,20 @@ impl SettingsWindow {
             openai_key: Self::get_text(self.openai[2].1),
             timeout_seconds: Self::get_text(self.timeout),
             debounce_ms: Self::get_text(self.debounce),
-            alt_output: button_checked(self.alt_output),
+            alt_output_shortcut: {
+                let index = SendMessageW(self.shortcut_key, CB_GETCURSEL, 0, 0);
+                if index <= 0 {
+                    "none".to_string()
+                } else {
+                    let vk = SHORTCUT_CHOICES[(index - 1) as usize].1;
+                    let mut mods = 0u8;
+                    if button_checked(self.mod_ctrl) { mods |= MOD_CTRL; }
+                    if button_checked(self.mod_shift) { mods |= MOD_SHIFT; }
+                    if button_checked(self.mod_alt) { mods |= MOD_ALT; }
+                    if button_checked(self.mod_win) { mods |= MOD_WIN; }
+                    shortcut_spec(mods, vk)
+                }
+            },
             auto_update: button_checked(self.auto_update),
             auto_install: button_checked(self.auto_install),
             update_interval_minutes: {
@@ -1524,12 +1747,12 @@ mod tests {
     fn shared_parser_feeds_settings_and_runtime_defaults() {
         let base = temp_base("shared");
         fs::write(base.join("translator.conf"),
-            "provider=OpenAI\nauto_update=off\nalt_output=yes\n             openai_url=http://127.0.0.1:8080/v1/chat/completions\n")
+            "provider=OpenAI\nauto_update=off\nalt_output_shortcut=ctrl+space\n             openai_url=http://127.0.0.1:8080/v1/chat/completions\n")
             .unwrap();
         let file = ConfigFile::read(&base);
         assert_eq!(file.provider, "openai");
         assert!(!file.auto_update);
-        assert!(file.alt_output);
+        assert_eq!(file.alt_output_shortcut, "ctrl+space");
         assert_eq!(file.openai_url, "http://127.0.0.1:8080/v1/chat/completions");
         assert_eq!(file.azure_url, DEFAULT_AZURE_URL);
         assert_eq!(file.openai_model, DEFAULT_OPENAI_MODEL);
@@ -1605,12 +1828,20 @@ mod tests {
     }
 
     #[test]
-    fn theme_defaults_to_system_and_alt_output_is_on_by_default() {
+    fn theme_defaults_to_system_and_the_shortcut_defaults_to_left_alt() {
         let base = temp_base("defaults");
         fs::create_dir_all(&base).unwrap();
         let file = ConfigFile::read(&base);
         assert_eq!(file.theme, "system");
-        assert!(file.alt_output, "Alt text output should default to on");
+        assert_eq!(file.alt_output_shortcut, DEFAULT_SHORTCUT);
+        assert_eq!(normalize_shortcut(" nope "), "none");
+        assert_eq!(normalize_shortcut("Ctrl + Space"), "ctrl+space");
+        assert_eq!(normalize_shortcut("shift+alt+f5"), "shift+alt+f5");
+        assert_eq!(shortcut_label("lalt"), "\u{5de6} Alt");
+        assert_eq!(shortcut_label("ctrl+shift+a"), "Ctrl + Shift + A");
+        assert_eq!(shortcut_label("none"), "\u{672a}\u{8bbe}\u{7f6e}");
+        assert_eq!(parse_shortcut(""), None);
+        assert_eq!(parse_shortcut("f24"), Some((0, 0x87)));
         assert_eq!(normalize_theme(" Dark "), "dark");
         assert_eq!(normalize_theme("LIGHT"), "light");
         assert_eq!(normalize_theme("auto"), "system");

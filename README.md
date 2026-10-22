@@ -20,7 +20,7 @@ cargo build --release
 ## 使用
 
 - 托盘图标：左键暂停 / 恢复，右键菜单可打开设置、检查更新、暂停或退出
-- 设置窗口分四个标签：翻译 / 外观 / 系统 / 关于，改动即改即存，没有保存按钮，关掉窗口也不会丢
+- 设置窗口分五个标签：翻译 / 外观 / 系统 / 快捷键 / 关于，改动即改即存，没有保存按钮，关掉窗口也不会丢
 - 快捷键：`Ctrl+Alt+Q` 退出
 - 命令行：`--settings`、`--pause`、`--resume`、`--quit`
 
@@ -33,7 +33,7 @@ cargo build --release
 | `provider` | `off` / `bing`（无需密钥）/ `azure` / `openai`（兼容 Chat Completions 接口） |
 | `timeout_seconds` | 请求超时，2–30 秒 |
 | `debounce_ms` | 翻译防抖，100–1000 毫秒 |
-| `alt_output` | `true` 时启用轻按左 Alt 直接输入英文 |
+| `alt_output_shortcut` | 轻按即输入英文的快捷键，默认 `lalt`；可写 `ctrl+shift+k` 这类组合键，写 `none` 关闭 |
 | `auto_update` | `on`（默认）时在后台定时检查 GitHub 新版本，`off` 关闭（手动「立即检查」仍可用） |
 | `auto_install` | `on`（默认）时发现新版本直接后台下载安装，`off` 时只弹窗询问 |
 | `update_interval_minutes` | 后台检查间隔，单位分钟，最小 15，默认 30 |
