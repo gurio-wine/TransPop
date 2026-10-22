@@ -2,7 +2,7 @@
 //! The window procedure only forwards form commands to the application's
 //! existing message loop. No UIA or networking occurs in a Win32 callback.
 
-use std::{collections::HashMap, fs, io::Write, mem, path::{Path, PathBuf}, ptr};
+use std::{cell::RefCell, collections::HashMap, fs, io::Write, mem, path::{Path, PathBuf}, ptr};
 use windows_sys::Win32::{
     Foundation::{HWND, POINT, RECT},
     Graphics::{
@@ -23,7 +23,11 @@ use windows_sys::Win32::{
     UI::{
         Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
         Controls::{SetWindowTheme, DRAWITEMSTRUCT, ODS_FOCUS},
-        Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE},
+        Shell::{DefSubclassProc, SetWindowSubclass},
+        Input::KeyboardAndMouse::{
+            GetKeyState, MapVirtualKeyW, SetFocus, MAPVK_VSC_TO_VK_EX, VK_CONTROL, VK_ESCAPE,
+            VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_TAB,
+        },
         WindowsAndMessaging::{
             AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumChildWindows,
             GetClassNameW, GetClientRect, GetCursorPos, GetDlgItem, GetSystemMetrics, GetParent,
@@ -32,7 +36,8 @@ use windows_sys::Win32::{
             SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW,
             BN_CLICKED, DM_GETDEFID, GWLP_USERDATA, SPI_GETHIGHCONTRAST, SW_HIDE, SW_SHOW,
             SW_SHOWNA,
-            SWP_NOACTIVATE, SWP_NOZORDER, WM_CLOSE, WM_COMMAND, WM_DRAWITEM, WM_GETFONT, WNDCLASSW,
+            SWP_NOACTIVATE, SWP_NOZORDER, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DRAWITEM,
+            WM_GETFONT, WM_KEYUP, WM_KILLFOCUS, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
             WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPED,
             WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
         },
@@ -42,6 +47,7 @@ use windows_sys::Win32::{
 const CLASS: &str = "TransPopNativeSettings061";
 const WM_SETFONT: u32 = 0x0030;
 const ES_AUTOHSCROLL: u32 = 0x0080;
+const ES_READONLY: u32 = 0x0800;
 const BS_OWNERDRAW: u32 = 0x000B;
 const ES_PASSWORD: u32 = 0x0020;
 const CBS_DROPDOWN: u32 = 0x0002;
@@ -60,10 +66,6 @@ const ID_OPENAI_SECRET: u16 = 4106;
 const ID_UPDATE: u16 = 4107;
 const ID_AUTOSTART: u16 = 4108;
 const ID_SHORTCUT_KEY: u16 = 4109;
-const ID_MOD_SHIFT: u16 = 4114;
-const ID_MOD_CTRL: u16 = 4115;
-const ID_MOD_ALT: u16 = 4116;
-const ID_MOD_WIN: u16 = 4117;
 const ID_AUTO_UPDATE: u16 = 4110;
 const ID_THEME: u16 = 4111;
 const ID_UPDATE_INTERVAL: u16 = 4112;
@@ -83,6 +85,10 @@ const WM_CTLCOLOREDIT: u32 = 0x0133;
 const WM_CTLCOLORLISTBOX: u32 = 0x0134;
 const WM_ERASEBKGND: u32 = 0x0014;
 const WM_KEYDOWN: u32 = 0x0100;
+const WM_GETDLGCODE: u32 = 0x0087;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const DLGC_WANTALLKEYS: isize = 0x0004;
+const SUBCLASS_ID: usize = 1;
 const IDCANCEL: u16 = 2;
 const EM_SETMARGINS: u32 = 0x00D3;
 const EC_LEFT_RIGHT_MARGINS: usize = 0x0003;
@@ -515,8 +521,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
             // Owner-drawn checks do not flip themselves; mirror the click into
             // the button state, then repaint.
             if notify as u32 == BN_CLICKED
-                && matches!(id, ID_AUTOSTART | ID_AUTO_UPDATE | ID_MOD_SHIFT | ID_MOD_CTRL
-                    | ID_MOD_ALT | ID_MOD_WIN | ID_AUTO_INSTALL
+                && matches!(id, ID_AUTOSTART | ID_AUTO_UPDATE | ID_AUTO_INSTALL
                     | ID_AZURE_REVEAL | ID_OPENAI_REVEAL) {
                 let was_checked = button_checked(control);
                 set_button_checked(control, !was_checked);
@@ -645,27 +650,125 @@ const FKEYS: [&str; 24] = ["f1","f2","f3","f4","f5","f6","f7","f8","f9","f10",
     "f11","f12","f13","f14","f15","f16","f17","f18","f19","f20",
     "f21","f22","f23","f24"];
 
-/// Keys offered in the settings page. The config file accepts every name in
-/// SHORTCUT_KEYS, so a hand-edited chord keeps working even when it is not
-/// listed here.
-pub const SHORTCUT_CHOICES: [(&str, u32); 31] = [
-    ("\u{5de6} Alt", 0xA4), ("\u{53f3} Alt", 0xA5),
-    ("\u{5de6} Ctrl", 0xA2), ("\u{53f3} Ctrl", 0xA3),
-    ("\u{5de6} Shift", 0xA0), ("\u{53f3} Shift", 0xA1),
-    ("Space", 0x20), ("Enter", 0x0D), ("Tab", 0x09), ("Backspace", 0x08),
-    ("Esc", 0x1B), ("Insert", 0x2D), ("Delete", 0x2E), ("Home", 0x24),
-    ("End", 0x23), ("Page Up", 0x21), ("Page Down", 0x22),
-    ("Left", 0x25), ("Up", 0x26), ("Right", 0x27), ("Down", 0x28),
-    ("F1", 0x70), ("F2", 0x71), ("F3", 0x72), ("F4", 0x73),
-    ("F5", 0x74), ("F6", 0x75), ("F7", 0x76), ("F8", 0x77),
-    ("F9", 0x78), ("F10", 0x79),
-];
+/// Modifiers a chord may carry. The shortcut field reads the real keyboard, so
+/// this is the whole key surface: whatever the user presses is what gets saved.
+fn modifier_mask(vk: u16) -> Option<u8> {
+    match vk {
+        0x10 | 0xA0 | 0xA1 => Some(MOD_SHIFT),
+        0x11 | 0xA2 | 0xA3 => Some(MOD_CTRL),
+        0x12 | 0xA4 | 0xA5 => Some(MOD_ALT),
+        0x5B | 0x5C => Some(MOD_WIN),
+        _ => None,
+    }
+}
 
-/// First entry is the off switch, so an empty choice is always expressible.
-fn shortcut_key_items() -> Vec<String> {
-    let mut items = vec!["\u{672a}\u{8bbe}\u{7f6e}".to_string()];
-    items.extend(SHORTCUT_CHOICES.iter().map(|(name, _)| (*name).to_string()));
-    items
+/// Side-specific virtual key for a modifier that was just pressed, falling back
+/// to the generic key when the scan code cannot be resolved.
+unsafe fn side_of(vk: u16, scan: u32) -> u16 {
+    if modifier_mask(vk).is_none() { return vk; }
+    let resolved = MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX);
+    if resolved == 0 { vk } else { resolved as u16 }
+}
+
+/// What the shortcut field is doing right now. The field is a plain read-only
+/// edit; pressing a key inside it is the only way to change the shortcut, and
+/// the captured spec is kept here instead of being parsed back out of the text.
+#[derive(Default)]
+struct Capture {
+    /// A click armed the field; leaving it without a completed key means off.
+    armed: bool,
+    /// Modifier held down while the field has focus, waiting for a main key.
+    pending: Option<(u8, u32)>,
+    /// Latest captured spec; None means nothing was ever captured.
+    spec: Option<String>,
+}
+
+thread_local! {
+    static CAPTURE: RefCell<Capture> = RefCell::new(Capture::default());
+}
+
+/// Live keyboard capture for the shortcut field. Whatever the user presses is
+/// stored as-is; pressing only a modifier and then leaving stores `none`, which
+/// is how "not set" is expressed without any extra control.
+unsafe extern "system" fn shortcut_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize,
+    _id: usize, _data: usize) -> isize {
+    match msg {
+        WM_GETDLGCODE => return DLGC_WANTALLKEYS,
+        WM_LBUTTONDOWN => {
+            // A click arms the field; the key that follows is the shortcut.
+            SetFocus(hwnd);
+            CAPTURE.with(|c| { let mut c = c.borrow_mut(); c.armed = true; c.pending = None; });
+            return 0;
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            let vk = wp as u16;
+            // Escape keeps meaning "close", so the dialog is never trapped.
+            if vk == VK_ESCAPE {
+                let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
+                if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_CANCEL, 0, 0); }
+                return 0;
+            }
+            // Only a real press counts: the window messages that simulate a
+            // keystroke have no previous-key state, and those must not edit.
+            if GetKeyState(vk as i32) >= 0 { return 0; }
+            // Tab still moves focus unless the field was clicked first, so
+            // keyboard users are never trapped in it.
+            if vk == VK_TAB && !CAPTURE.with(|c| c.borrow().armed) {
+                return DefSubclassProc(hwnd, msg, wp, lp);
+            }
+            let scan = ((lp >> 16) & 0xff) as u32;
+            let key = side_of(vk, scan) as u32;
+            let mods = current_modifiers(vk);
+            if modifier_mask(vk).is_some() {
+                // A modifier alone is only half a chord; hold it for the key.
+                CAPTURE.with(|c| c.borrow_mut().pending = Some((mods, key)));
+                let label = shortcut_label(&shortcut_spec(mods, key));
+                set_text(hwnd, &label);
+                return 0;
+            }
+            CAPTURE.with(|c| { let mut c = c.borrow_mut(); c.pending = None; c.armed = false; });
+            let spec = shortcut_spec(mods, key);
+            CAPTURE.with(|c| c.borrow_mut().spec = Some(spec.clone()));
+            set_text(hwnd, &shortcut_label(&spec));
+            let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
+            if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0); }
+            return 0;
+        }
+        // Swallow the characters and releases a chord would otherwise type or
+        // forward; the field never takes text input.
+        WM_CHAR | WM_SYSCHAR | WM_KEYUP | WM_SYSKEYUP => return 0,
+        WM_KILLFOCUS => {
+            // Clicked in, pressed nothing (or only a modifier), then left: the
+            // user did not choose a key, which is how "off" is expressed.
+            let armed = CAPTURE.with(|c| { let mut c = c.borrow_mut(); c.pending = None; c.armed });
+            if armed {
+                CAPTURE.with(|c| { let mut c = c.borrow_mut(); c.armed = false; c.spec = Some("none".to_string()); });
+                set_text(hwnd, &shortcut_label("none"));
+                let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
+                if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0); }
+            }
+        }
+        _ => {}
+    }
+    DefSubclassProc(hwnd, msg, wp, lp)
+}
+
+/// Modifier bits held down right now, ignoring the key being pressed: pressing
+/// Alt alone must not turn into `alt+alt`.
+unsafe fn current_modifiers(vk: u16) -> u8 {
+    let down = |code: u16| code != vk && GetKeyState(code as i32) < 0;
+    let mut mods = 0u8;
+    if down(VK_SHIFT) || down(0xA0) || down(0xA1) { mods |= MOD_SHIFT; }
+    if down(VK_CONTROL) || down(0xA2) || down(0xA3) { mods |= MOD_CTRL; }
+    if down(VK_MENU) || down(0xA4) || down(0xA5) { mods |= MOD_ALT; }
+    if down(VK_LWIN) || down(VK_RWIN) { mods |= MOD_WIN; }
+    mods
+}
+
+unsafe fn set_text(control: HWND, text: &str) {
+    if control.is_null() { return; }
+    let text = wide(text);
+    SetWindowTextW(control, text.as_ptr());
 }
 
 /// Canonical spelling of a shortcut. Anything unreadable becomes `none`, which
@@ -1094,11 +1197,6 @@ pub struct SettingsWindow {
     autostart: HWND,
     shortcut_label: HWND,
     shortcut_key: HWND,
-    mod_shift: HWND,
-    mod_ctrl: HWND,
-    mod_alt: HWND,
-    mod_win: HWND,
-    shortcut_hint: HWND,
     auto_update: HWND,
     auto_install: HWND,
     update_interval: HWND,
@@ -1289,33 +1387,19 @@ impl SettingsWindow {
         // caption bar already closes the window.
         let shortcut_caption = create("STATIC", "输入英文", 0, 0);
         set_font(shortcut_caption, section_font);
-        // One key list plus modifier switches covers any single key or chord
-        // without needing a modal capture loop inside the window procedure.
-        let shortcut_key = create("COMBOBOX", "", ID_SHORTCUT_KEY,
-            CBS_DROPDOWN | WS_TABSTOP);
-        let key_items = shortcut_key_items();
-        for item in &key_items {
-            let text = wide(item);
-            SendMessageW(shortcut_key, CB_ADDSTRING, 0, text.as_ptr() as isize);
-        }
-        let (saved_mods, saved_vk) = parse_shortcut(&values.alt_output_shortcut)
-            .unwrap_or((0, 0));
-        let key_index = SHORTCUT_CHOICES.iter().position(|(_, vk)| *vk == saved_vk)
-            .map(|index| index as isize + 1).unwrap_or(0);
-        SendMessageW(shortcut_key, CB_SETCURSEL, key_index as usize, 0);
-        let key_edit = GetWindow(shortcut_key, GW_CHILD);
-        if !key_edit.is_null() { SendMessageW(key_edit, EM_SETREADONLY, 1, 0); }
-        let mod_shift = create("BUTTON", "Shift", ID_MOD_SHIFT, BS_OWNERDRAW | WS_TABSTOP);
-        let mod_ctrl = create("BUTTON", "Ctrl", ID_MOD_CTRL, BS_OWNERDRAW | WS_TABSTOP);
-        let mod_alt = create("BUTTON", "Alt", ID_MOD_ALT, BS_OWNERDRAW | WS_TABSTOP);
-        let mod_win = create("BUTTON", "Win", ID_MOD_WIN, BS_OWNERDRAW | WS_TABSTOP);
-        set_button_checked(mod_shift, saved_mods & MOD_SHIFT != 0);
-        set_button_checked(mod_ctrl, saved_mods & MOD_CTRL != 0);
-        set_button_checked(mod_alt, saved_mods & MOD_ALT != 0);
-        set_button_checked(mod_win, saved_mods & MOD_WIN != 0);
-        let shortcut_hint = create("STATIC",
-            "不按下方的修饰键时，单按这个键即可；选「未设置」则功能关闭。", 0, 0);
-        set_font(shortcut_hint, note_font);
+        // The shortcut is captured from the real keyboard: one read-only field
+        // that swallows the next key press. No list, no modifier switches.
+        let shortcut_key = create("EDIT", "", ID_SHORTCUT_KEY,
+            WS_BORDER | ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP);
+        set_text(shortcut_key, &shortcut_label(&values.alt_output_shortcut));
+        SetWindowSubclass(shortcut_key, Some(shortcut_proc), SUBCLASS_ID, 0);
+        // Seed the capture with the stored value, so unrelated switches saved
+        // from this dialog cannot clear a shortcut the user never touched.
+        CAPTURE.with(|c| {
+            let mut c = c.borrow_mut();
+            c.pending = None;
+            c.spec = Some(normalize_shortcut(&values.alt_output_shortcut));
+        });
         let about_text = create("STATIC", &format!(
             "TransPop v{}\r\n\r\n在微软拼音候选窗下方实时显示英文翻译。\r\n\r\n仓库：github.com/gurio-wine/TransPop\r\n许可：MIT",
             super::VERSION), 0, 0);
@@ -1323,7 +1407,7 @@ impl SettingsWindow {
         // A slightly inset caret keeps addresses off the field frame.
         let pad = scale(8);
         for edit in [azure[0].1, azure[1].1, azure[2].1, openai[0].1, openai[1].1, openai[2].1,
-                     timeout, debounce] {
+                     timeout, debounce, shortcut_key] {
             if !edit.is_null() {
                 SendMessageW(edit, EM_SETMARGINS, EC_LEFT_RIGHT_MARGINS,
                     (pad | (pad << 16)) as isize);
@@ -1347,8 +1431,7 @@ impl SettingsWindow {
             connection_title, connection_divider, azure, openai, azure_reveal, openai_reveal,
             behavior_title, behavior_divider, timeout_label, timeout, timeout_unit,
             debounce_label, debounce, debounce_unit, autostart,
-            shortcut_label: shortcut_caption, shortcut_key, mod_shift, mod_ctrl,
-            mod_alt, mod_win, shortcut_hint,
+            shortcut_label: shortcut_caption, shortcut_key,
             auto_update, auto_install, update_interval, update_intervals: intervals,
             update_button, startup_title, update_title, interval_caption,
             theme_label, theme_picker,
@@ -1450,14 +1533,9 @@ impl SettingsWindow {
         place(self.auto_install, MARGIN_X, top + 185, CONTENT_W, 24);
         place(self.update_button, MARGIN_X, top + 219, 112, 30);
 
-        // 快捷键 page: one key, then the modifiers it is combined with.
+        // 快捷键 page: one field that captures whatever key is pressed.
         place(self.shortcut_label, MARGIN_X, top, 460, 22);
         place(self.shortcut_key, MARGIN_X, top + 28, 220, 30);
-        place(self.mod_shift, MARGIN_X, top + 74, 120, 24);
-        place(self.mod_ctrl, MARGIN_X + 132, top + 74, 120, 24);
-        place(self.mod_alt, MARGIN_X, top + 104, 120, 24);
-        place(self.mod_win, MARGIN_X + 132, top + 104, 120, 24);
-        place(self.shortcut_hint, MARGIN_X, top + 144, CONTENT_W, 44);
 
         // About page.
         place(self.about_text, MARGIN_X, top, CONTENT_W, 200);
@@ -1486,8 +1564,7 @@ impl SettingsWindow {
                         self.update_title, self.interval_caption] {
             show(control, system);
         }
-        for control in [self.shortcut_label, self.shortcut_key, self.mod_shift,
-                        self.mod_ctrl, self.mod_alt, self.mod_win, self.shortcut_hint] {
+        for control in [self.shortcut_label, self.shortcut_key] {
             show(control, shortcuts);
         }
         show(self.connection_divider, system);
@@ -1574,14 +1651,12 @@ impl SettingsWindow {
         set(self.timeout, &values.timeout_seconds);
         set(self.debounce, &values.debounce_ms);
         set_button_checked(self.autostart, self.autostart_checked());
-        let (mods, vk) = parse_shortcut(&values.alt_output_shortcut).unwrap_or((0, 0));
-        let index = SHORTCUT_CHOICES.iter().position(|(_, code)| *code == vk)
-            .map(|index| index as usize + 1).unwrap_or(0);
-        SendMessageW(self.shortcut_key, CB_SETCURSEL, index, 0);
-        set_button_checked(self.mod_shift, mods & MOD_SHIFT != 0);
-        set_button_checked(self.mod_ctrl, mods & MOD_CTRL != 0);
-        set_button_checked(self.mod_alt, mods & MOD_ALT != 0);
-        set_button_checked(self.mod_win, mods & MOD_WIN != 0);
+        CAPTURE.with(|c| {
+            let mut c = c.borrow_mut();
+            c.pending = None;
+            c.spec = Some(normalize_shortcut(&values.alt_output_shortcut));
+        });
+        set_text(self.shortcut_key, &shortcut_label(&values.alt_output_shortcut));
         set_button_checked(self.auto_update, values.auto_update);
         set_button_checked(self.auto_install, values.auto_install);
         let current: u32 = values.update_interval_minutes.parse()
@@ -1619,20 +1694,8 @@ impl SettingsWindow {
             openai_key: Self::get_text(self.openai[2].1),
             timeout_seconds: Self::get_text(self.timeout),
             debounce_ms: Self::get_text(self.debounce),
-            alt_output_shortcut: {
-                let index = SendMessageW(self.shortcut_key, CB_GETCURSEL, 0, 0);
-                if index <= 0 {
-                    "none".to_string()
-                } else {
-                    let vk = SHORTCUT_CHOICES[(index - 1) as usize].1;
-                    let mut mods = 0u8;
-                    if button_checked(self.mod_ctrl) { mods |= MOD_CTRL; }
-                    if button_checked(self.mod_shift) { mods |= MOD_SHIFT; }
-                    if button_checked(self.mod_alt) { mods |= MOD_ALT; }
-                    if button_checked(self.mod_win) { mods |= MOD_WIN; }
-                    shortcut_spec(mods, vk)
-                }
-            },
+            alt_output_shortcut: CAPTURE.with(|c| c.borrow().spec.clone())
+                .unwrap_or_else(|| "none".to_string()),
             auto_update: button_checked(self.auto_update),
             auto_install: button_checked(self.auto_install),
             update_interval_minutes: {
@@ -1659,6 +1722,7 @@ impl SettingsWindow {
     pub unsafe fn close(self) {
         // Clear the paint state pointer before children are destroyed.
         SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+        CAPTURE.with(|c| { let mut c = c.borrow_mut(); c.pending = None; c.spec = None; });
         DestroyWindow(self.hwnd);
         for font in [self.font, self.title_font, self.section_font, self.note_font] {
             if !font.is_null() { DeleteObject(font); }
