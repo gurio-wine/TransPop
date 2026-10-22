@@ -10,10 +10,11 @@ use windows_sys::Win32::{
         Gdi::{
             CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawFocusRect, DrawTextW,
             FillRect, FrameRect, GetMonitorInfoW, GetStockObject, GetSysColor, InvalidateRect,
-            MonitorFromPoint, MonitorFromWindow, Polyline, RedrawWindow, SelectObject, SetBkColor,
-            SetBkMode, SetTextColor, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT,
-            DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH, HFONT, MONITORINFO,
-            MONITOR_DEFAULTTONEAREST, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
+            MonitorFromPoint, MonitorFromWindow, Polyline, RedrawWindow, SelectObject,
+            SetBkColor, SetBkMode, SetTextColor, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_WINDOW,
+            COLOR_WINDOWTEXT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH,
+            HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST, RDW_ALLCHILDREN, RDW_ERASE,
+            RDW_INVALIDATE,
         },
     },
     System::{
@@ -29,17 +30,17 @@ use windows_sys::Win32::{
             VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_TAB,
         },
         WindowsAndMessaging::{
-            AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumChildWindows,
-            GetClassNameW, GetClientRect, GetCursorPos, GetDlgItem, GetSystemMetrics, GetParent,
-            GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-            IsWindow, IsWindowVisible, PostMessageW, RegisterClassW, SendMessageW, SetForegroundWindow,
-            SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW,
-            BN_CLICKED, DM_GETDEFID, GWLP_USERDATA, SPI_GETHIGHCONTRAST, SW_HIDE, SW_SHOW,
-            SW_SHOWNA,
-            SWP_NOACTIVATE, SWP_NOZORDER, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DRAWITEM,
-            WM_GETFONT, WM_KEYUP, WM_KILLFOCUS, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
-            WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPED,
-            WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+            AdjustWindowRectEx, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+            DestroyMenu, DestroyWindow, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
+            GetDlgItem, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
+            GetWindowTextW, IsWindow, IsWindowVisible, PostMessageW, RegisterClassW, SendMessageW,
+            SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+            SystemParametersInfoW, TrackPopupMenu, BN_CLICKED, DM_GETDEFID, GWLP_USERDATA,
+            MF_CHECKED, MF_STRING, SPI_GETHIGHCONTRAST, SW_HIDE, SW_SHOW, SW_SHOWNA, SWP_NOACTIVATE,
+            SWP_NOZORDER, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN, WM_CHAR,
+            WM_CLOSE, WM_COMMAND, WM_DRAWITEM, WM_GETFONT, WM_KEYUP, WM_KILLFOCUS,
+            WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_CAPTION, WS_CHILD,
+            WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -50,13 +51,6 @@ const ES_AUTOHSCROLL: u32 = 0x0080;
 const ES_READONLY: u32 = 0x0800;
 const BS_OWNERDRAW: u32 = 0x000B;
 const ES_PASSWORD: u32 = 0x0020;
-const CBS_DROPDOWN: u32 = 0x0002;
-const EM_SETREADONLY: u32 = 0x00CF;
-const GW_CHILD: u32 = 5;
-const CB_ADDSTRING: u32 = 0x0143;
-const CB_GETCURSEL: u32 = 0x0147;
-const CB_SETCURSEL: u32 = 0x014E;
-const CBN_SELCHANGE: u16 = 1;
 const ID_PROVIDER: u16 = 4100;
 const ID_CANCEL: u16 = 4102;
 const ID_AZURE_REVEAL: u16 = 4103;
@@ -180,7 +174,7 @@ impl Palette {
     unsafe fn colors(self) -> Colors {
         match self {
             Self::Light => Colors {
-                bg: 0x00FFFFFF, field: 0x00FFFFFF, text: 0x00202020,
+                bg: 0x00FFFFFF, field: 0x00F4F4F4, text: 0x00202020,
                 secondary: 0x00606060, line: 0x00E2E2E2, accent: 0x00D47800,
             },
             Self::Dark => Colors {
@@ -219,6 +213,15 @@ unsafe fn apps_use_light_theme() -> bool {
     status != 0 || value != 0
 }
 
+/// A flat selector: the stock combo box paints a light field and a white
+/// arrow that no theme call fixes on Windows 10, so the choice is drawn as a
+/// plain row and the options come from a native popup menu instead.
+struct Select {
+    hwnd: isize,
+    items: Vec<String>,
+    index: usize,
+}
+
 /// Everything the window procedure needs to paint. Boxed by the window and
 /// reached through GWLP_USERDATA, because a Win32 child outlives any borrow.
 struct UiTheme {
@@ -236,8 +239,10 @@ struct UiTheme {
     notes: Vec<isize>,
     /// Hairline statics, painted with the line colour.
     lines: Vec<isize>,
-    /// Drop-downs whose closed field is painted by this theme.
-    combos: Vec<isize>,
+    /// Read-only edits, painted with the field fill like live ones.
+    fields: Vec<isize>,
+    /// Flat selectors: one text row plus a chevron, menu on click.
+    selects: Vec<Select>,
     /// Owner-drawn tab buttons, and which page is showing.
     tabs: Vec<isize>,
     page: usize,
@@ -256,7 +261,8 @@ impl UiTheme {
             accent_brush: ptr::null_mut(),
             notes: Vec::new(),
             lines: Vec::new(),
-            combos: Vec::new(),
+            fields: Vec::new(),
+            selects: Vec::new(),
             tabs: Vec::new(),
             page: 0,
         };
@@ -279,8 +285,31 @@ impl UiTheme {
         self.rebuild_brushes();
     }
 
-    fn is_combo(&self, control: HWND) -> bool {
-        self.combos.contains(&(control as isize))
+    /// Position of this control in the selector list (an identity, not a choice).
+    fn select_position(&self, control: HWND) -> Option<usize> {
+        self.selects.iter().position(|select| select.hwnd == control as isize)
+    }
+
+    /// The option the user actually picked for this selector.
+    fn chosen_index(&self, control: HWND) -> Option<usize> {
+        self.selects.iter()
+            .find(|select| select.hwnd == control as isize)
+            .map(|select| select.index)
+    }
+
+    /// One flat selector's current choice and its option labels.
+    fn selection(&self, control: HWND) -> Option<(usize, Vec<String>)> {
+        self.selects.iter()
+            .find(|select| select.hwnd == control as isize)
+            .map(|select| (select.index, select.items.clone()))
+    }
+
+    fn set_selection(&mut self, control: HWND, index: usize) {
+        if let Some(select) = self.selects.iter_mut()
+            .find(|select| select.hwnd == control as isize) {
+            select.index = index;
+        }
+        unsafe { InvalidateRect(control, ptr::null(), 0) };
     }
 
     fn tab_index(&self, control: HWND) -> Option<usize> {
@@ -293,6 +322,8 @@ impl UiTheme {
             (self.colors.line, self.line_brush)
         } else if self.notes.contains(&key) {
             (self.colors.secondary, self.bg_brush)
+        } else if self.fields.contains(&key) || self.select_position(control).is_some() {
+            (self.colors.text, self.field_brush)
         } else {
             (self.colors.text, self.bg_brush)
         }
@@ -406,6 +437,74 @@ unsafe fn draw_tab(item: &DRAWITEMSTRUCT, theme: &UiTheme, index: usize) {
 }
 
 
+/// Flat selector: the current choice on a plain fill with a chevron on the
+/// right, so it reads as a value rather than as a text field.
+unsafe fn draw_select(item: &DRAWITEMSTRUCT, theme: &UiTheme) {
+    let s = |value: i32| value * theme.dpi / 96;
+    let hdc = item.hDC;
+    FillRect(hdc, &item.rcItem, theme.field_brush);
+    let mut text = [0u16; 256];
+    let len = GetWindowTextW(item.hwndItem, text.as_mut_ptr(), text.len() as i32).max(0) as usize;
+    let font = SendMessageW(item.hwndItem, WM_GETFONT, 0, 0) as HFONT;
+    let old_font = if font.is_null() { ptr::null_mut() } else { SelectObject(hdc, font) };
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, theme.colors.text);
+    let arrow = s(14);
+    let mut area = RECT {
+        left: item.rcItem.left + s(10),
+        top: item.rcItem.top,
+        right: item.rcItem.right - arrow - s(10),
+        bottom: item.rcItem.bottom,
+    };
+    DrawTextW(hdc, text.as_ptr(), len as i32, &mut area,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    // Chevron: two strokes meeting at a point, drawn with a hairline pen.
+    let cx = item.rcItem.right - s(14);
+    let cy = (item.rcItem.top + item.rcItem.bottom) / 2;
+    let pen = CreatePen(PS_SOLID, s(1).max(1), theme.colors.secondary);
+    if !pen.is_null() {
+        let old_pen = SelectObject(hdc, pen);
+        let points = [
+            POINT { x: cx - s(4), y: cy - s(2) },
+            POINT { x: cx, y: cy + s(2) },
+            POINT { x: cx + s(4), y: cy - s(2) },
+        ];
+        Polyline(hdc, points.as_ptr(), points.len() as i32);
+        SelectObject(hdc, old_pen);
+        DeleteObject(pen);
+    }
+    if !old_font.is_null() { SelectObject(hdc, old_font); }
+    if item.itemState & ODS_FOCUS != 0 {
+        let mut focus = item.rcItem;
+        focus.left += s(2);
+        focus.right -= s(2);
+        DrawFocusRect(hdc, &focus);
+    }
+}
+
+/// Pops the native menu under a flat selector and returns the picked option.
+/// A dismissed menu yields None, so the stored choice stays as it was.
+unsafe fn pick_option(hwnd: HWND, control: HWND, theme: &UiTheme) -> Option<(usize, String)> {
+    let (current, items) = theme.selection(control)?;
+    let menu = CreatePopupMenu();
+    if menu.is_null() { return None; }
+    let mut labels: Vec<Vec<u16>> = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let label = wide(item);
+        let flags = if index == current { MF_STRING | MF_CHECKED } else { MF_STRING };
+        AppendMenuW(menu, flags, index + 1, label.as_ptr());
+        labels.push(label);
+    }
+    let mut rect: RECT = mem::zeroed();
+    GetWindowRect(control, &mut rect);
+    let chosen = TrackPopupMenu(menu,
+        TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
+        rect.left, rect.bottom, 0, hwnd, ptr::null());
+    DestroyMenu(menu);
+    if chosen == 0 { return None; }
+    items.get(chosen as usize - 1).map(|label| (chosen as usize - 1, label.clone()))
+}
+
 /// Applies the palette to the frame and every child control. Runs on open and
 /// whenever the in-app theme picker changes, so no restart is needed.
 unsafe fn apply_window_theme(hwnd: HWND, theme: &mut UiTheme) {
@@ -428,9 +527,8 @@ unsafe fn apply_window_theme(hwnd: HWND, theme: &mut UiTheme) {
         let mut class = [0u16; 32];
         let len = GetClassNameW(child, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
         let name = String::from_utf16_lossy(&class[..len]).to_ascii_lowercase();
-        // Checkboxes are owner-drawn and need no scheme.
+        // Checkboxes and selectors are owner-drawn and need no scheme.
         let scheme = if !dark { "" }
-            else if name.contains("combobox") { "DarkMode_CFD" }
             else if name.contains("edit") || name.contains("button") { "DarkMode_Explorer" }
             else { return 1 };
         let scheme = wide(scheme);
@@ -456,24 +554,16 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
         }
         WM_CTLCOLORSTATIC => {
             if theme.is_null() { return DefWindowProcW(hwnd, msg, wp, lp); }
-            // Windows 10 has no dark combobox theme, so the closed field is
-            // painted unthemed and asks the parent for its colours.
-            if (*theme).dark
-                && ((*theme).is_combo(lp as HWND) || (*theme).is_combo(GetParent(lp as HWND))) {
-                SetBkColor(wp as _, (*theme).colors.field);
-                SetTextColor(wp as _, (*theme).colors.text);
-                return (*theme).field_brush as isize;
-            }
             let (text, brush) = (*theme).colors_for(lp as HWND);
             SetBkMode(wp as _, TRANSPARENT);
+            SetBkColor(wp as _, (*theme).colors.field);
             SetTextColor(wp as _, text);
             brush as isize
         }
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
-            // Light mode keeps the stock control painting, which already matches.
-            if theme.is_null() || !(*theme).dark {
-                return DefWindowProcW(hwnd, msg, wp, lp);
-            }
+            // Borderless fields: the fill is the only affordance, so both
+            // palettes paint it instead of leaving the stock white.
+            if theme.is_null() { return DefWindowProcW(hwnd, msg, wp, lp); }
             SetBkColor(wp as _, (*theme).colors.field);
             SetTextColor(wp as _, (*theme).colors.text);
             (*theme).field_brush as isize
@@ -481,9 +571,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
         WM_DRAWITEM => {
             if theme.is_null() { return DefWindowProcW(hwnd, msg, wp, lp); }
             let item = &*(lp as *const DRAWITEMSTRUCT);
-            match (*theme).tab_index(item.hwndItem) {
-                Some(index) => draw_tab(item, &*theme, index),
-                None => draw_checkbox(item, &*theme),
+            if let Some(index) = (*theme).tab_index(item.hwndItem) {
+                draw_tab(item, &*theme, index);
+            } else if (*theme).select_position(item.hwndItem).is_some() {
+                draw_select(item, &*theme);
+            } else {
+                draw_checkbox(item, &*theme);
             }
             1
         }
@@ -542,31 +635,35 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
                 if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0); }
                 return 0;
             }
-            if id == ID_THEME && notify == CBN_SELCHANGE && !theme.is_null() {
-                let palette = match SendMessageW(control, CB_GETCURSEL, 0, 0) {
-                    1 => Palette::Light,
-                    2 => Palette::Dark,
-                    _ => Palette::detect_system(),
-                };
+            // Flat selectors open their menu on click; the picked row becomes
+            // the control text, so the field always shows the live value.
+            if notify as u32 == BN_CLICKED
+                && matches!(id, ID_PROVIDER | ID_THEME | ID_UPDATE_INTERVAL) {
+                if theme.is_null() { return 0; }
+                let picked = pick_option(hwnd, control, &*theme);
+                let Some((index, label)) = picked else { return 0 };
                 let theme = theme as *mut UiTheme;
-                (*theme).recolour(palette);
-                apply_window_theme(hwnd, &mut *theme);
-                // The choice has to outlive the dialog, so it is saved too.
+                (*theme).set_selection(control, index);
+                set_text(control, &label);
                 let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
-                if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0); }
+                if main.is_null() { return 0; }
+                if id == ID_PROVIDER {
+                    PostMessageW(main, WM_APP_SETTINGS_PROVIDER, 0, 0);
+                } else if id == ID_THEME {
+                    let palette = match index {
+                        1 => Palette::Light,
+                        2 => Palette::Dark,
+                        _ => Palette::detect_system(),
+                    };
+                    (*theme).recolour(palette);
+                    apply_window_theme(hwnd, &mut *theme);
+                }
+                PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0);
                 return 0;
             }
             // Save-on-change: every committed edit reports the same message the
             // Save button used to send, so the main loop keeps one apply path.
-            if id == ID_PROVIDER && notify == CBN_SELCHANGE {
-                let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
-                if !main.is_null() {
-                    PostMessageW(main, WM_APP_SETTINGS_PROVIDER, 0, 0);
-                    PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0);
-                }
-                return 0;
-            }
-            let committed = notify == CBN_SELCHANGE || notify == EN_KILLFOCUS;
+            let committed = notify == EN_KILLFOCUS;
             if committed {
                 let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
                 if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0); }
@@ -718,7 +815,11 @@ unsafe extern "system" fn shortcut_proc(hwnd: HWND, msg: u32, wp: usize, lp: isi
             }
             let scan = ((lp >> 16) & 0xff) as u32;
             let key = side_of(vk, scan) as u32;
-            let mods = current_modifiers(vk);
+            // The key being pressed must not count as its own modifier: a
+            // shift press arrives as the generic VK_SHIFT while the down-state
+            // query uses the side-specific keys, so both would be combined.
+            let own = modifier_mask(vk).unwrap_or(0);
+            let mods = current_modifiers(vk) & !own;
             if modifier_mask(vk).is_some() {
                 // A modifier alone is only half a chord; hold it for the key.
                 CAPTURE.with(|c| c.borrow_mut().pending = Some((mods, key)));
@@ -734,9 +835,24 @@ unsafe extern "system" fn shortcut_proc(hwnd: HWND, msg: u32, wp: usize, lp: isi
             if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0); }
             return 0;
         }
-        // Swallow the characters and releases a chord would otherwise type or
-        // forward; the field never takes text input.
-        WM_CHAR | WM_SYSCHAR | WM_KEYUP | WM_SYSKEYUP => return 0,
+        // Releasing the only modifier commits it: a bare Shift is a shortcut
+        // too, and waiting for a main key would silently drop the choice.
+        WM_KEYUP | WM_SYSKEYUP => {
+            if modifier_mask(wp as u16).is_some() {
+                let pending = CAPTURE.with(|c| { let mut c = c.borrow_mut(); c.armed = false; c.pending.take() });
+                if let Some((mods, key)) = pending {
+                    let spec = shortcut_spec(mods, key);
+                    CAPTURE.with(|c| c.borrow_mut().spec = Some(spec.clone()));
+                    set_text(hwnd, &shortcut_label(&spec));
+                    let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
+                    if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0); }
+                }
+            }
+            return 0;
+        }
+        // Swallow the characters a chord would otherwise type or forward; the
+        // field never takes text input.
+        WM_CHAR | WM_SYSCHAR => return 0,
         WM_KILLFOCUS => {
             // Clicked in, pressed nothing (or only a modifier), then left: the
             // user did not choose a key, which is how "off" is expressed.
@@ -1282,17 +1398,16 @@ impl SettingsWindow {
         // Translation service.
         let service_title = create("STATIC", "翻译服务", 0, 0);
         set_font(service_title, section_font);
-        let provider = create("COMBOBOX", "", ID_PROVIDER, CBS_DROPDOWN | WS_TABSTOP);
-        for label in ["Bing 翻译（无需密钥）", "Azure Translator", "OpenAI 兼容接口", "关闭翻译"] {
-            let item = wide(label);
-            SendMessageW(provider, CB_ADDSTRING, 0, item.as_ptr() as isize);
-        }
-        let pos = match values.provider.as_str() { "bing" => 0, "azure" => 1, "openai" => 2, _ => 3 };
-        SendMessageW(provider, CB_SETCURSEL, pos, 0);
-        // A read-only drop-down keeps a real edit child: Windows 10 only honours
-        // theme colours on that child, a drop-down list paints itself.
-        let provider_edit = GetWindow(provider, GW_CHILD);
-        if !provider_edit.is_null() { SendMessageW(provider_edit, EM_SETREADONLY, 1, 0); }
+        // Flat selectors instead of combo boxes: the stock closed field reads as
+        // an editable text box, and Windows 10 has no dark combo theme at all.
+        let mut selects: Vec<Select> = Vec::new();
+        let provider_items: Vec<String> =
+            ["Bing 翻译（无需密钥）", "Azure Translator", "OpenAI 兼容接口", "关闭翻译"]
+                .iter().map(|label| label.to_string()).collect();
+        let provider_index = match values.provider.as_str() { "bing" => 0, "azure" => 1, "openai" => 2, _ => 3 };
+        let provider = create("BUTTON", &provider_items[provider_index], ID_PROVIDER,
+            BS_OWNERDRAW | WS_TABSTOP);
+        selects.push(Select { hwnd: provider as isize, items: provider_items, index: provider_index });
 
         // Service connection; only visible for providers that need credentials.
         let connection_divider = create("STATIC", "", 0, 0);
@@ -1302,7 +1417,7 @@ impl SettingsWindow {
             let label_hwnd = create("STATIC", label, 0, 0);
             let password = if secret_id != 0 { ES_PASSWORD } else { 0 };
             let edit_hwnd = create("EDIT", value, secret_id,
-                WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | password);
+                WS_TABSTOP | ES_AUTOHSCROLL | password);
             (label_hwnd, edit_hwnd)
         };
         let azure = [
@@ -1324,11 +1439,11 @@ impl SettingsWindow {
         set_font(behavior_title, section_font);
         let timeout_label = create("STATIC", "请求超时", 0, 0);
         let timeout = create("EDIT", &values.timeout_seconds, 0,
-            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL);
+            WS_TABSTOP | ES_AUTOHSCROLL);
         let timeout_unit = create("STATIC", "秒", 0, 0);
         let debounce_label = create("STATIC", "翻译防抖", 0, 0);
         let debounce = create("EDIT", &values.debounce_ms, 0,
-            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL);
+            WS_TABSTOP | ES_AUTOHSCROLL);
         let debounce_unit = create("STATIC", "ms", 0, 0);
         let autostart = create("BUTTON", "开机自启", ID_AUTOSTART,
             BS_OWNERDRAW | WS_TABSTOP);
@@ -1352,19 +1467,16 @@ impl SettingsWindow {
         set_button_checked(auto_install, values.auto_install);
         // Interval between background checks; the current value may be one
         // the presets no longer offer, so it is kept as an extra entry.
-        let update_interval = create("COMBOBOX", "", ID_UPDATE_INTERVAL,
-            CBS_DROPDOWN | WS_TABSTOP);
         let current: u32 = values.update_interval_minutes.parse().unwrap_or(DEFAULT_UPDATE_INTERVAL);
         let mut intervals = UPDATE_INTERVALS.to_vec();
         if !intervals.contains(&current) { intervals.push(current); intervals.sort_unstable(); }
-        for minutes in &intervals {
-            let item = wide(&interval_label(*minutes));
-            SendMessageW(update_interval, CB_ADDSTRING, 0, item.as_ptr() as isize);
-        }
+        let interval_items: Vec<String> =
+            intervals.iter().map(|minutes| interval_label(*minutes)).collect();
         let interval_pos = intervals.iter().position(|m| *m == current).unwrap_or(0);
-        SendMessageW(update_interval, CB_SETCURSEL, interval_pos, 0);
-        let interval_edit = GetWindow(update_interval, GW_CHILD);
-        if !interval_edit.is_null() { SendMessageW(interval_edit, EM_SETREADONLY, 1, 0); }
+        let update_interval = create("BUTTON", &interval_items[interval_pos], ID_UPDATE_INTERVAL,
+            BS_OWNERDRAW | WS_TABSTOP);
+        selects.push(Select { hwnd: update_interval as isize, items: interval_items,
+            index: interval_pos });
         let update_button = create("BUTTON", "立即检查", ID_UPDATE, WS_TABSTOP);
         let startup_title = create("STATIC", "启动", 0, 0);
         set_font(startup_title, section_font);
@@ -1374,15 +1486,12 @@ impl SettingsWindow {
         // In-app theme switch: system, light, dark.
         let theme_label = create("STATIC", "主题", 0, 0);
         set_font(theme_label, section_font);
-        let theme_picker = create("COMBOBOX", "", ID_THEME, CBS_DROPDOWN | WS_TABSTOP);
-        for label in ["跟随系统", "浅色", "深色"] {
-            let item = wide(label);
-            SendMessageW(theme_picker, CB_ADDSTRING, 0, item.as_ptr() as isize);
-        }
+        let theme_items: Vec<String> =
+            ["跟随系统", "浅色", "深色"].iter().map(|label| label.to_string()).collect();
         let theme_pos = match values.theme.as_str() { "light" => 1, "dark" => 2, _ => 0 };
-        SendMessageW(theme_picker, CB_SETCURSEL, theme_pos, 0);
-        let picker_edit = GetWindow(theme_picker, GW_CHILD);
-        if !picker_edit.is_null() { SendMessageW(picker_edit, EM_SETREADONLY, 1, 0); }
+        let theme_picker = create("BUTTON", &theme_items[theme_pos], ID_THEME,
+            BS_OWNERDRAW | WS_TABSTOP);
+        selects.push(Select { hwnd: theme_picker as isize, items: theme_items, index: theme_pos });
         // No Save button and no footer: every change applies at once and the
         // caption bar already closes the window.
         let shortcut_caption = create("STATIC", "输入英文", 0, 0);
@@ -1390,7 +1499,7 @@ impl SettingsWindow {
         // The shortcut is captured from the real keyboard: one read-only field
         // that swallows the next key press. No list, no modifier switches.
         let shortcut_key = create("EDIT", "", ID_SHORTCUT_KEY,
-            WS_BORDER | ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP);
+            ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP);
         set_text(shortcut_key, &shortcut_label(&values.alt_output_shortcut));
         SetWindowSubclass(shortcut_key, Some(shortcut_proc), SUBCLASS_ID, 0);
         // Seed the capture with the stored value, so unrelated switches saved
@@ -1417,10 +1526,12 @@ impl SettingsWindow {
         for control in [service_divider, connection_divider, behavior_divider] {
             (*theme_ptr).lines.push(control as isize);
         }
-        // Drop-downs whose closed field the theme has to paint itself.
-        (*theme_ptr).combos.push(provider as isize);
-        (*theme_ptr).combos.push(theme_picker as isize);
-        (*theme_ptr).combos.push(update_interval as isize);
+        (*theme_ptr).selects = selects;
+        // Borderless fields are painted by the theme, so it must know them.
+        for edit in [azure[0].1, azure[1].1, azure[2].1, openai[0].1, openai[1].1, openai[2].1,
+                     timeout, debounce, shortcut_key] {
+            if !edit.is_null() { (*theme_ptr).fields.push(edit as isize); }
+        }
         for tab in [tab_translate, tab_appearance, tab_system, tab_shortcut, tab_about] {
             (*theme_ptr).tabs.push(tab as isize);
         }
@@ -1481,7 +1592,7 @@ impl SettingsWindow {
         // The three pages share one origin; only the active page is shown, so
         // every page can use the same coordinates without fighting.
         let top = CONTENT_TOP;
-        let selected = SendMessageW(self.provider, CB_GETCURSEL, 0, 0);
+        let selected = (*self.theme).chosen_index(self.provider).unwrap_or(0) as isize;
         let advanced = selected == 1 || selected == 2;
         let translating = (*self.theme).page == 0;
         let appearance = (*self.theme).page == 1;
@@ -1521,24 +1632,25 @@ impl SettingsWindow {
         place(self.theme_label, MARGIN_X, top, 460, 22);
         place(self.theme_picker, MARGIN_X, top + 28, 220, 30);
 
-        // System page: two titled groups with a rule between them, so startup
-        // and updates never read as one pile of switches.
+        // System page: startup only; updates live on 关于.
         place(self.startup_title, MARGIN_X, top, 460, 22);
         place(self.autostart, MARGIN_X, top + 28, CONTENT_W, 24);
-        place(self.connection_divider, MARGIN_X, top + 70, CONTENT_W, 1);
-        place(self.update_title, MARGIN_X, top + 88, 460, 22);
-        place(self.auto_update, MARGIN_X, top + 116, CONTENT_W, 24);
-        place(self.interval_caption, MARGIN_X, top + 149, LABEL_W, 22);
-        place(self.update_interval, FIELD_X, top + 145, 160, 30);
-        place(self.auto_install, MARGIN_X, top + 185, CONTENT_W, 24);
-        place(self.update_button, MARGIN_X, top + 219, 112, 30);
 
-        // 快捷键 page: one field that captures whatever key is pressed.
-        place(self.shortcut_label, MARGIN_X, top, 460, 22);
-        place(self.shortcut_key, MARGIN_X, top + 28, 220, 30);
+        // 快捷键 page: one field that captures whatever key is pressed, on the
+        // same label/field grid as every other row.
+        place(self.shortcut_label, MARGIN_X, top + 4, LABEL_W, 22);
+        place(self.shortcut_key, FIELD_X, top, 260, 30);
 
-        // About page.
-        place(self.about_text, MARGIN_X, top, CONTENT_W, 200);
+        // About page: identity, then the update switches, which used to crowd
+        // the startup group on 系统.
+        place(self.about_text, MARGIN_X, top, CONTENT_W, 140);
+        place(self.connection_divider, MARGIN_X, top + 150, CONTENT_W, 1);
+        place(self.update_title, MARGIN_X, top + 168, 460, 22);
+        place(self.auto_update, MARGIN_X, top + 196, CONTENT_W, 24);
+        place(self.interval_caption, MARGIN_X, top + 228, LABEL_W, 22);
+        place(self.update_interval, FIELD_X, top + 224, 160, 30);
+        place(self.auto_install, MARGIN_X, top + 260, CONTENT_W, 24);
+        place(self.update_button, MARGIN_X, top + 292, 112, 30);
 
         for control in [self.service_title, self.provider] { show(control, translating); }
         for (label, edit) in self.azure {
@@ -1559,16 +1671,15 @@ impl SettingsWindow {
         }
         show(self.theme_label, appearance);
         show(self.theme_picker, appearance);
-        for control in [self.autostart, self.auto_update, self.auto_install,
-                        self.update_interval, self.update_button, self.startup_title,
-                        self.update_title, self.interval_caption] {
-            show(control, system);
-        }
+        for control in [self.autostart, self.startup_title] { show(control, system); }
         for control in [self.shortcut_label, self.shortcut_key] {
             show(control, shortcuts);
         }
-        show(self.connection_divider, system);
-        show(self.about_text, about);
+        for control in [self.about_text, self.connection_divider, self.update_title,
+                        self.auto_update, self.interval_caption, self.update_interval,
+                        self.auto_install, self.update_button] {
+            show(control, about);
+        }
 
         CLIENT_H
     }
@@ -1662,7 +1773,9 @@ impl SettingsWindow {
         let current: u32 = values.update_interval_minutes.parse()
             .unwrap_or(DEFAULT_UPDATE_INTERVAL);
         if let Some(index) = self.update_intervals.iter().position(|m| *m == current) {
-            SendMessageW(self.update_interval, CB_SETCURSEL, index, 0);
+            let theme = self.theme.as_ref() as *const UiTheme as *mut UiTheme;
+            (*theme).set_selection(self.update_interval, index);
+            set_text(self.update_interval, &interval_label(current));
         }
     }
 
@@ -1681,7 +1794,8 @@ impl SettingsWindow {
     }
 
     pub unsafe fn gather(&self) -> SettingsValues {
-        let provider = match SendMessageW(self.provider, CB_GETCURSEL, 0, 0) {
+        let selected = (*self.theme).chosen_index(self.provider).unwrap_or(0);
+        let provider = match selected {
             0 => "bing", 1 => "azure", 2 => "openai", _ => "off",
         }.to_string();
         SettingsValues {
@@ -1699,12 +1813,12 @@ impl SettingsWindow {
             auto_update: button_checked(self.auto_update),
             auto_install: button_checked(self.auto_install),
             update_interval_minutes: {
-                let index = SendMessageW(self.update_interval, CB_GETCURSEL, 0, 0);
-                let minutes = self.update_intervals.get(index.max(0) as usize)
+                let index = (*self.theme).chosen_index(self.update_interval).unwrap_or(0);
+                let minutes = self.update_intervals.get(index)
                     .copied().unwrap_or(DEFAULT_UPDATE_INTERVAL);
                 minutes.to_string()
             },
-            theme: match SendMessageW(self.theme_picker, CB_GETCURSEL, 0, 0) {
+            theme: match (*self.theme).chosen_index(self.theme_picker).unwrap_or(0) {
                 1 => "light".to_string(),
                 2 => "dark".to_string(),
                 _ => "system".to_string(),
