@@ -137,6 +137,22 @@ fn check_via(base: Option<&str>) -> Result<(String, String), String> {
     Ok((tag, sha256))
 }
 
+/// Finds the first tag/digest pair published by at least two mirrors.
+fn pick_agreement(
+    results: &[(&'static str, String, String)],
+) -> Option<(String, String, Vec<&'static str>)> {
+    for (tag, sha256) in results.iter().map(|(_, tag, sha256)| (tag, sha256)) {
+        let agreeing: Vec<&'static str> = results.iter()
+            .filter(|(_, t, s)| t == tag && s == sha256)
+            .map(|(mirror, _, _)| *mirror)
+            .collect();
+        if agreeing.len() >= 2 {
+            return Some((tag.clone(), sha256.clone(), agreeing));
+        }
+    }
+    None
+}
+
 /// The newest published release that carries a verifiable transpop.exe.
 ///
 /// github.com is asked first and its digest is the authority. When it cannot be
@@ -174,23 +190,16 @@ pub fn latest() -> Result<Release, String> {
             results.push((mirror, tag, sha256));
         }
     }
-    for (tag, sha256) in results.iter().map(|(_, tag, sha256)| (tag, sha256)) {
-        let agreeing: Vec<&'static str> = results.iter()
-            .filter(|(_, t, s)| t == tag && s == sha256)
-            .map(|(mirror, _, _)| *mirror)
-            .collect();
-        if agreeing.len() >= 2 {
-            let mirror_urls = agreeing.iter().map(|mirror| asset_url(Some(mirror), tag)).collect();
-            return Ok(Release {
-                direct_url: None,
-                mirror_urls,
-                source: agreeing[0].to_string(),
-                tag: tag.clone(),
-                sha256: sha256.clone(),
-            });
-        }
+    match pick_agreement(&results) {
+        Some((tag, sha256, mirrors)) => Ok(Release {
+            direct_url: None,
+            mirror_urls: mirrors.iter().map(|mirror| asset_url(Some(mirror), &tag)).collect(),
+            source: mirrors[0].to_string(),
+            tag,
+            sha256,
+        }),
+        None => Err("github.com unreachable and no two mirrors agree on the release".to_string()),
     }
-    Err("github.com unreachable and no two mirrors agree on the release".to_string())
 }
 
 
@@ -405,6 +414,19 @@ mod tests {
         // Wrong tag or missing digest must not be trusted.
         assert_eq!(digest_from_assets(&html, "v9.9.9"), None);
         assert_eq!(digest_from_assets("sha256:nothex", "v1.2.3"), None);
+    }
+
+    #[test]
+    fn a_lone_mirror_digest_is_never_trusted() {
+        let results = vec![
+            ("https://a", "v1.0.0".to_string(), "aa".to_string()),
+            ("https://b", "v1.0.0".to_string(), "aa".to_string()),
+            ("https://c", "v1.0.0".to_string(), "bb".to_string()),
+        ];
+        let (tag, sha256, mirrors) = pick_agreement(&results).expect("two mirrors agree");
+        assert_eq!((tag.as_str(), sha256.as_str(), mirrors), ("v1.0.0", "aa", vec!["https://a", "https://b"]));
+        assert!(pick_agreement(&results[..1]).is_none());
+        assert!(pick_agreement(&[]).is_none());
     }
 
     #[test]
