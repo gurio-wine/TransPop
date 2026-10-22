@@ -2342,7 +2342,8 @@ fn update_worker(base: PathBuf, manual: bool, log_tx: Sender<LogRecord>) {
             return;
         }
     };
-    log_line(&log_tx, format!("UPDATE_CHECK_OK current={VERSION} remote={}", release.tag));
+    log_line(&log_tx, format!(
+        "UPDATE_CHECK_OK current={VERSION} remote={} source={}", release.tag, release.source));
     if !update::is_newer(VERSION, &release.tag) {
         if manual { update_notice("检查更新", &format!("当前已是最新版本 v{VERSION}。")); }
         return;

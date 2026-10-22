@@ -23,11 +23,22 @@ const MAX_PAGE_BODY: u64 = 262_144;
 // A release executable is about 2 MiB; refuse anything unreasonably larger.
 const MAX_DOWNLOAD: u64 = 32 * 1024 * 1024;
 const USER_AGENT: &str = concat!("TransPop/", env!("CARGO_PKG_VERSION"));
+// GitHub reverse proxies, used only when github.com itself is unreachable.
+// A digest coming from a mirror is trusted only when two independent mirrors
+// publish the same one, so a single hostile proxy cannot push code.
+const MIRRORS: [&str; 3] =
+    ["https://ghfast.top", "https://gh.llkk.cc", "https://ghproxy.net"];
 
+#[derive(Clone, Debug)]
 pub struct Release {
     pub tag: String,
-    pub url: String,
     pub sha256: String,
+    /// Where the digest came from ("github" or the mirror that agreed first).
+    pub source: String,
+    /// github.com itself, when it answered during the check.
+    pub direct_url: Option<String>,
+    /// Reverse proxies that published the same digest, in probe order.
+    pub mirror_urls: Vec<String>,
 }
 
 fn transport_error(error: ureq::Error) -> String {
@@ -39,7 +50,10 @@ fn transport_error(error: ureq::Error) -> String {
 }
 
 fn agent(timeout: Duration) -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout(timeout).build()
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout(timeout)
+        .build()
 }
 
 /// The tag GitHub redirects /releases/latest to.
@@ -59,32 +73,126 @@ fn digest_from_assets(html: &str, tag: &str) -> Option<String> {
         .then(|| digest.to_ascii_lowercase())
 }
 
+/// Some mirrors answer with the page instead of a redirect, so the tag can
+/// also come from the body. GitHub's URL templates embed the literal
+/// "/releases/tag/*name", whose star is not a tag character.
+fn tag_from_body(html: &str) -> Option<String> {
+    // The page also embeds URL templates such as
+    // "/:user_id/:repository/releases/tag/*name", so scan for the first match
+    // that actually looks like a tag instead of trusting the first occurrence.
+    for (index, _) in html.match_indices("/releases/tag/") {
+        let tag: String = html.get(index + "/releases/tag/".len()..)?
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+            .collect();
+        if tag.starts_with('v') && tag.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) {
+            return Some(tag);
+        }
+    }
+    None
+}
+
+/// The asset URL on github.com, or behind a reverse proxy that takes the full
+/// GitHub URL as its path.
+fn asset_url(base: Option<&str>, tag: &str) -> String {
+    let url = format!("{REPO}/releases/download/{tag}/{ASSET_NAME}");
+    match base {
+        Some(mirror) => format!("{mirror}/{url}"),
+        None => url,
+    }
+}
+
 /// The newest published release that carries a verifiable transpop.exe.
-pub fn latest() -> Result<Release, String> {
-    // Redirects are followed; the final URL is /releases/tag/<tag>.
+/// Reads the newest tag and its published digest from github.com (None) or
+/// through one reverse proxy; a mirror is only usable if it serves both pages.
+fn check_via(base: Option<&str>) -> Result<(String, String), String> {
+    let through = |url: &str| match base {
+        Some(mirror) => format!("{mirror}/{url}"),
+        None => url.to_string(),
+    };
     let response = agent(Duration::from_secs(20))
-        .get(RELEASES_LATEST)
+        .get(&through(RELEASES_LATEST))
         .set("User-Agent", USER_AGENT)
         .call()
         .map_err(transport_error)?;
-    let tag = tag_from_url(response.get_url())
-        .ok_or_else(|| "release page has no tag".to_string())?;
-    let page = agent(Duration::from_secs(20))
-        .get(&format!("{REPO}/releases/expanded_assets/{tag}"))
-        .set("User-Agent", USER_AGENT)
-        .call()
-        .map_err(transport_error)?;
+    let tag = match tag_from_url(response.get_url()) {
+        Some(tag) => tag,
+        None => {
+            let mut body = String::new();
+            response.into_reader().take(MAX_PAGE_BODY).read_to_string(&mut body)
+                .map_err(|_| "response read error".to_string())?;
+            tag_from_body(&body).ok_or_else(|| "release page has no tag".to_string())?
+        }
+    };
     let mut body = String::new();
-    page.into_reader().take(MAX_PAGE_BODY).read_to_string(&mut body)
+    agent(Duration::from_secs(20))
+        .get(&through(&format!("{REPO}/releases/expanded_assets/{tag}")))
+        .set("User-Agent", USER_AGENT)
+        .call()
+        .map_err(transport_error)?
+        .into_reader().take(MAX_PAGE_BODY).read_to_string(&mut body)
         .map_err(|_| "response read error".to_string())?;
     let sha256 = digest_from_assets(&body, &tag)
         .ok_or_else(|| "release asset has no trusted digest".to_string())?;
-    Ok(Release {
-        url: format!("{REPO}/releases/download/{tag}/{ASSET_NAME}"),
-        tag,
-        sha256,
-    })
+    Ok((tag, sha256))
 }
+
+/// The newest published release that carries a verifiable transpop.exe.
+///
+/// github.com is asked first and its digest is the authority. When it cannot be
+/// reached (common in mainland China) two independent reverse proxies must
+/// publish the same tag and digest instead, so one hostile mirror cannot push
+/// its own executable. That check doubles as a source list for the download.
+pub fn latest() -> Result<Release, String> {
+    // Escape hatch for networks where every github.com host is blocked: point
+    // the updater at one trusted reverse proxy and skip the agreement check.
+    if let Ok(override_url) = std::env::var("TRANSPOP_UPDATE_MIRROR") {
+        let override_url = override_url.trim().trim_end_matches('/');
+        if override_url.starts_with("https://") {
+            let (tag, sha256) = check_via(Some(override_url))?;
+            return Ok(Release {
+                direct_url: None,
+                mirror_urls: vec![asset_url(Some(override_url), &tag)],
+                source: override_url.to_string(),
+                tag,
+                sha256,
+            });
+        }
+    }
+    if let Ok((tag, sha256)) = check_via(None) {
+        return Ok(Release {
+            mirror_urls: MIRRORS.iter().map(|mirror| asset_url(Some(mirror), &tag)).collect(),
+            direct_url: Some(asset_url(None, &tag)),
+            source: "github".to_string(),
+            tag,
+            sha256,
+        });
+    }
+    let mut results: Vec<(&'static str, String, String)> = Vec::new();
+    for mirror in MIRRORS {
+        if let Ok((tag, sha256)) = check_via(Some(mirror)) {
+            results.push((mirror, tag, sha256));
+        }
+    }
+    for (tag, sha256) in results.iter().map(|(_, tag, sha256)| (tag, sha256)) {
+        let agreeing: Vec<&'static str> = results.iter()
+            .filter(|(_, t, s)| t == tag && s == sha256)
+            .map(|(mirror, _, _)| *mirror)
+            .collect();
+        if agreeing.len() >= 2 {
+            let mirror_urls = agreeing.iter().map(|mirror| asset_url(Some(mirror), tag)).collect();
+            return Ok(Release {
+                direct_url: None,
+                mirror_urls,
+                source: agreeing[0].to_string(),
+                tag: tag.clone(),
+                sha256: sha256.clone(),
+            });
+        }
+    }
+    Err("github.com unreachable and no two mirrors agree on the release".to_string())
+}
+
 
 fn parse_version(text: &str) -> Option<[u64; 3]> {
     let core = text.trim().trim_start_matches('v')
@@ -105,9 +213,36 @@ pub fn is_newer(current: &str, candidate: &str) -> bool {
     }
 }
 
-/// Download the release executable into the given directory and verify its
-/// digest. `progress` receives a percentage after every chunk (0 means the
-/// server did not report a length).
+/// Streams one URL into memory, reporting progress as it goes.
+fn fetch_into(url: &str, bytes: &mut Vec<u8>, progress: &mut dyn FnMut(u32)) -> Result<(), String> {
+    let response = agent(Duration::from_secs(120))
+        .get(url)
+        .set("User-Agent", USER_AGENT)
+        .call()
+        .map_err(transport_error)?;
+    let total = response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    bytes.clear();
+    let mut reader = response.into_reader();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut chunk).map_err(|_| "download read error".to_string())?;
+        if read == 0 { break; }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() as u64 > MAX_DOWNLOAD { return Err("download too large".to_string()); }
+        let percent = if total == 0 { 0 } else {
+            (bytes.len() as u64 * 100 / total).min(100) as u32
+        };
+        progress(percent);
+    }
+    Ok(())
+}
+
+/// Download the release executable and verify its digest, trying each source
+/// that published this release in turn (github.com first, then the mirrors).
+/// `progress` receives a percentage after every chunk.
 pub fn download(
     release: &Release,
     dir: &Path,
@@ -118,36 +253,28 @@ pub fn download(
         .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
         .collect();
     let path = dir.join(format!("transpop-{safe_tag}.exe"));
-    let response = agent(Duration::from_secs(120))
-        .get(&release.url)
-        .set("User-Agent", USER_AGENT)
-        .call()
-        .map_err(transport_error)?;
-    let total = response
-        .header("Content-Length")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    let mut reader = response.into_reader();
+    let mut sources: Vec<&str> = Vec::new();
+    if let Some(direct) = release.direct_url.as_deref() { sources.push(direct); }
+    sources.extend(release.mirror_urls.iter().map(String::as_str));
     let mut bytes = Vec::new();
-    let mut chunk = [0u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut chunk).map_err(|_| "download read error".to_string())?;
-        if read == 0 { break; }
-        bytes.extend_from_slice(&chunk[..read]);
-        if bytes.len() as u64 > MAX_DOWNLOAD { return Err("download too large".to_string()); }
-        let percent = if total == 0 {
-            0
-        } else {
-            (bytes.len() as u64 * 100 / total).min(100) as u32
-        };
-        progress(percent);
+    let mut last_error = "download failed".to_string();
+    for url in sources {
+        match fetch_into(url, &mut bytes, progress) {
+            Ok(()) => {
+                if sha256_hex(&bytes).eq_ignore_ascii_case(&release.sha256) {
+                    fs::write(&path, &bytes).map_err(|e| format!("write update file: {e}"))?;
+                    progress(100);
+                    return Ok(path);
+                }
+                // A mirror may serve a stale file; the digest is the only trust
+                // anchor, so move on to the next source instead of installing it.
+                last_error = "UPDATE_DIGEST_MISMATCH".to_string();
+            }
+            Err(reason) => last_error = reason,
+        }
+        progress(0);
     }
-    if !sha256_hex(&bytes).eq_ignore_ascii_case(&release.sha256) {
-        return Err("UPDATE_DIGEST_MISMATCH".to_string());
-    }
-    fs::write(&path, &bytes).map_err(|e| format!("write update file: {e}"))?;
-    progress(100);
-    Ok(path)
+    Err(last_error)
 }
 
 fn backup_path(current: &Path) -> PathBuf {
@@ -278,6 +405,23 @@ mod tests {
         // Wrong tag or missing digest must not be trusted.
         assert_eq!(digest_from_assets(&html, "v9.9.9"), None);
         assert_eq!(digest_from_assets("sha256:nothex", "v1.2.3"), None);
+    }
+
+    #[test]
+    fn mirror_pages_yield_a_tag_but_url_templates_do_not() {
+        assert_eq!(tag_from_body("<a href=\"/o/r/releases/tag/v1.2.3\">x</a>").as_deref(),
+            Some("v1.2.3"));
+        assert_eq!(
+            tag_from_body("content=\"/:user_id/:repository/releases/tag/*name\" \
+                <a href=\"/o/r/releases/tag/v1.2.3\">x</a>").as_deref(),
+            Some("v1.2.3"),
+        );
+        assert_eq!(tag_from_body("content=\"/:user_id/:repository/releases/tag/*name\""), None);
+        assert_eq!(tag_from_body("/releases/tag/latest"), None);
+        assert_eq!(
+            asset_url(Some("https://ghfast.top"), "v1.2.3"),
+            "https://ghfast.top/https://github.com/gurio-wine/TransPop/releases/download/v1.2.3/transpop.exe",
+        );
     }
 
     #[test]

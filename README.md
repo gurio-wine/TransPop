@@ -44,7 +44,9 @@ cargo build --release
 
 ## 自动更新
 
-启动 20 秒后以及之后每 6 小时，TransPop 会查询 GitHub Releases 的最新版本（`auto_update=on`，默认，可在设置窗口关闭）。发现新版本时先弹出前台窗口告知版本并询问是否更新，确认后才开始下载，下载过程在同一窗口显示进度；下载完成后用 GitHub 公布的 `sha256` 摘要校验，通过后替换自身并自动重启（新进程会等旧进程退出后再启动）。选择「稍后」则本次不下载，下次检查或手动检查时再询问。托盘右键「检查更新...」或设置窗口的「检查更新」可手动触发同一流程。更新文件存放在 `%LOCALAPPDATA%\TransPop\update\`。
+启动 20 秒后以及之后每 6 小时，TransPop 会查询 GitHub Releases 的最新版本（`auto_update=on`，默认，可在设置窗口关闭）。发现新版本时先弹出前台窗口告知版本并询问是否更新，确认后才开始下载，下载过程在同一窗口显示进度；下载完成后用 GitHub 公布的 `sha256` 摘要校验，通过后替换自身并自动重启（新进程会等旧进程退出后再启动）。
+
+无法直连 github.com 时，更新检查与下载会自动改用 GitHub 反向代理（`ghfast.top`、`gh.llkk.cc`、`ghproxy.net`）。镜像模式下必须有两个相互独立的镜像公布同一版本号与同一 `sha256`，才会下载并安装，避免单个代理投毒；仍无法更新时可用环境变量 `TRANSPOP_UPDATE_MIRROR=https://你的代理` 指定可信代理。选择「稍后」则本次不下载，下次检查或手动检查时再询问。托盘右键「检查更新...」或设置窗口的「检查更新」可手动触发同一流程。更新文件存放在 `%LOCALAPPDATA%\TransPop\update\`。
 
 更新时旧版本会先改名为 `transpop.exe.old`。新版本成功进入消息循环并稳定运行 30 秒后才删除该备份；若新版本启动即崩溃，旧的 `transpop.exe.old` 会保留，可手动改回 `transpop.exe` 回滚。
 
@@ -58,5 +60,5 @@ cargo build --release
 - 仅支持微软拼音的候选窗（UIAutomation `IME_Candidate_Window` / `IME_Prediction_Window`）
 - API Key 由 DPAPI 绑定当前 Windows 用户，更换用户或重装系统后需要重新填写
 - 气泡位置跟随输入法候选窗计算，不支持拖动或跨重启记住位置
-- 自动更新需要能访问 GitHub；若安装目录不可写（例如 Program Files），替换会失败并弹窗提示，同时写入日志
+- 自动更新优先直连 GitHub；连不上时依赖第三方反向代理，若这些代理也失效需要手动更新，或用 `TRANSPOP_UPDATE_MIRROR` 指定代理。安装目录不可写（例如 Program Files）时替换会失败并弹窗提示，同时写入日志
 - 回滚备份 `transpop.exe.old` 只保留到新版本稳定运行 30 秒；更早的崩溃需要重新安装旧版本
