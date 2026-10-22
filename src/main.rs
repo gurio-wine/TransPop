@@ -189,7 +189,7 @@ static AUTO_UPDATE_ENABLED: AtomicBool = AtomicBool::new(true);
 // Separate from AUTO_UPDATE_ENABLED: checking and installing are two switches.
 static AUTO_INSTALL_ENABLED: AtomicBool = AtomicBool::new(true);
 // Minutes between background update checks; the settings window owns it.
-static UPDATE_INTERVAL_MINUTES: AtomicU64 = AtomicU64::new(360);
+static UPDATE_INTERVAL_MINUTES: AtomicU64 = AtomicU64::new(30);
 static READY_TRANSLATION: OnceLock<Mutex<Option<ReadyTranslation>>> = OnceLock::new();
 static ALT_GESTURE: OnceLock<Mutex<AltGesture>> = OnceLock::new();
 static PENDING_COMMIT: OnceLock<Mutex<Option<PendingCommit>>> = OnceLock::new();
@@ -578,7 +578,7 @@ impl TranslatorConfig {
             auto_install: settings::truthy(
                 &env_or("TRANSPOP_AUTO_INSTALL", String::new()), file.auto_install),
             update_interval_minutes: env_or("TRANSPOP_UPDATE_INTERVAL_MINUTES",
-                file.update_interval_minutes).parse::<u64>().unwrap_or(360).max(15),
+                file.update_interval_minutes).parse::<u64>().unwrap_or(30).max(15),
         }
     }
 
@@ -2806,7 +2806,7 @@ fn main() {
                                     .swap(values.auto_update, Ordering::AcqRel);
                                 AUTO_INSTALL_ENABLED.store(values.auto_install, Ordering::Release);
                                 let chosen_interval = values.update_interval_minutes
-                                    .parse::<u64>().unwrap_or(360).max(15);
+                                    .parse::<u64>().unwrap_or(30).max(15);
                                 // The loop compares against this value every tick, so a
                                 // shortened interval takes effect without waiting.
                                 UPDATE_INTERVAL_MINUTES.store(chosen_interval, Ordering::Release);

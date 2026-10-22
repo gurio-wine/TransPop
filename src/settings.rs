@@ -496,7 +496,7 @@ pub struct ConfigFile {
 /// Update check intervals offered in the settings window, in minutes.
 pub const UPDATE_INTERVALS: [u32; 7] = [15, 30, 60, 180, 360, 720, 1440];
 
-pub const DEFAULT_UPDATE_INTERVAL: u32 = 360;
+pub const DEFAULT_UPDATE_INTERVAL: u32 = 30;
 
 /// Self-describing label: the picker sits next to the checkbox, so the
 /// value itself has to say what it counts.
@@ -615,7 +615,7 @@ debounce_ms=300\n\
 # while auto_install=off only announces the release and waits for a click.\n\
 auto_update=on\n\
 auto_install=on\n\
-update_interval_minutes=360\n\
+update_interval_minutes=30\n\
 alt_output=on\n\
 theme=system\n";
         let _ = fs::OpenOptions::new().write(true).create_new(true).open(&path)
@@ -1375,7 +1375,7 @@ mod tests {
         let base = temp_base("interval");
         fs::create_dir_all(&base).unwrap();
         let values = SettingsValues::from_file(&base);
-        assert_eq!(values.update_interval_minutes, "360");
+        assert_eq!(values.update_interval_minutes, "30");
         assert!(values.auto_update, "checking defaults to on");
         assert!(values.auto_install, "installing defaults to on");
         let mut quiet = values.clone();
@@ -1384,7 +1384,7 @@ mod tests {
         quiet.save(&base).unwrap();
         let text = fs::read_to_string(base.join("translator.conf")).unwrap();
         assert!(text.contains("auto_install=off"), "auto_install not saved: {text}");
-        assert_eq!(SettingsValues::from_file(&base).update_interval_minutes, "360");
+        assert_eq!(SettingsValues::from_file(&base).update_interval_minutes, "30");
         let mut short = values.clone();
         short.provider = "bing".into();
         short.update_interval_minutes = "14".into();
