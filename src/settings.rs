@@ -4,19 +4,33 @@
 
 use std::{collections::HashMap, fs, io::Write, mem, path::{Path, PathBuf}, ptr};
 use windows_sys::Win32::{
-    Foundation::HWND,
-    Graphics::Gdi::{CreateFontW, DeleteObject, GetStockObject, SetBkMode, SetTextColor, HFONT},
-    System::LibraryLoader::GetModuleHandleW,
+    Foundation::{HWND, POINT, RECT},
+    Graphics::{
+        Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE},
+        Gdi::{
+            CreateFontW, CreateSolidBrush, DeleteObject, FillRect, GetMonitorInfoW, GetStockObject,
+            GetSysColor, InvalidateRect, MonitorFromPoint, MonitorFromWindow, SetBkColor, SetBkMode,
+            SetTextColor, COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, HFONT, HBRUSH, MONITORINFO,
+            MONITOR_DEFAULTTONEAREST,
+        },
+    },
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
+    },
     UI::{
-        Input::KeyboardAndMouse::SetFocus,
+        Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
+        Controls::SetWindowTheme,
+        Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE},
         WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics,
-        GetWindowTextLengthW, GetWindowTextW, IsWindow, PostMessageW,
-        RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos,
-        ShowWindow, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW,
-        WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, SW_HIDE, SW_SHOW,
-        SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOMOVE,
-        WM_CLOSE, WM_COMMAND,
+            AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
+            GetCursorPos, GetDlgItem, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
+            GetParent, GetWindow, GetWindowTextLengthW, GetWindowTextW, IsWindow, PostMessageW, RegisterClassW,
+            SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+            ShowWindow, SystemParametersInfoW, DM_GETDEFID, GWLP_USERDATA, SPI_GETHIGHCONTRAST,
+            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, WM_CLOSE, WM_COMMAND, WNDCLASSW,
+            WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPED,
+            WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -29,7 +43,9 @@ const BM_GETCHECK: u32 = 0x00F0;
 const BM_SETCHECK: u32 = 0x00F1;
 const BST_CHECKED: usize = 1;
 const ES_PASSWORD: u32 = 0x0020;
-const CBS_DROPDOWNLIST: u32 = 0x0003;
+const CBS_DROPDOWN: u32 = 0x0002;
+const EM_SETREADONLY: u32 = 0x00CF;
+const GW_CHILD: u32 = 5;
 const CB_ADDSTRING: u32 = 0x0143;
 const CB_GETCURSEL: u32 = 0x0147;
 const CB_SETCURSEL: u32 = 0x014E;
@@ -44,9 +60,29 @@ const ID_OPENAI_SECRET: u16 = 4106;
 const ID_UPDATE: u16 = 4107;
 const EM_SETPASSWORDCHAR: u32 = 0x00CC;
 const WM_CTLCOLORSTATIC: u32 = 0x0138;
+const WM_CTLCOLOREDIT: u32 = 0x0133;
+const WM_CTLCOLORLISTBOX: u32 = 0x0134;
+const WM_ERASEBKGND: u32 = 0x0014;
+const WM_KEYDOWN: u32 = 0x0100;
+const DM_GETDEFID_ANSWER: usize = 0x534B; // DC_HASDEFID
+const IDOK: u16 = 1;
+const IDCANCEL: u16 = 2;
+const EM_SETMARGINS: u32 = 0x00D3;
+const EC_LEFT_RIGHT_MARGINS: usize = 0x0003;
+const TRANSPARENT: i32 = 1;
 const SS_ICON: u32 = 0x0003;
 const STM_SETICON: u32 = 0x0170;
-const SS_ETCHEDHORZ: u32 = 0x0010;
+
+// One shared grid: 26 px side margin, 520 px of content, labels end at 136.
+const CLIENT_W: i32 = 572;
+const MARGIN_X: i32 = 26;
+const CONTENT_W: i32 = 520;
+const LABEL_W: i32 = 118;
+const FIELD_X: i32 = 154;
+const FIELD_W: i32 = 392;
+const SECRET_W: i32 = 323;
+const WINDOW_STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
+const WINDOW_EX_STYLE: u32 = WS_EX_APPWINDOW;
 const WM_APP_SETTINGS_SAVE: u32 = super::WM_APP + 30;
 const WM_APP_SETTINGS_CANCEL: u32 = super::WM_APP + 31;
 const WM_APP_SETTINGS_PROVIDER: u32 = super::WM_APP + 32;
@@ -59,46 +95,202 @@ pub const UPDATE_MESSAGE: u32 = WM_APP_SETTINGS_UPDATE;
 
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
 
+/// Colour roles for one palette. Windows has three: the user's light or dark
+/// app theme, and high contrast, which overrides both.
+struct Colors {
+    bg: u32,
+    field: u32,
+    text: u32,
+    secondary: u32,
+    line: u32,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Palette {
+    Light,
+    Dark,
+    HighContrast,
+}
+
+impl Palette {
+    unsafe fn detect() -> Self {
+        if high_contrast_enabled() { return Self::HighContrast; }
+        // Explicit override first: it makes light and dark testable without
+        // flipping the whole desktop theme.
+        match std::env::var("TRANSPOP_THEME").unwrap_or_default().to_ascii_lowercase().as_str() {
+            "dark" => return Self::Dark,
+            "light" => return Self::Light,
+            _ => {}
+        }
+        if apps_use_light_theme() { Self::Light } else { Self::Dark }
+    }
+
+    unsafe fn colors(self) -> Colors {
+        match self {
+            Self::Light => Colors {
+                bg: 0x00FFFFFF, field: 0x00FFFFFF, text: 0x00202020,
+                secondary: 0x00606060, line: 0x00E2E2E2,
+            },
+            Self::Dark => Colors {
+                bg: 0x00202020, field: 0x002D2D2D, text: 0x00F0F0F0,
+                secondary: 0x00A0A0A0, line: 0x003C3C3C,
+            },
+            Self::HighContrast => Colors {
+                bg: GetSysColor(COLOR_WINDOW),
+                field: GetSysColor(COLOR_WINDOW),
+                text: GetSysColor(COLOR_WINDOWTEXT),
+                secondary: GetSysColor(COLOR_GRAYTEXT),
+                line: GetSysColor(COLOR_GRAYTEXT),
+            },
+        }
+    }
+}
+
+unsafe fn high_contrast_enabled() -> bool {
+    let mut hc: HIGHCONTRASTW = mem::zeroed();
+    hc.cbSize = mem::size_of::<HIGHCONTRASTW>() as u32;
+    SystemParametersInfoW(SPI_GETHIGHCONTRAST, hc.cbSize,
+        (&mut hc as *mut HIGHCONTRASTW).cast(), 0) != 0
+        && hc.dwFlags & HCF_HIGHCONTRASTON != 0
+}
+
+/// AppsUseLightTheme drives app surfaces; SystemUsesLightTheme only drives the
+/// shell. An unreadable value means light, which is also the safe fallback.
+unsafe fn apps_use_light_theme() -> bool {
+    let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+    let name = wide("AppsUseLightTheme");
+    let mut value: u32 = 1;
+    let mut size = mem::size_of::<u32>() as u32;
+    let status = RegGetValueW(HKEY_CURRENT_USER, sub.as_ptr(), name.as_ptr(), RRF_RT_REG_DWORD,
+        ptr::null_mut(), (&mut value as *mut u32).cast(), &mut size);
+    status != 0 || value != 0
+}
+
+/// Everything the window procedure needs to paint. Boxed by the window and
+/// reached through GWLP_USERDATA, because a Win32 child outlives any borrow.
+struct UiTheme {
+    dark: bool,
+    colors: Colors,
+    bg_brush: HBRUSH,
+    field_brush: HBRUSH,
+    line_brush: HBRUSH,
+    /// Secondary-text statics, painted with the muted colour.
+    notes: Vec<isize>,
+    /// Hairline statics, painted with the line colour.
+    lines: Vec<isize>,
+}
+
+impl UiTheme {
+    unsafe fn create(palette: Palette) -> Self {
+        let colors = palette.colors();
+        Self {
+            dark: palette == Palette::Dark,
+            bg_brush: CreateSolidBrush(colors.bg),
+            field_brush: CreateSolidBrush(colors.field),
+            line_brush: CreateSolidBrush(colors.line),
+            colors,
+            notes: Vec::new(),
+            lines: Vec::new(),
+        }
+    }
+
+    unsafe fn colors_for(&self, control: HWND) -> (u32, HBRUSH) {
+        let key = control as isize;
+        if self.lines.contains(&key) {
+            (self.colors.line, self.line_brush)
+        } else if self.notes.contains(&key) {
+            (self.colors.secondary, self.bg_brush)
+        } else {
+            (self.colors.text, self.bg_brush)
+        }
+    }
+
+    unsafe fn release(&self) {
+        for brush in [self.bg_brush, self.field_brush, self.line_brush] {
+            if !brush.is_null() { DeleteObject(brush); }
+        }
+    }
+}
+
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
-    if msg == WM_CTLCOLORSTATIC {
-        // Stock white brush: no custom paint routine, no owned HBRUSH lifecycle.
-        SetBkMode(wp as _, 1); // TRANSPARENT
-        SetTextColor(wp as _, 0x003E3330); // subtle charcoal, COLORREF BGR
-        return GetStockObject(0) as isize; // WHITE_BRUSH
-    }
-    if msg == WM_CLOSE {
-        let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
-        if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_CANCEL, 0, 0); }
-        return 0;
-    }
-    if msg == WM_COMMAND {
-        let id = (wp & 0xffff) as u16;
-        let notify = ((wp >> 16) & 0xffff) as u16;
-        let outgoing = if id == ID_SAVE { WM_APP_SETTINGS_SAVE }
-            else if id == ID_CANCEL { WM_APP_SETTINGS_CANCEL }
-            else if id == ID_PROVIDER && notify == CBN_SELCHANGE { WM_APP_SETTINGS_PROVIDER }
-            else if id == ID_UPDATE { WM_APP_SETTINGS_UPDATE }
-            else { 0 };
-        if id == ID_AZURE_REVEAL || id == ID_OPENAI_REVEAL {
-            // Password visibility is local to this settings dialog; it never
-            // persists secrets or changes the saved values by itself.
-            let secret_id = if id == ID_AZURE_REVEAL { ID_AZURE_SECRET } else { ID_OPENAI_SECRET };
-            let edit = windows_sys::Win32::UI::WindowsAndMessaging::GetDlgItem(hwnd, secret_id as i32);
-            let checkbox = windows_sys::Win32::UI::WindowsAndMessaging::GetDlgItem(hwnd, id as i32);
-            if !edit.is_null() && !checkbox.is_null() {
-                let shown = SendMessageW(checkbox, BM_GETCHECK, 0, 0) as usize == BST_CHECKED;
-                SendMessageW(edit, EM_SETPASSWORDCHAR, if shown { 0 } else { '*' as usize }, 0);
-                windows_sys::Win32::Graphics::Gdi::InvalidateRect(edit, ptr::null(), 1);
+    let theme = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const UiTheme;
+    match msg {
+        WM_ERASEBKGND => {
+            // The class brush is only a fallback: repaint with the theme colour.
+            if !theme.is_null() {
+                let mut rect: RECT = mem::zeroed();
+                GetClientRect(hwnd, &mut rect);
+                FillRect(wp as _, &rect, (*theme).bg_brush);
             }
-            return 0;
+            1
         }
-        if outgoing != 0 {
+        WM_CTLCOLORSTATIC => {
+            if theme.is_null() { return DefWindowProcW(hwnd, msg, wp, lp); }
+            // Windows 10 has no dark combobox theme, so the closed field is
+            // painted unthemed and asks the parent for its colours.
+            if (*theme).dark
+                && (lp as HWND == GetDlgItem(hwnd, ID_PROVIDER as i32)
+                    || GetParent(lp as HWND) == GetDlgItem(hwnd, ID_PROVIDER as i32)) {
+                SetBkColor(wp as _, (*theme).colors.field);
+                SetTextColor(wp as _, (*theme).colors.text);
+                return (*theme).field_brush as isize;
+            }
+            let (text, brush) = (*theme).colors_for(lp as HWND);
+            SetBkMode(wp as _, TRANSPARENT);
+            SetTextColor(wp as _, text);
+            brush as isize
+        }
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+            // Light mode keeps the stock control painting, which already matches.
+            if theme.is_null() || !(*theme).dark {
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
+            SetBkColor(wp as _, (*theme).colors.field);
+            SetTextColor(wp as _, (*theme).colors.text);
+            (*theme).field_brush as isize
+        }
+        // Answer the dialog manager so IsDialogMessageW can route Enter to Save.
+        DM_GETDEFID => ((DM_GETDEFID_ANSWER as isize) << 16) | ID_SAVE as isize,
+        WM_KEYDOWN if wp as u16 == VK_ESCAPE => {
             let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
-            if !main.is_null() { PostMessageW(main, outgoing, 0, 0); }
-            return 0;
+            if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_CANCEL, 0, 0); }
+            0
         }
+        WM_CLOSE => {
+            let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
+            if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_CANCEL, 0, 0); }
+            0
+        }
+        WM_COMMAND => {
+            let id = (wp & 0xffff) as u16;
+            let notify = ((wp >> 16) & 0xffff) as u16;
+            let outgoing = if id == ID_SAVE || id == IDOK { WM_APP_SETTINGS_SAVE }
+                else if id == ID_CANCEL || id == IDCANCEL { WM_APP_SETTINGS_CANCEL }
+                else if id == ID_PROVIDER && notify == CBN_SELCHANGE { WM_APP_SETTINGS_PROVIDER }
+                else if id == ID_UPDATE { WM_APP_SETTINGS_UPDATE }
+                else { 0 };
+            if id == ID_AZURE_REVEAL || id == ID_OPENAI_REVEAL {
+                // Password visibility is local to this dialog; it never persists
+                // secrets or changes the saved values by itself.
+                let secret_id = if id == ID_AZURE_REVEAL { ID_AZURE_SECRET } else { ID_OPENAI_SECRET };
+                let edit = GetDlgItem(hwnd, secret_id as i32);
+                let checkbox = GetDlgItem(hwnd, id as i32);
+                if !edit.is_null() && !checkbox.is_null() {
+                    let shown = SendMessageW(checkbox, BM_GETCHECK, 0, 0) as usize == BST_CHECKED;
+                    SendMessageW(edit, EM_SETPASSWORDCHAR, if shown { 0 } else { '*' as usize }, 0);
+                    InvalidateRect(edit, ptr::null(), 1);
+                }
+                return 0;
+            }
+            if outgoing != 0 {
+                let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
+                if !main.is_null() { PostMessageW(main, outgoing, 0, 0); }
+                return 0;
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
-    DefWindowProcW(hwnd, msg, wp, lp)
 }
 
 /// Shared translator.conf parser. The settings window and the runtime loader
@@ -347,31 +539,37 @@ pub struct SettingsWindow {
     title_font: HFONT,
     section_font: HFONT,
     note_font: HFONT,
+    theme: Box<UiTheme>,
+    brand_mark: HWND,
+    heading: HWND,
+    subtitle: HWND,
+    service_title: HWND,
+    service_divider: HWND,
     provider: HWND,
+    hint: HWND,
+    connection_title: HWND,
+    connection_divider: HWND,
     azure: [(HWND, HWND); 3],
     openai: [(HWND, HWND); 3],
     azure_reveal: HWND,
     openai_reveal: HWND,
-    connection_title: HWND,
-    connection_divider: HWND,
     behavior_title: HWND,
     behavior_divider: HWND,
     timeout_label: HWND,
-    debounce_label: HWND,
-    timeout_unit: HWND,
-    debounce_unit: HWND,
     timeout: HWND,
+    timeout_unit: HWND,
+    debounce_label: HWND,
     debounce: HWND,
+    debounce_unit: HWND,
     autostart: HWND,
+    autostart_help: HWND,
     alt_output: HWND,
     auto_update: HWND,
     update_button: HWND,
-    autostart_help: HWND,
     footer_divider: HWND,
     footer_note: HWND,
     save_button: HWND,
     cancel_button: HWND,
-    hint: HWND,
 }
 
 impl SettingsWindow {
@@ -382,31 +580,41 @@ impl SettingsWindow {
         wc.lpfnWndProc = Some(proc);
         wc.hInstance = instance;
         wc.lpszClassName = class.as_ptr();
-        wc.hbrBackground = GetStockObject(0) as _; // white, native Windows surface
+        wc.hbrBackground = GetStockObject(0) as _; // light fallback; WM_ERASEBKGND paints
         wc.hIcon = super::load_brand_icon(false);
         let _ = RegisterClassW(&wc);
+
         let scale = |v: i32| v * dpi / 96;
-        let width = scale(586);
-        let height = scale(548);
-        let x = (GetSystemMetrics(0) - width).max(0) / 2;
-        let y = (GetSystemMetrics(1) - height).max(0) / 2;
+        // A throwaway frame size: apply_layout sizes the window from the client grid.
         let title = wide("TransPop · 偏好设置");
-        let hwnd = CreateWindowExW(WS_EX_APPWINDOW, class.as_ptr(), title.as_ptr(),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-            x, y, width, height, ptr::null_mut(), ptr::null_mut(), instance, ptr::null());
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE, class.as_ptr(), title.as_ptr(), WINDOW_STYLE,
+            0, 0, scale(CLIENT_W), scale(400), ptr::null_mut(), ptr::null_mut(), instance, ptr::null());
         if hwnd.is_null() { return None; }
+
+        // One boxed paint state. Its address goes into GWLP_USERDATA and must
+        // stay valid while the SettingsWindow itself is moved into the caller.
+        let mut theme = Box::new(UiTheme::create(Palette::detect()));
+        let theme_ptr: *mut UiTheme = &mut *theme;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, theme_ptr as isize);
+        if theme.dark {
+            let enabled: u32 = 1;
+            // 20 is the current attribute; 19 is the pre-20H1 number, still worth a try.
+            if DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+                (&enabled as *const u32).cast(), 4) != 0 {
+                let _ = DwmSetWindowAttribute(hwnd, 19, (&enabled as *const u32).cast(), 4);
+            }
+        }
 
         let font_face = wide("Segoe UI");
         let font = CreateFontW(-scale(14), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, font_face.as_ptr());
-        let title_font = CreateFontW(-scale(22), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, font_face.as_ptr());
-        let section_font = CreateFontW(-scale(15), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, font_face.as_ptr());
+        let title_font = CreateFontW(-scale(20), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, font_face.as_ptr());
+        let section_font = CreateFontW(-scale(14), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, font_face.as_ptr());
         let note_font = CreateFontW(-scale(12), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, font_face.as_ptr());
-        let mut create = |kind: &str, text: &str, id: u16,
-                          xpos: i32, ypos: i32, w: i32, h: i32, style: u32| -> HWND {
+        // No coordinates here on purpose: layout() owns every position and size.
+        let create = |kind: &str, text: &str, id: u16, style: u32| -> HWND {
             let c = wide(kind); let t = wide(text);
-            let child = CreateWindowExW(0, c.as_ptr(), t.as_ptr(),
-                WS_CHILD | WS_VISIBLE | style, scale(xpos), scale(ypos),
-                scale(w), scale(h), hwnd, id as usize as HWND, instance, ptr::null());
+            let child = CreateWindowExW(0, c.as_ptr(), t.as_ptr(), WS_CHILD | WS_VISIBLE | style,
+                0, 0, 0, 0, hwnd, id as usize as HWND, instance, ptr::null());
             if !child.is_null() && !font.is_null() { SendMessageW(child, WM_SETFONT, font as usize, 1); }
             child
         };
@@ -415,73 +623,73 @@ impl SettingsWindow {
         };
         let values = SettingsValues::from_file(&base);
 
-        // Identity / information hierarchy; no oversized decorative icon cards.
-        let mark = create("STATIC", "", 0, 26, 19, 40, 40, SS_ICON);
+        // Header: mark, product name, one quiet subtitle line.
+        let mark = create("STATIC", "", 0, SS_ICON);
         let brand_icon = super::load_brand_icon(false);
         if !mark.is_null() && !brand_icon.is_null() {
             SendMessageW(mark, STM_SETICON, brand_icon as usize, 0);
         }
-        let heading = create("STATIC", "TransPop", 0, 77, 19, 450, 30, 0);
+        let heading = create("STATIC", "TransPop", 0, 0);
         set_font(heading, title_font);
-        let subtitle = create("STATIC",
-            &format!("偏好设置 · 让翻译恰到好处 · v{}", super::VERSION), 0, 78, 50, 480, 21, 0);
+        let subtitle = create("STATIC", &format!("偏好设置 · v{}", super::VERSION), 0, 0);
         set_font(subtitle, note_font);
-        create("STATIC", "", 0, 26, 83, 520, 2, SS_ETCHEDHORZ);
+        let service_divider = create("STATIC", "", 0, 0);
 
-        let service_title = create("STATIC", "翻译服务", 0, 26, 101, 480, 23, 0);
+        // Translation service.
+        let service_title = create("STATIC", "翻译服务", 0, 0);
         set_font(service_title, section_font);
-        let provider = create("COMBOBOX", "", ID_PROVIDER, 26, 133, 520, 200,
-            CBS_DROPDOWNLIST | WS_TABSTOP);
+        let provider = create("COMBOBOX", "", ID_PROVIDER, CBS_DROPDOWN | WS_TABSTOP);
         for label in ["Bing 翻译（无需密钥）", "Azure Translator", "OpenAI 兼容接口", "关闭翻译"] {
             let item = wide(label);
             SendMessageW(provider, CB_ADDSTRING, 0, item.as_ptr() as isize);
         }
-        let pos = match values.provider.as_str() { "bing"=>0, "azure"=>1, "openai"=>2, _=>3 };
+        let pos = match values.provider.as_str() { "bing" => 0, "azure" => 1, "openai" => 2, _ => 3 };
         SendMessageW(provider, CB_SETCURSEL, pos, 0);
-        let hint = create("STATIC", "", 0, 26, 170, 515, 38, 0);
+        // A read-only drop-down keeps a real edit child: Windows 10 only honours
+        // theme colours on that child, a drop-down list paints itself.
+        let provider_edit = GetWindow(provider, GW_CHILD);
+        if !provider_edit.is_null() { SendMessageW(provider_edit, EM_SETREADONLY, 1, 0); }
+        let hint = create("STATIC", "", 0, 0);
         set_font(hint, note_font);
 
-        let connection_divider = create("STATIC", "", 0, 26, 201, 520, 2, SS_ETCHEDHORZ);
-        let connection_title = create("STATIC", "服务连接", 0, 26, 216, 500, 23, 0);
+        // Service connection; only visible for providers that need credentials.
+        let connection_divider = create("STATIC", "", 0, 0);
+        let connection_title = create("STATIC", "服务连接", 0, 0);
         set_font(connection_title, section_font);
-        let field = |create: &mut dyn FnMut(&str,&str,u16,i32,i32,i32,i32,u32)->HWND,
-                     label: &str, y: i32, value: &str, secret_id: u16| -> (HWND, HWND) {
-            let label_hwnd = create("STATIC", label, 0, 26, y + 5, 118, 24, 0);
-            let width = if secret_id != 0 { 323 } else { 392 };
-            let edit_hwnd = create("EDIT", value, secret_id, 154, y, width, 30,
-                WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL |
-                (if secret_id != 0 { ES_PASSWORD } else { 0 }));
+        let field = |label: &str, value: &str, secret_id: u16| -> (HWND, HWND) {
+            let label_hwnd = create("STATIC", label, 0, 0);
+            let password = if secret_id != 0 { ES_PASSWORD } else { 0 };
+            let edit_hwnd = create("EDIT", value, secret_id,
+                WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | password);
             (label_hwnd, edit_hwnd)
         };
         let azure = [
-            field(&mut create, "翻译地址", 245, &values.azure_url, 0),
-            field(&mut create, "资源区域", 282, &values.azure_region, 0),
-            field(&mut create, "API Key", 319, &values.azure_key, ID_AZURE_SECRET),
+            field("翻译地址", &values.azure_url, 0),
+            field("资源区域", &values.azure_region, 0),
+            field("API Key", &values.azure_key, ID_AZURE_SECRET),
         ];
         let openai = [
-            field(&mut create, "接口地址", 245, &values.openai_url, 0),
-            field(&mut create, "模型名称", 282, &values.openai_model, 0),
-            field(&mut create, "API Key", 319, &values.openai_key, ID_OPENAI_SECRET),
+            field("接口地址", &values.openai_url, 0),
+            field("模型名称", &values.openai_model, 0),
+            field("API Key", &values.openai_key, ID_OPENAI_SECRET),
         ];
-        let azure_reveal = create("BUTTON", "显示", ID_AZURE_REVEAL, 485, 321, 61, 26,
-            BS_AUTOCHECKBOX | WS_TABSTOP);
-        let openai_reveal = create("BUTTON", "显示", ID_OPENAI_REVEAL, 485, 321, 61, 26,
-            BS_AUTOCHECKBOX | WS_TABSTOP);
+        let azure_reveal = create("BUTTON", "显示", ID_AZURE_REVEAL, BS_AUTOCHECKBOX | WS_TABSTOP);
+        let openai_reveal = create("BUTTON", "显示", ID_OPENAI_REVEAL, BS_AUTOCHECKBOX | WS_TABSTOP);
 
-        // This entire block reflows up if no credentials are required.
-        let behavior_divider = create("STATIC", "", 0, 26, 205, 520, 2, SS_ETCHEDHORZ);
-        let behavior_title = create("STATIC", "翻译行为", 0, 26, 220, 500, 23, 0);
+        // Translation behaviour.
+        let behavior_divider = create("STATIC", "", 0, 0);
+        let behavior_title = create("STATIC", "翻译行为", 0, 0);
         set_font(behavior_title, section_font);
-        let timeout_label = create("STATIC", "请求超时", 0, 26, 261, 132, 24, 0);
-        let timeout = create("EDIT", &values.timeout_seconds, 0, 154, 256, 85, 30,
+        let timeout_label = create("STATIC", "请求超时", 0, 0);
+        let timeout = create("EDIT", &values.timeout_seconds, 0,
             WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL);
-        let timeout_unit = create("STATIC", "秒（2–30）", 0, 247, 261, 124, 24, 0);
-        let debounce_label = create("STATIC", "翻译防抖", 0, 327, 261, 110, 24, 0);
-        let debounce = create("EDIT", &values.debounce_ms, 0, 421, 256, 75, 30,
+        let timeout_unit = create("STATIC", "秒（2–30）", 0, 0);
+        let debounce_label = create("STATIC", "翻译防抖", 0, 0);
+        let debounce = create("EDIT", &values.debounce_ms, 0,
             WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL);
-        let debounce_unit = create("STATIC", "ms", 0, 501, 261, 48, 24, 0);
+        let debounce_unit = create("STATIC", "ms", 0, 0);
         let autostart = create("BUTTON", "登录 Windows 时自动启动", 0,
-            26, 317, 510, 25, BS_AUTOCHECKBOX | WS_TABSTOP);
+            BS_AUTOCHECKBOX | WS_TABSTOP);
         // An unreadable registry state must not look like "disabled": the next
         // Save would then delete a working autostart entry. Assume enabled.
         let previously_enabled = match super::startup::enabled_for_current_exe() {
@@ -492,30 +700,62 @@ impl SettingsWindow {
             }
         };
         SendMessageW(autostart, BM_SETCHECK, if previously_enabled { BST_CHECKED } else { 0 }, 0);
-        let alt_output = create("BUTTON", "轻按左 Alt：取消拼音并输入英文（实验性）", 0,
-            26, 370, 510, 25, BS_AUTOCHECKBOX | WS_TABSTOP);
-        SendMessageW(alt_output, BM_SETCHECK, if values.alt_output { BST_CHECKED } else { 0 }, 0);
-        let autostart_help = create("STATIC", "仅当前用户 · 移动程序后需要重新启用", 0,
-            49, 348, 492, 23, 0);
+        let autostart_help = create("STATIC", "仅当前用户 · 移动后需重新启用", 0, 0);
         set_font(autostart_help, note_font);
+        let alt_output = create("BUTTON", "轻按左 Alt：取消拼音并输入英文（实验性）", 0,
+            BS_AUTOCHECKBOX | WS_TABSTOP);
+        SendMessageW(alt_output, BM_SETCHECK, if values.alt_output { BST_CHECKED } else { 0 }, 0);
         let auto_update = create("BUTTON", "自动检查并安装 GitHub 更新", 0,
-            26, 403, 330, 25, BS_AUTOCHECKBOX | WS_TABSTOP);
+            BS_AUTOCHECKBOX | WS_TABSTOP);
         SendMessageW(auto_update, BM_SETCHECK, if values.auto_update { BST_CHECKED } else { 0 }, 0);
-        let update_button = create("BUTTON", "检查更新", ID_UPDATE, 422, 400, 125, 30, WS_TABSTOP);
-        let footer_divider = create("STATIC", "", 0, 26, 437, 520, 2, SS_ETCHEDHORZ);
-        let footer_note = create("STATIC", "在线翻译会将候选文字发送给服务商", 0,
-            26, 453, 298, 23, 0);
+        let update_button = create("BUTTON", "检查更新", ID_UPDATE, WS_TABSTOP);
+        let footer_divider = create("STATIC", "", 0, 0);
+        let footer_note = create("STATIC", "在线翻译会将候选文字发送给服务商", 0, 0);
         set_font(footer_note, note_font);
-        let save_button = create("BUTTON", "保存设置", ID_SAVE, 422, 481, 125, 34,
-            WS_TABSTOP | 0x00000001); // BS_DEFPUSHBUTTON
-        let cancel_button = create("BUTTON", "取消", ID_CANCEL, 334, 481, 78, 34, WS_TABSTOP);
-        let this = Self { hwnd, base, dpi, font, title_font, section_font, note_font,
-                          provider, azure, openai, azure_reveal, openai_reveal,
-                          connection_title, connection_divider, behavior_title, behavior_divider,
-                          timeout_label, debounce_label, timeout_unit, debounce_unit, timeout, debounce,
-                          autostart, alt_output, auto_update, update_button, autostart_help,
-                          footer_divider, footer_note, save_button, cancel_button, hint };
+        let save_button = create("BUTTON", "保存设置", ID_SAVE, WS_TABSTOP | 0x00000001); // BS_DEFPUSHBUTTON
+        let cancel_button = create("BUTTON", "取消", ID_CANCEL, WS_TABSTOP);
+
+        // A slightly inset caret keeps addresses off the field frame.
+        let pad = scale(8);
+        for edit in [azure[0].1, azure[1].1, azure[2].1, openai[0].1, openai[1].1, openai[2].1,
+                     timeout, debounce] {
+            if !edit.is_null() {
+                SendMessageW(edit, EM_SETMARGINS, EC_LEFT_RIGHT_MARGINS,
+                    (pad | (pad << 16)) as isize);
+            }
+        }
+        // Which statics are secondary text and which are hairlines.
+        for control in [subtitle, hint, autostart_help, footer_note] {
+            (*theme_ptr).notes.push(control as isize);
+        }
+        for control in [service_divider, connection_divider, behavior_divider, footer_divider] {
+            (*theme_ptr).lines.push(control as isize);
+        }
+        if (*theme_ptr).dark {
+            // Documented opt-in for dark edit/combo/button chrome. Without it the
+            // controls keep their light theme and paint over the dark page.
+            let scheme = wide("DarkMode_Explorer");
+            for control in [provider, azure[0].1, azure[1].1, azure[2].1,
+                            openai[0].1, openai[1].1, openai[2].1,
+                            timeout, debounce, azure_reveal, openai_reveal,
+                            autostart, alt_output, auto_update,
+                            update_button, save_button, cancel_button] {
+                if !control.is_null() { SetWindowTheme(control, scheme.as_ptr(), ptr::null()); }
+            }
+            // The picker's dropdown button only has a dark rendering in the
+            // file-dialog scheme; the explorer one paints it white.
+            let picker_scheme = wide("DarkMode_CFD");
+            SetWindowTheme(provider, picker_scheme.as_ptr(), ptr::null());
+        }
+
+        let this = Self { hwnd, base, dpi, font, title_font, section_font, note_font, theme,
+            brand_mark: mark, heading, subtitle, service_title, service_divider, provider, hint,
+            connection_title, connection_divider, azure, openai, azure_reveal, openai_reveal,
+            behavior_title, behavior_divider, timeout_label, timeout, timeout_unit,
+            debounce_label, debounce, debounce_unit, autostart, autostart_help, alt_output,
+            auto_update, update_button, footer_divider, footer_note, save_button, cancel_button };
         this.update_provider();
+        this.apply_layout(true);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
         SetFocus(provider);
@@ -529,6 +769,141 @@ impl SettingsWindow {
         }
     }
 
+    /// Positions every control and returns the client height the form needs.
+    /// This is the only place that knows coordinates; visibility follows the
+    /// selected provider, so switching providers only needs a new layout pass.
+    unsafe fn layout(&self) -> i32 {
+        let s = |value: i32| value * self.dpi / 96;
+        let place = |control: HWND, x: i32, y: i32, width: i32, height: i32| {
+            if !control.is_null() {
+                SetWindowPos(control, ptr::null_mut(), s(x), s(y), s(width), s(height),
+                    SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        };
+        let show = |control: HWND, visible: bool| {
+            if !control.is_null() {
+                ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE });
+            }
+        };
+
+        place(self.brand_mark, MARGIN_X, 18, 34, 34);
+        place(self.heading, 74, 12, 440, 32);
+        place(self.subtitle, 75, 44, 470, 20);
+        place(self.service_divider, MARGIN_X, 80, CONTENT_W, 1);
+
+        let mut y = 98;
+        place(self.service_title, MARGIN_X, y, 460, 22);
+        y += 28;
+        place(self.provider, MARGIN_X, y, CONTENT_W, 30);
+        y += 34;
+        place(self.hint, MARGIN_X, y, CONTENT_W, 34);
+        y += 34 + 18;
+
+        // Separator before 服务连接, or before 翻译行为 when there is none.
+        place(self.behavior_divider, MARGIN_X, y, CONTENT_W, 1);
+        y += 18;
+
+        let selected = SendMessageW(self.provider, CB_GETCURSEL, 0, 0);
+        let advanced = selected == 1 || selected == 2;
+        for (label, edit) in self.azure {
+            show(label, selected == 1);
+            show(edit, selected == 1);
+        }
+        for (label, edit) in self.openai {
+            show(label, selected == 2);
+            show(edit, selected == 2);
+        }
+        show(self.connection_title, advanced);
+        show(self.connection_divider, advanced);
+        show(self.azure_reveal, selected == 1);
+        show(self.openai_reveal, selected == 2);
+
+        if advanced {
+            place(self.connection_title, MARGIN_X, y, 460, 22);
+            y += 28;
+            let rows = if selected == 1 { &self.azure } else { &self.openai };
+            let reveal = if selected == 1 { self.azure_reveal } else { self.openai_reveal };
+            for (row, (label, edit)) in rows.iter().enumerate() {
+                place(*label, MARGIN_X, y + 4, LABEL_W, 22);
+                let width = if row == 2 { SECRET_W } else { FIELD_W };
+                place(*edit, FIELD_X, y, width, 28);
+                if row == 2 { place(reveal, 485, y + 3, 61, 22); }
+                if row < 2 { y += 36; }
+            }
+            y += 28 + 18;
+            place(self.connection_divider, MARGIN_X, y, CONTENT_W, 1);
+            y += 18;
+        }
+
+        place(self.behavior_title, MARGIN_X, y, 460, 22);
+        y += 28;
+        place(self.timeout_label, MARGIN_X, y + 4, LABEL_W, 22);
+        place(self.timeout, FIELD_X, y, 90, 28);
+        place(self.timeout_unit, FIELD_X + 98, y + 4, 140, 22);
+        y += 36;
+        place(self.debounce_label, MARGIN_X, y + 4, LABEL_W, 22);
+        place(self.debounce, FIELD_X, y, 84, 28);
+        place(self.debounce_unit, FIELD_X + 92, y + 4, 60, 22);
+        y += 28 + 14;
+
+        place(self.autostart, MARGIN_X, y, 300, 24);
+        place(self.autostart_help, 336, y + 2, 210, 20);
+        place(self.alt_output, MARGIN_X, y + 30, CONTENT_W, 24);
+        place(self.auto_update, MARGIN_X, y + 60, 380, 24);
+        place(self.update_button, 450, y + 57, 96, 30);
+        y += 57 + 30;
+
+        place(self.footer_divider, MARGIN_X, y + 14, CONTENT_W, 1);
+        y += 14 + 1 + 14;
+        place(self.footer_note, MARGIN_X, y + 8, 320, 20);
+        place(self.cancel_button, 342, y, 84, 32);
+        place(self.save_button, 434, y, 112, 32);
+        y + 32 + 18
+    }
+
+    /// Resizes the frame to the client area the layout needs. Centring happens
+    /// only on first show; provider switches keep the window where the user put it.
+    unsafe fn apply_layout(&self, center: bool) {
+        let client_h = self.layout();
+        let s = |value: i32| value * self.dpi / 96;
+        let mut rect = RECT { left: 0, top: 0, right: s(CLIENT_W), bottom: s(client_h) };
+        AdjustWindowRectEx(&mut rect, WINDOW_STYLE, 0, WINDOW_EX_STYLE);
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        let (x, y) = self.placement(width, height, center);
+        SetWindowPos(self.hwnd, ptr::null_mut(), x, y, width, height,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    unsafe fn placement(&self, width: i32, height: i32, center: bool) -> (i32, i32) {
+        let monitor = if center {
+            let mut cursor = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut cursor);
+            MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST)
+        } else {
+            MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST)
+        };
+        let mut info: MONITORINFO = mem::zeroed();
+        info.cbSize = mem::size_of::<MONITORINFO>() as u32;
+        let work = if !monitor.is_null() && GetMonitorInfoW(monitor, &mut info) != 0
+            && info.rcWork.right > info.rcWork.left && info.rcWork.bottom > info.rcWork.top {
+            info.rcWork
+        } else {
+            RECT { left: 0, top: 0, right: GetSystemMetrics(0), bottom: GetSystemMetrics(1) }
+        };
+        let mut current: RECT = mem::zeroed();
+        GetWindowRect(self.hwnd, &mut current);
+        let (x, y) = if center {
+            (work.left + (work.right - work.left - width) / 2,
+             work.top + (work.bottom - work.top - height) / 2)
+        } else {
+            (current.left, current.top)
+        };
+        // Keep the dialog inside the work area, taskbar included.
+        (x.max(work.left).min((work.right - width).max(work.left)),
+         y.max(work.top).min((work.bottom - height).max(work.top)))
+    }
+
     pub unsafe fn update_provider(&self) {
         let index = SendMessageW(self.provider, CB_GETCURSEL, 0, 0);
         let hint = match index {
@@ -537,49 +912,8 @@ impl SettingsWindow {
             2 => "支持 OpenAI 兼容的 Chat Completions 接口 · 远程 HTTPS／本机 HTTP。",
             _ => "关闭在线翻译 · 不向服务商发送输入文字。",
         };
-        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(self.hint, wide(hint).as_ptr());
-        let advanced = index == 1 || index == 2;
-        for (label, edit) in self.azure {
-            ShowWindow(label, if index == 1 { SW_SHOW } else { SW_HIDE });
-            ShowWindow(edit, if index == 1 { SW_SHOW } else { SW_HIDE });
-        }
-        for (label, edit) in self.openai {
-            ShowWindow(label, if index == 2 { SW_SHOW } else { SW_HIDE });
-            ShowWindow(edit, if index == 2 { SW_SHOW } else { SW_HIDE });
-        }
-        ShowWindow(self.azure_reveal, if index == 1 { SW_SHOW } else { SW_HIDE });
-        ShowWindow(self.openai_reveal, if index == 2 { SW_SHOW } else { SW_HIDE });
-        ShowWindow(self.connection_divider, if advanced { SW_SHOW } else { SW_HIDE });
-        ShowWindow(self.connection_title, if advanced { SW_SHOW } else { SW_HIDE });
-
-        // Preserve current screen location: resize the dialog only, not the IME.
-        let delta = if advanced { 164 } else { 0 };
-        let scaled = |v: i32| v * self.dpi / 96;
-        let move_to = |h: HWND, x: i32, y: i32, w: i32, height: i32| {
-            if !h.is_null() {
-                SetWindowPos(h, ptr::null_mut(), scaled(x), scaled(y), scaled(w), scaled(height),
-                    SWP_NOZORDER | SWP_NOACTIVATE);
-            }
-        };
-        move_to(self.behavior_divider, 26, 205 + delta, 520, 2);
-        move_to(self.behavior_title, 26, 220 + delta, 500, 23);
-        move_to(self.timeout_label, 26, 261 + delta, 132, 24);
-        move_to(self.timeout, 154, 256 + delta, 85, 30);
-        move_to(self.debounce_label, 327, 261 + delta, 110, 24);
-        move_to(self.timeout_unit, 247, 261 + delta, 124, 24);
-        move_to(self.debounce_unit, 501, 261 + delta, 48, 24);
-        move_to(self.debounce, 421, 256 + delta, 75, 30);
-        move_to(self.autostart, 26, 317 + delta, 510, 25);
-        move_to(self.autostart_help, 49, 348 + delta, 492, 23);
-        move_to(self.alt_output, 26, 370 + delta, 510, 25);
-        move_to(self.auto_update, 26, 403 + delta, 330, 25);
-        move_to(self.update_button, 422, 400 + delta, 125, 30);
-        move_to(self.footer_divider, 26, 437 + delta, 520, 2);
-        move_to(self.footer_note, 26, 453 + delta, 328, 23);
-        move_to(self.save_button, 422, 481 + delta, 125, 34);
-        move_to(self.cancel_button, 334, 481 + delta, 78, 34);
-        SetWindowPos(self.hwnd, ptr::null_mut(), 0, 0, scaled(586), scaled(548 + delta),
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
+        SetWindowTextW(self.hint, wide(hint).as_ptr());
+        self.apply_layout(false);
     }
 
     unsafe fn get_text(hwnd: HWND) -> String {
@@ -616,11 +950,15 @@ impl SettingsWindow {
         SendMessageW(self.autostart, BM_SETCHECK, if checked { BST_CHECKED } else { 0 }, 0);
     }
     pub fn base(&self) -> &Path { &self.base }
+
     pub unsafe fn close(self) {
+        // Clear the paint state pointer before children are destroyed.
+        SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
         DestroyWindow(self.hwnd);
         for font in [self.font, self.title_font, self.section_font, self.note_font] {
             if !font.is_null() { DeleteObject(font); }
         }
+        self.theme.release();
     }
 }
 
