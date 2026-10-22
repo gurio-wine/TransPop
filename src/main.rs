@@ -14,6 +14,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 // No desktop scanning. Optional, opt-in Alt text output uses a guarded keyboard hook.
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     env,
     fs::{self, File},
@@ -203,6 +204,11 @@ static LATEST_CORE_HWND: AtomicUsize = AtomicUsize::new(0);
 // This is only a hint; the reader validates it against the current IME list.
 static SELECTED_EVENT_HINT: OnceLock<Mutex<Option<SelectionHint>>> = OnceLock::new();
 static CONFIRMED_FOREGROUND: AtomicUsize = AtomicUsize::new(0);
+// Windows 11 hands the candidate pane to UIA event subscribers but refuses to
+// resolve it from a window handle. Once a pane read straight from an event
+// source has succeeded, stop paying for the handle lookups that cannot work.
+static PANEL_DIRECT: AtomicBool = AtomicBool::new(false);
+static HWND_READ_MISSES: AtomicU32 = AtomicU32::new(0);
 const ACTIVE_RECHECK_INTERVAL: Duration = Duration::from_millis(85);
 // The reader controls its own poll cadence. WM_TIMER is for visual animation only.
 const ACTIVE_RECHECK_WAKE: Duration = Duration::from_millis(40);
@@ -467,12 +473,15 @@ enum LogRecord {
     Line(String),
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct ProbeRequest {
     hwnd: usize,
     foreground: usize,
     epoch: u64,
     active_recheck: bool,
+    // Some when a UIA event delivered the candidate pane itself, as it does on
+    // Windows 11 where ElementFromHandle cannot reach that pane.
+    candidate: Option<Candidate>,
 }
 
 #[derive(Clone, Debug)]
@@ -1038,7 +1047,7 @@ fn set_paused(
             } else { LATEST_CORE_HWND.load(Ordering::Acquire) };
             if hwnd != 0 && foreground != 0 {
                 let _ = probe_tx.send(ProbeRequest {
-                    hwnd, foreground, epoch, active_recheck: false,
+                    hwnd, foreground, epoch, active_recheck: false, candidate: None,
                 });
             }
         }
@@ -1387,15 +1396,16 @@ fn panel_for_hwnd(automation: &UIAutomation, all: &UICondition, hwnd: usize) -> 
     via_pid
 }
 
-fn targeted_candidate(
-    automation: &UIAutomation,
+/// Reads the highlighted candidate out of an already known pane. Event
+/// subscribers can pass their own source element, which is the only reliable
+/// way to reach the pane on Windows 11.
+fn candidate_from_panel(
+    panel: &UIElement,
     all: &UICondition,
-    hwnd: usize,
     hint: Option<&SelectionHint>,
 ) -> Result<Option<Candidate>, String> {
-    let Some(panel) = panel_for_hwnd(automation, all, hwnd) else { return Ok(None); };
     if panel.is_offscreen().unwrap_or(false) { return Ok(None); }
-    let Some((text, selection_index, selection_source)) = selected_candidate(&panel, all, hint)? else { return Ok(None); };
+    let Some((text, selection_index, selection_source)) = selected_candidate(panel, all, hint)? else { return Ok(None); };
     let rect = panel.get_bounding_rectangle()
         .map_err(|e| format!("panel_bounds: {e}"))?;
     let (left, top, right, bottom) = (
@@ -1408,6 +1418,40 @@ fn targeted_candidate(
     Ok(Some(Candidate {
         text: text.chars().take(100).collect(), selection_index, selection_source, left, top, right, bottom,
     }))
+}
+
+fn targeted_candidate(
+    automation: &UIAutomation,
+    all: &UICondition,
+    hwnd: usize,
+    hint: Option<&SelectionHint>,
+) -> Result<Option<Candidate>, String> {
+    let Some(panel) = panel_for_hwnd(automation, all, hwnd) else { return Ok(None); };
+    candidate_from_panel(&panel, all, hint)
+}
+
+/// Reads the pane that an IME event delivered. Returns nothing when no pane is
+/// cached yet or it exposes no candidate; the caller then falls back to the
+/// window-handle lookup that Windows 10 serves well.
+fn read_cached_panel(
+    cache: &RefCell<Option<UIElement>>,
+    all: &UICondition,
+    hint: Option<&SelectionHint>,
+    log_tx: &Sender<LogRecord>,
+) -> Option<Candidate> {
+    let cached = cache.borrow();
+    let panel = cached.as_ref()?;
+    match candidate_from_panel(panel, all, hint) {
+        Ok(Some(candidate)) => {
+            PANEL_DIRECT.store(true, Ordering::Release);
+            Some(candidate)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            log_line(log_tx, format!("PANEL_DIRECT_ERROR stage={e}"));
+            None
+        }
+    }
 }
 
 fn candidate_worker(
@@ -1478,7 +1522,11 @@ fn candidate_worker(
         while let Ok(newer) = rx.try_recv() { incoming = Some(newer); }
         if !TRANSLATION_PAUSED.load(Ordering::Acquire)
             && MENU_OPEN.load(Ordering::Acquire)
-            && last_recheck.elapsed() >= ACTIVE_RECHECK_INTERVAL {
+            && last_recheck.elapsed() >= ACTIVE_RECHECK_INTERVAL
+            // Windows 11 cannot resolve the pane from a window handle. Keep
+            // polling only while that path works or has not been disproved.
+            && !(PANEL_DIRECT.load(Ordering::Acquire)
+                && HWND_READ_MISSES.load(Ordering::Acquire) >= 3) {
             let foreground = unsafe { GetForegroundWindow() } as usize;
             let confirmed = CONFIRMED_IME_HWND.load(Ordering::Acquire);
             let confirmed_fg = CONFIRMED_FOREGROUND.load(Ordering::Acquire);
@@ -1492,7 +1540,7 @@ fn candidate_worker(
                 // This also catches same-position, same-length candidate changes.
                 incoming = Some(ProbeRequest {
                     hwnd, foreground, epoch: CANDIDATE_EPOCH.load(Ordering::Acquire),
-                    active_recheck: true,
+                    active_recheck: true, candidate: None,
                 });
             }
             last_recheck = Instant::now();
@@ -1512,11 +1560,13 @@ fn candidate_worker(
         let Some(request) = incoming else { continue; };
         if TRANSLATION_PAUSED.load(Ordering::Acquire)
             || request.epoch != CANDIDATE_EPOCH.load(Ordering::Acquire) { continue; }
-        if recent.get(&request.hwnd).is_some_and(|at| at.elapsed() < Duration::from_millis(50)) {
-            continue;
+        if request.candidate.is_none() {
+            if recent.get(&request.hwnd).is_some_and(|at| at.elapsed() < Duration::from_millis(50)) {
+                continue;
+            }
+            recent.insert(request.hwnd, Instant::now());
+            if recent.len() > 80 { recent.retain(|_, at| at.elapsed() < Duration::from_secs(3)); }
         }
-        recent.insert(request.hwnd, Instant::now());
-        if recent.len() > 80 { recent.retain(|_, at| at.elapsed() < Duration::from_secs(3)); }
         if request.active_recheck { active_checks += 1; }
         let start = Instant::now();
         // Copy under the lock, then drop it before any cross-process UIA work.
@@ -1526,15 +1576,24 @@ fn candidate_worker(
                 && value.foreground == request.foreground
                 && MENU_OPEN.load(Ordering::Acquire)
                 && value.observed.elapsed() < Duration::from_secs(30));
-        match targeted_candidate(&automation, &all, request.hwnd, hint.as_ref()) {
+        let direct = request.candidate.is_some();
+        let read = match request.candidate {
+            Some(candidate) => Ok(Some(candidate)),
+            None => targeted_candidate(&automation, &all, request.hwnd, hint.as_ref()),
+        };
+        match read {
             Ok(Some(candidate)) => {
                 if TRANSLATION_PAUSED.load(Ordering::Acquire) { continue; }
                 // A late COM return must NOT resurrect an already closed IME menu.
                 if request.epoch != CANDIDATE_EPOCH.load(Ordering::Acquire) { continue; }
                 // Keep the confirmed handle while the composition is alive;
                 // a timer may now verify this exact window without an event.
-                CONFIRMED_IME_HWND.store(request.hwnd, Ordering::Release);
-                CONFIRMED_FOREGROUND.store(request.foreground, Ordering::Release);
+                if !direct {
+                    // The handle path verified this window; rechecks may poll it.
+                    CONFIRMED_IME_HWND.store(request.hwnd, Ordering::Release);
+                    CONFIRMED_FOREGROUND.store(request.foreground, Ordering::Release);
+                    HWND_READ_MISSES.store(0, Ordering::Release);
+                }
                 MENU_OPEN.store(true, Ordering::Release);
                 consecutive_misses = 0;
                 if request.active_recheck { active_found += 1; }
@@ -1597,24 +1656,40 @@ fn candidate_worker(
             }
             Ok(None) => {
                 if request.active_recheck { active_misses += 1; }
-                consecutive_misses += 1;
-                if last_miss_log.elapsed() >= Duration::from_secs(1) {
-                    log_line(&log_tx, format!(
-                        "TARGETED_NOT_FOUND hwnd=0x{:X} read_ms={}",
-                        request.hwnd, start.elapsed().as_millis()
-                    ));
-                    last_miss_log = Instant::now();
+                if direct {
+                    // The pane arrived with the event but had nothing readable
+                    // yet; the next selection event retries.
+                    if last_miss_log.elapsed() >= Duration::from_secs(1) {
+                        log_line(&log_tx, format!("DIRECT_NOT_READY read_ms={}",
+                            start.elapsed().as_millis()));
+                        last_miss_log = Instant::now();
+                    }
+                } else {
+                    consecutive_misses += 1;
+                    HWND_READ_MISSES.fetch_add(1, Ordering::AcqRel);
+                    if last_miss_log.elapsed() >= Duration::from_secs(1) {
+                        log_line(&log_tx, format!(
+                            "TARGETED_NOT_FOUND hwnd=0x{:X} read_ms={}",
+                            request.hwnd, start.elapsed().as_millis()
+                        ));
+                        last_miss_log = Instant::now();
+                    }
                 }
             }
             Err(e) => {
                 if request.active_recheck { active_misses += 1; }
-                consecutive_misses += 1;
-                if last_miss_log.elapsed() >= Duration::from_secs(1) {
-                    log_line(&log_tx, format!(
-                        "TARGETED_ERROR hwnd=0x{:X} stage={e} read_ms={}",
-                        request.hwnd, start.elapsed().as_millis()
-                    ));
-                    last_miss_log = Instant::now();
+                if direct {
+                    log_line(&log_tx, format!("DIRECT_ERROR stage={e}"));
+                } else {
+                    consecutive_misses += 1;
+                    HWND_READ_MISSES.fetch_add(1, Ordering::AcqRel);
+                    if last_miss_log.elapsed() >= Duration::from_secs(1) {
+                        log_line(&log_tx, format!(
+                            "TARGETED_ERROR hwnd=0x{:X} stage={e} read_ms={}",
+                            request.hwnd, start.elapsed().as_millis()
+                        ));
+                        last_miss_log = Instant::now();
+                    }
                 }
             }
         }
@@ -1622,6 +1697,7 @@ fn candidate_worker(
         // confirmed misses, discard the old translation rather than leaving
         // an unrelated English bubble on screen forever.
         if request.active_recheck && consecutive_misses >= 8
+            && !PANEL_DIRECT.load(Ordering::Acquire)
             && MENU_OPEN.load(Ordering::Acquire) {
             MENU_OPEN.store(false, Ordering::Release);
             clear_selection_hint();
@@ -1653,9 +1729,19 @@ fn uia_event_worker(
         Ok(value) => value,
         Err(e) => { log_line(&log_tx, format!("UIA_EVENT_ROOT_ERROR {e}")); return; }
     };
+    // Only the pane delivered by a matching event is ever traversed below.
+    let all = match automation.create_true_condition() {
+        Ok(value) => value,
+        Err(e) => { log_line(&log_tx, format!("UIA_EVENT_CONDITION_ERROR {e}")); return; }
+    };
     let cb_log = log_tx.clone();
     let cb_ui = ui_tx.clone();
     let cb_probe = probe_tx.clone();
+    let cb_all = all.clone();
+    // The pane delivered by the last IME MenuOpened event. Windows 11 exposes
+    // it to subscribers but not through ElementFromHandle, so event callbacks
+    // read it directly instead of asking the reader to re-resolve the window.
+    let panel_cache: RefCell<Option<UIElement>> = RefCell::new(None);
     let callback: Box<CustomEventHandlerFn> = Box::new(move |sender, event| {
         // The event source is already a small IME pane. Never traverse a UIA tree here.
         let id = sender.get_automation_id().unwrap_or_default();
@@ -1678,21 +1764,23 @@ fn uia_event_worker(
                 "UIA_SELECTION_EVENT type={event_type:?} name_chars={} bounds={} accepted={plausible}",
                 name.chars().count(), bounds.is_some()));
             if plausible {
+                let hint = SelectionHint {
+                    text: name.clone(), foreground,
+                    epoch: CANDIDATE_EPOCH.load(Ordering::Acquire),
+                    bounds, observed: Instant::now(),
+                };
+                let direct = read_cached_panel(&panel_cache, &cb_all, Some(&hint), &cb_log);
                 if let Ok(mut slot) = selection_hint_lock().lock() {
-                    *slot = Some(SelectionHint {
-                        text: name.clone(), foreground,
-                        epoch: CANDIDATE_EPOCH.load(Ordering::Acquire),
-                        bounds, observed: Instant::now(),
-                    });
+                    *slot = Some(hint);
                 }
                 let confirmed = CONFIRMED_IME_HWND.load(Ordering::Acquire);
                 let hwnd = if confirmed != 0 { confirmed } else {
                     LATEST_CORE_HWND.load(Ordering::Acquire)
                 };
-                if hwnd != 0 {
+                if hwnd != 0 || direct.is_some() {
                     let _ = cb_probe.send(ProbeRequest {
                         hwnd, foreground, epoch: CANDIDATE_EPOCH.load(Ordering::Acquire),
-                        active_recheck: false,
+                        active_recheck: false, candidate: direct,
                     });
                 }
             }
@@ -1702,6 +1790,10 @@ fn uia_event_worker(
             if event == UIEventType::MenuOpened {
                 clear_selection_hint();
                 MENU_OPEN.store(true, Ordering::Release);
+                // The event source is the candidate pane on Windows 11; keep it
+                // so later selection events can read it without a window handle.
+                *panel_cache.borrow_mut() = Some(sender.clone());
+                let direct = read_cached_panel(&panel_cache, &cb_all, None, &cb_log);
                 // The first opening event may precede a WinEvent. Probe the
                 // previously observed CoreWindow once, and keep active checks
                 // gated on the menu state until a matching MenuClosed arrives.
@@ -1709,15 +1801,16 @@ fn uia_event_worker(
                 let hwnd = if hwnd != 0 { hwnd } else {
                     LATEST_CORE_HWND.load(Ordering::Acquire)
                 };
-                if hwnd != 0 {
+                if hwnd != 0 || direct.is_some() {
                     let foreground = unsafe { GetForegroundWindow() } as usize;
                     let _ = cb_probe.send(ProbeRequest {
                         hwnd, foreground, epoch: CANDIDATE_EPOCH.load(Ordering::Acquire),
-                        active_recheck: false,
+                        active_recheck: false, candidate: direct,
                     });
                 }
             } else if event == UIEventType::MenuClosed {
                 IME_MENU_CLOSE_SEQ.fetch_add(1, Ordering::AcqRel);
+                *panel_cache.borrow_mut() = None;
                 MENU_OPEN.store(false, Ordering::Release);
                 clear_ready_translation();
                 cancel_pending_unless_cancel_sent();
@@ -1800,7 +1893,7 @@ fn log_worker(
                     let request = ProbeRequest {
                         hwnd: n.hwnd, foreground: n.foreground,
                         epoch: CANDIDATE_EPOCH.load(Ordering::Acquire),
-                        active_recheck: false,
+                        active_recheck: false, candidate: None,
                     };
                     if probe_tx.send(request).is_err() {
                         format!("PROBE_CHANNEL_CLOSED hwnd=0x{:X}", n.hwnd)
