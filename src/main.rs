@@ -46,8 +46,9 @@ use uiautomation::{
 use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, HANDLE, HWND, POINT, RECT, ERROR_ALREADY_EXISTS},
     Graphics::Gdi::{
-        CreateFontW, CreateRoundRectRgn, DeleteObject, DrawTextW, GetDC,
-        GetDeviceCaps, ReleaseDC, SelectObject, SetWindowRgn, HFONT,
+        CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, GetDC,
+        GetDeviceCaps, InvalidateRect, ReleaseDC, SelectObject, SetBkColor, SetBkMode,
+        SetTextColor, SetWindowRgn, HBRUSH, HFONT,
     },
     System::LibraryLoader::GetModuleHandleW,
     UI::{
@@ -62,24 +63,24 @@ use windows_sys::Win32::{
             KEYEVENTF_UNICODE, KEYEVENTF_KEYUP, VK_LMENU, VK_ESCAPE,
         },
         WindowsAndMessaging::{
-            AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+            AppendMenuW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
             DestroyWindow, DispatchMessageW, FindWindowW,
             GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW,
             GetSystemMetrics, LoadIconW, RegisterClassW, RegisterWindowMessageW,
             IsDialogMessageW, IsWindow, KillTimer, PostMessageW, SendMessageW, SetForegroundWindow,
             SetLayeredWindowAttributes,
-            SetProcessDPIAware, SetTimer, SetWindowPos, SetWindowTextW,
+            SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
             ShowWindow, TrackPopupMenu, TranslateMessage, MSG, WNDCLASSW,
             EVENT_OBJECT_HIDE, EVENT_OBJECT_IME_CHANGE, EVENT_OBJECT_IME_HIDE,
             EVENT_OBJECT_IME_SHOW, EVENT_OBJECT_LOCATIONCHANGE,
             EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SELECTION, EVENT_OBJECT_SHOW,
-            HWND_TOPMOST, LWA_ALPHA, MF_SEPARATOR, MF_STRING,
+            GWLP_WNDPROC, HWND_TOPMOST, LWA_ALPHA, MF_SEPARATOR, MF_STRING,
             SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
             SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SWP_NOACTIVATE,
             SWP_SHOWWINDOW,
             TPM_RETURNCMD, TPM_RIGHTBUTTON, WINEVENT_OUTOFCONTEXT,
             WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CONTEXTMENU, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-            WM_NULL, WM_RBUTTONUP,
+            WM_CTLCOLOREDIT, WM_NULL, WM_RBUTTONUP,
             WM_HOTKEY, WM_TIMER, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
             SetWindowsHookExW, UnhookWindowsHookEx, CallNextHookEx, WH_KEYBOARD_LL,
             KBDLLHOOKSTRUCT, LLKHF_INJECTED,
@@ -123,10 +124,10 @@ fn acquire_instance() -> Result<Option<InstanceGuard>, u32> {
 }
 
 // Keep the stable system-controlled HWND approach: EDIT owns painting and
-// wrapping, so no custom window procedure runs inside a user callback.
-// EDIT is white by default, supports multiline word wrapping and a formatting
-// rectangle for true horizontal/vertical padding. WS_EX_NOACTIVATE and
-// click-through prevent it from becoming an input target.
+// wrapping, supports multiline word wrapping and a formatting rectangle for
+// true horizontal/vertical padding. One thin subclass answers WM_CTLCOLOREDIT
+// so the bubble can follow the app theme; it never draws anything itself.
+// WS_EX_NOACTIVATE and click-through prevent it from becoming an input target.
 const STATIC_CLASS: &str = "STATIC";
 const BUBBLE_CLASS: &str = "EDIT";
 const CONTROL_TITLE: &str = "TransPop-Event-Bubble-Control-042"; // Preserve --quit contract.
@@ -145,6 +146,7 @@ const ES_MULTILINE: u32 = 0x0004;
 const SS_BLACKRECT: u32 = 0x0004;
 const WM_SETFONT: u32 = 0x0030;
 const EM_SETRECT: u32 = 0x00B3;
+const TRANSPARENT: i32 = 1;
 const DT_CALCRECT: u32 = 0x0400;
 const DT_SINGLELINE: u32 = 0x0020;
 const DT_WORDBREAK: u32 = 0x0010;
@@ -178,6 +180,13 @@ static LOG_TX: OnceLock<Sender<LogRecord>> = OnceLock::new();
 static UI_RX: OnceLock<Mutex<Receiver<OverlayMessage>>> = OnceLock::new();
 static UI_STATE: OnceLock<Mutex<OverlayState>> = OnceLock::new();
 static OVERLAY_HWND: AtomicIsize = AtomicIsize::new(0);
+// Bubble surface and text colours, so the overlay follows the app theme. The
+// brush is owned here and replaced (old one deleted) on every theme change.
+static BUBBLE_BG: AtomicU32 = AtomicU32::new(0x00FFFFFF);
+static BUBBLE_FG: AtomicU32 = AtomicU32::new(0x00202020);
+static BUBBLE_BRUSH: AtomicIsize = AtomicIsize::new(0);
+// Original EDIT window procedure, restored through CallWindowProcW.
+static BUBBLE_OLD_PROC: AtomicIsize = AtomicIsize::new(0);
 static CONTROL_HWND: AtomicIsize = AtomicIsize::new(0);
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 static CANDIDATE_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -2219,6 +2228,50 @@ fn rounded(hwnd: HWND, width: i32, height: i32, diameter: i32) {
     }
 }
 
+type WndProcFn = unsafe extern "system" fn(HWND, u32, usize, isize) -> isize;
+
+// The bubble stays a stock EDIT control: it owns wrapping, scrolling and the
+// caret-less layout, and nothing custom paints it. Only the colour messages are
+// intercepted, which is why this is a subclass and not a hand-drawn window.
+unsafe extern "system" fn bubble_proc(
+    hwnd: HWND, message: u32, wparam: usize, lparam: isize,
+) -> isize {
+    if message == WM_CTLCOLOREDIT {
+        let dc = wparam as *mut core::ffi::c_void;
+        let brush = BUBBLE_BRUSH.load(Ordering::Acquire) as HBRUSH;
+        if !dc.is_null() && !brush.is_null() {
+            SetBkColor(dc, BUBBLE_BG.load(Ordering::Acquire));
+            SetTextColor(dc, BUBBLE_FG.load(Ordering::Acquire));
+            SetBkMode(dc, TRANSPARENT);
+            return brush as isize;
+        }
+    }
+    let old = BUBBLE_OLD_PROC.load(Ordering::Acquire);
+    if old != 0 {
+        let previous: WndProcFn = mem::transmute(old);
+        return CallWindowProcW(Some(previous), hwnd, message, wparam, lparam);
+    }
+    DefWindowProcW(hwnd, message, wparam, lparam)
+}
+
+/// Re-read the theme and repaint the bubble. Cheap enough to call on every
+/// settings save; the old brush is deleted only after the new one exists.
+fn apply_bubble_theme(bubble: HWND, base: &Path) {
+    let (bg, fg) = settings::bubble_colors(base);
+    let brush = unsafe { CreateSolidBrush(bg) };
+    if brush.is_null() { return; }
+    let previous = BUBBLE_BRUSH.swap(brush as isize, Ordering::AcqRel);
+    BUBBLE_BG.store(bg, Ordering::Release);
+    BUBBLE_FG.store(fg, Ordering::Release);
+    log_global(format!("BUBBLE_THEME bg=0x{bg:06X} fg=0x{fg:06X}"));
+    unsafe {
+        if !bubble.is_null() {
+            InvalidateRect(bubble, ptr::null(), 1);
+        }
+        if previous != 0 { DeleteObject(previous as *mut core::ffi::c_void); }
+    }
+}
+
 // The bubble follows actual text metrics, with no arbitrary min/max width.
 // A screen-boundary guard is still necessary to prevent off-screen clipping;
 // only text wider than the virtual desktop is wrapped.
@@ -2697,6 +2750,10 @@ fn main() {
             return;
         }
         if !font.is_null() { SendMessageW(hwnd, WM_SETFONT, font as usize, 0); }
+        // Subclass only to answer WM_CTLCOLOREDIT; painting stays native.
+        let old_proc = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, bubble_proc as *const () as isize);
+        if old_proc != 0 { BUBBLE_OLD_PROC.store(old_proc, Ordering::Release); }
+        apply_bubble_theme(hwnd, &base);
         OVERLAY_HWND.store(hwnd as isize, Ordering::Release);
         SetLayeredWindowAttributes(hwnd, 0, 250, LWA_ALPHA);
         log_line(&log_tx, format!("BUBBLE_READY native EDIT, adaptive wrap, rounded, shadow={} dpi={dpi}",
@@ -2912,6 +2969,9 @@ fn main() {
                                 CANDIDATE_EPOCH.fetch_add(1, Ordering::AcqRel);
                                 TRANSLATION_SERIAL.fetch_add(1, Ordering::AcqRel);
                                 clear_selection_hint();
+                                // The theme may have just changed; repaint the bubble
+                                // now instead of waiting for the next candidate.
+                                apply_bubble_theme(hwnd, &base);
                                 if let Some(cell) = UI_STATE.get() {
                                     if let Ok(mut state) = cell.lock() {
                                         state.visible = false;
@@ -3041,6 +3101,8 @@ fn main() {
         if IsWindow(hwnd) != 0 { DestroyWindow(hwnd); }
         if !shadow.is_null() && IsWindow(shadow) != 0 { DestroyWindow(shadow); }
         if !font.is_null() { DeleteObject(font); }
+        let brush = BUBBLE_BRUSH.swap(0, Ordering::AcqRel);
+        if brush != 0 { DeleteObject(brush as *mut core::ffi::c_void); }
         if IsWindow(control) != 0 { DestroyWindow(control); }
     }
     log_line(&log_tx, format!("TransPop v{VERSION} stopped"));

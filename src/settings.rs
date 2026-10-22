@@ -213,6 +213,17 @@ unsafe fn apps_use_light_theme() -> bool {
     status != 0 || value != 0
 }
 
+/// Surface and text colours for the translation bubble, so the overlay
+/// follows the same palette as the window. The bubble sits over arbitrary
+/// desktop content, so dark mode lifts it to the field tone instead of the
+/// window tone.
+pub(crate) fn bubble_colors(base: &Path) -> (u32, u32) {
+    let palette = unsafe { Palette::detect(base) };
+    let colors = unsafe { palette.colors() };
+    let bg = if palette == Palette::Dark { colors.field } else { colors.bg };
+    (bg, colors.text)
+}
+
 /// A flat selector: the stock combo box paints a light field and a white
 /// arrow that no theme call fixes on Windows 10, so the choice is drawn as a
 /// plain row and the options come from a native popup menu instead.
