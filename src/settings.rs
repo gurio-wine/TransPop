@@ -982,7 +982,7 @@ pub const MANUAL_UPDATE_INTERVAL: u32 = 0;
 pub const DEFAULT_UPDATE_INTERVAL: u32 = 30;
 
 /// Shortcut that pastes the translation instead of the Chinese candidate.
-pub const DEFAULT_SHORTCUT: &str = "lalt";
+pub const DEFAULT_SHORTCUT: &str = "tab";
 
 /// Modifier bits of a shortcut spec, in the order the label prints them.
 pub const MOD_CTRL: u8 = 1;
@@ -1470,7 +1470,7 @@ update_interval_minutes=30\n\
 # alt_output_shortcut holds one or more shortcuts separated by commas; each is\n\
 # pressed once (no chord) to paste the translation instead of the Chinese\n\
 # candidate. Write none to disable it.\n\
-alt_output_shortcut=lalt\n\
+alt_output_shortcut=tab\n\
 theme=system\n";
         let _ = fs::OpenOptions::new().write(true).create_new(true).open(&path)
             .and_then(|mut file| file.write_all(sample.as_bytes()));
@@ -1882,7 +1882,7 @@ impl SettingsWindow {
         selects.push(Select { hwnd: theme_picker as isize, items: theme_items, index: theme_pos });
         // No Save button and no footer: every change applies at once and the
         // caption bar already closes the window.
-        let shortcut_caption = create("STATIC", "输入英文", 0, 0);
+        let shortcut_caption = create("STATIC", "翻译上屏", 0, 0);
         set_font(shortcut_caption, section_font);
         // Shortcuts are captured from the real keyboard: each row is a
         // read-only field that swallows the next key press, and the "+" button
@@ -2468,7 +2468,7 @@ mod tests {
     }
 
     #[test]
-    fn theme_defaults_to_system_and_the_shortcut_defaults_to_left_alt() {
+    fn theme_defaults_to_system_and_the_shortcut_defaults_to_tab() {
         let base = temp_base("defaults");
         fs::create_dir_all(&base).unwrap();
         let file = ConfigFile::read(&base);
