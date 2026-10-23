@@ -27,7 +27,7 @@ use windows_sys::Win32::{
         Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
         Controls::{SetWindowTheme, DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_SELECTED,
             ODT_MENU},
-        Shell::{DefSubclassProc, SetWindowSubclass, ShellExecuteW},
+        Shell::{DefSubclassProc, SetWindowSubclass},
         Input::KeyboardAndMouse::{
             GetKeyState, MapVirtualKeyW, SetFocus, MAPVK_VSC_TO_VK_EX, VK_CONTROL,
             VK_ESCAPE,
@@ -42,7 +42,7 @@ use windows_sys::Win32::{
             ShowWindow, SystemParametersInfoW, TrackPopupMenu, BN_CLICKED, DM_GETDEFID,
             GWLP_USERDATA, MENUINFO, MF_OWNERDRAW, MIM_BACKGROUND,
             SPI_GETHIGHCONTRAST, SW_HIDE, SW_SHOW, SW_SHOWNA,
-            SW_SHOWNORMAL, SWP_NOACTIVATE,
+            SWP_NOACTIVATE,
             SWP_NOZORDER, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN, WM_CHAR,
             WM_CLOSE, WM_COMMAND, WM_DRAWITEM, WM_GETFONT, WM_KEYUP, WM_KILLFOCUS, WM_MEASUREITEM,
             WM_PAINT,
@@ -69,7 +69,6 @@ const ID_SHORTCUT_KEY: u16 = 4109;
 const ID_THEME: u16 = 4111;
 const ID_UPDATE_INTERVAL: u16 = 4112;
 const ID_AUTO_INSTALL: u16 = 4113;
-const ID_OPEN_REPO: u16 = 4114;
 const ID_SHORTCUT_ADD: u16 = 4115;
 const ID_AUTO_RESTART: u16 = 4116;
 // One owner-drawn button per tab, in display order.
@@ -931,13 +930,6 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
                 if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SHORTCUT, 0, 0); }
                 return 0;
             }
-            // The project block only links out; nothing here is persisted.
-            if notify as u32 == BN_CLICKED && id == ID_OPEN_REPO {
-                let url = wide("https://github.com/gurio-wine/TransPop");
-                ShellExecuteW(hwnd, ptr::null(), url.as_ptr(), ptr::null(), ptr::null(),
-                    SW_SHOWNORMAL);
-                return 0;
-            }
             // Save-on-change: every committed edit reports the same message the
             // Save button used to send, so the main loop keeps one apply path.
             let committed = notify == EN_KILLFOCUS;
@@ -1674,7 +1666,6 @@ pub struct SettingsWindow {
     service_divider: HWND,
     provider: HWND,
     connection_title: HWND,
-    connection_divider: HWND,
     azure: [(HWND, HWND); 3],
     openai: [(HWND, HWND); 3],
     azure_reveal: HWND,
@@ -1697,15 +1688,14 @@ pub struct SettingsWindow {
     update_intervals: Vec<u32>,
     update_button: HWND,
     startup_title: HWND,
-    project_title: HWND,
+
     update_title: HWND,
     version_label: HWND,
     interval_caption: HWND,
     theme_label: HWND,
     theme_picker: HWND,
     tabs: [HWND; 5],
-    about_text: HWND,
-    open_repo: HWND,
+
 }
 
 impl SettingsWindow {
@@ -1802,7 +1792,6 @@ impl SettingsWindow {
         selects.push(Select { hwnd: provider as isize, items: provider_items, index: provider_index });
 
         // Service connection; only visible for providers that need credentials.
-        let connection_divider = create("STATIC", "", 0, 0);
         let connection_title = create("STATIC", "服务连接", 0, 0);
         set_font(connection_title, section_font);
         let field = |label: &str, value: &str, secret_id: u16| -> (HWND, HWND) {
@@ -1877,10 +1866,7 @@ impl SettingsWindow {
         let update_button = create("BUTTON", "检查更新", ID_UPDATE, BS_OWNERDRAW | WS_TABSTOP);
         let startup_title = create("STATIC", "启动", 0, 0);
         set_font(startup_title, section_font);
-        // About page: a project block and an update block, nothing else.
-        let project_title = create("STATIC", "项目", 0, 0);
-        set_font(project_title, section_font);
-        let open_repo = create("BUTTON", "打开仓库", ID_OPEN_REPO, BS_OWNERDRAW | WS_TABSTOP);
+        // About page: the update block, nothing else.
         let update_title = create("STATIC", "更新", 0, 0);
         set_font(update_title, section_font);
         let version_label = create("STATIC", &format!("当前版本 v{}", super::VERSION), 0, 0);
@@ -1915,8 +1901,6 @@ impl SettingsWindow {
         reset_rows(shortcut_rows);
         CAPTURE.with(|c| c.borrow_mut().pending = None);
         let shortcut_add = create("BUTTON", "", ID_SHORTCUT_ADD, BS_OWNERDRAW | WS_TABSTOP);
-        let about_text = create("STATIC",
-            "仓库：github.com/gurio-wine/TransPop\r\n许可：MIT", 0, 0);
 
         // A slightly inset caret keeps addresses off the field frame.
         let pad = scale(8);
@@ -1928,7 +1912,7 @@ impl SettingsWindow {
             }
         }
         // Which statics are secondary text and which are hairlines.
-        for control in [service_divider, connection_divider, behavior_divider] {
+        for control in [service_divider, behavior_divider] {
             (*theme_ptr).lines.push(control as isize);
         }
         (*theme_ptr).selects = selects;
@@ -1939,7 +1923,7 @@ impl SettingsWindow {
         }
         // Plain owner-drawn buttons: the two action buttons and the two
         // "显示" toggles beside the key fields.
-        for button in [update_button, open_repo, azure_reveal, openai_reveal] {
+        for button in [update_button, azure_reveal, openai_reveal] {
             (*theme_ptr).buttons.push(button as isize);
         }
         for row in shortcut_keys { (*theme_ptr).shortcut_rows.push(row as isize); }
@@ -1951,15 +1935,14 @@ impl SettingsWindow {
 
         let this = Self { hwnd, base, dpi, font, title_font, section_font, note_font, theme,
             brand_mark: mark, heading, service_title, service_divider, provider,
-            connection_title, connection_divider, azure, openai, azure_reveal, openai_reveal,
+            connection_title, azure, openai, azure_reveal, openai_reveal,
             behavior_title, behavior_divider, timeout_label, timeout, timeout_unit,
             debounce_label, debounce, debounce_unit, autostart,
             shortcut_label: shortcut_caption, shortcut_keys, shortcut_add,
             auto_install, auto_restart, update_interval, update_intervals: intervals,
-            update_button, startup_title, project_title, update_title, version_label,
+            update_button, startup_title, update_title, version_label,
             interval_caption, theme_label, theme_picker,
-            tabs: [tab_translate, tab_appearance, tab_system, tab_shortcut, tab_about],
-            about_text, open_repo };
+            tabs: [tab_translate, tab_appearance, tab_system, tab_shortcut, tab_about] };
         this.apply_layout(true);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
@@ -2084,19 +2067,15 @@ impl SettingsWindow {
                 top + last as i32 * (CONTROL_H + SHORTCUT_GAP), SHORTCUT_ADD_W, CONTROL_H);
         }
 
-        // About page: a project block (repo, licence, one button) and an
-        // update block (version, check button, interval, install switch).
-        place(self.project_title, MARGIN_X, top, 460, 22);
-        place(self.about_text, MARGIN_X, top + 28, CONTENT_W, 56);
-        place(self.open_repo, MARGIN_X, top + 90, 112, CONTROL_H);
-        place(self.connection_divider, MARGIN_X, top + 138, CONTENT_W, 1);
-        place(self.update_title, MARGIN_X, top + 156, 460, 22);
-        place(self.version_label, MARGIN_X, top + 184, 200, 22);
-        place(self.update_button, MARGIN_X, top + 212, 112, CONTROL_H);
-        place(self.interval_caption, MARGIN_X, top + 252, LABEL_W, 22);
-        place(self.update_interval, FIELD_X, top + 248, 160, CONTROL_H);
-        place(self.auto_install, MARGIN_X, top + 286, CONTENT_W, 24);
-        place(self.auto_restart, MARGIN_X, top + 314, CONTENT_W, 24);
+        // About page: the update block (version, check button, interval,
+        // install switches).
+        place(self.update_title, MARGIN_X, top, 460, 22);
+        place(self.version_label, MARGIN_X, top + 28, 200, 22);
+        place(self.update_button, MARGIN_X, top + 56, 112, CONTROL_H);
+        place(self.interval_caption, MARGIN_X, top + 96, LABEL_W, 22);
+        place(self.update_interval, FIELD_X, top + 92, 160, CONTROL_H);
+        place(self.auto_install, MARGIN_X, top + 130, CONTENT_W, 24);
+        place(self.auto_restart, MARGIN_X, top + 158, CONTENT_W, 24);
 
         for control in [self.service_title, self.provider] { show(control, translating); }
         for (label, edit) in self.azure {
@@ -2122,9 +2101,8 @@ impl SettingsWindow {
         let rows = self.visible_shortcuts();
         for row in self.shortcut_keys { show(row, shortcuts && rows.contains(&row)); }
         show(self.shortcut_add, shortcuts && rows.len() < MAX_SHORTCUTS);
-        for control in [self.project_title, self.about_text, self.open_repo,
-                        self.connection_divider, self.update_title, self.version_label,
-                        self.update_button, self.interval_caption, self.update_interval,
+        for control in [self.update_title, self.version_label, self.update_button,
+                        self.interval_caption, self.update_interval,
                         self.auto_install, self.auto_restart] {
             show(control, about);
         }
