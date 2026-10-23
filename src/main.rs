@@ -173,6 +173,7 @@ const ICON_PAUSED_RESOURCE: usize = 2;
 const TRAY_MENU_TOGGLE: u32 = 3001;
 const TRAY_MENU_SETTINGS: u32 = 3003;
 const WM_APP_SETTINGS: u32 = WM_APP + 23;
+const WM_APP_COMMIT: u32 = WM_APP + 24;
 const TRAY_MENU_EXIT: u32 = 3002;
 const TRAY_MENU_UPDATE: u32 = 3004;
 const TIMER_ID: usize = 1;
@@ -180,6 +181,8 @@ const EXIT_HOTKEY_ID: i32 = 0x4341;
 const GCS_COMPSTR: u32 = 0x0008;
 // Keep a generous window for a physically tapped left Alt; held keys never fire.
 const ALT_TAP_MAX: Duration = Duration::from_millis(500);
+// A queued commit must fire quickly; anything older is a stale keystroke.
+const ALT_COMMIT_MAX: Duration = Duration::from_millis(300);
 
 static START: OnceLock<Instant> = OnceLock::new();
 static LOG_TX: OnceLock<Sender<LogRecord>> = OnceLock::new();
@@ -222,8 +225,6 @@ static PHYSICAL_KEY_EVENTS: AtomicU64 = AtomicU64::new(0);
 // Candidate text can change in-place without any WinEvent. While the menu
 // is open, recheck ONLY the already identified CoreWindow (never the desktop).
 static MENU_OPEN: AtomicBool = AtomicBool::new(false);
-// Only a matched IME panel MenuClosed event confirms the Escape transition.
-static IME_MENU_CLOSE_SEQ: AtomicU64 = AtomicU64::new(0);
 // Pausing never changes the IME or intercepts keystrokes. Network responses
 // that were already in flight are ignored after pause.
 static TRANSLATION_PAUSED: AtomicBool = AtomicBool::new(false);
@@ -286,10 +287,8 @@ struct AltGesture {
     allowed: u32,
 }
 struct PendingCommit {
-    translation: ReadyTranslation, focus: usize, started: Instant, stage: u8,
+    translation: ReadyTranslation, focus: usize, started: Instant,
     input_generation: u64,
-    menu_close_before: u64,
-    closed_since: Option<Instant>,
     /// Modifiers this commit's shortcut tolerates while it settles.
     allowed: u32,
 }
@@ -304,11 +303,6 @@ fn commit_slot() -> &'static Mutex<Option<PendingCommit>> {
 }
 fn cancel_pending_commit() {
     if let Ok(mut slot) = commit_slot().lock() { *slot = None; }
-}
-fn cancel_pending_unless_cancel_sent() {
-    if let Ok(mut slot) = commit_slot().lock() {
-        if slot.as_ref().is_none_or(|p| p.stage != 1) { *slot = None; }
-    }
 }
 
 // TSF-based Microsoft Pinyin commonly exposes no composition through a
@@ -355,21 +349,27 @@ fn composition_length(focus: usize) -> Option<i32> {
         if count < 0 { None } else { Some(count) }
     }
 }
-fn send_escape_key() -> bool {
+fn send_commit(text: &str) -> bool {
     // Microsoft Pinyin documents Escape as discarding the uncommitted
-    // candidate composition, unlike Enter/Space which may commit input.
-    // Do not try to delete committed text with Backspace, Ctrl+A or similar.
-    let keys = [
-        INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 {
-            ki: KEYBDINPUT { wVk: VK_ESCAPE as u16, wScan: 0, dwFlags: 0,
-                time: 0, dwExtraInfo: 0 },
-        }},
-        INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 {
-            ki: KEYBDINPUT { wVk: VK_ESCAPE as u16, wScan: 0,
-                dwFlags: KEYEVENTF_KEYUP, time: 0, dwExtraInfo: 0 },
-        }},
-    ];
-    unsafe { SendInput(2, keys.as_ptr(), mem::size_of::<INPUT>() as i32) == 2 }
+    // candidate composition. Escape and the translation are delivered in a
+    // single SendInput batch: the input queue processes them in order, so no
+    // cross-process wait for the candidate panel to close is needed.
+    if text.is_empty() || text.encode_utf16().count() > 1024 { return false; }
+    let mut input = Vec::<INPUT>::with_capacity(2 + 2 * text.encode_utf16().count());
+    input.push(INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 {
+        ki: KEYBDINPUT { wVk: VK_ESCAPE as u16, wScan: 0, dwFlags: 0, time: 0, dwExtraInfo: 0 },
+    }});
+    input.push(INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 {
+        ki: KEYBDINPUT { wVk: VK_ESCAPE as u16, wScan: 0, dwFlags: KEYEVENTF_KEYUP, time: 0, dwExtraInfo: 0 },
+    }});
+    for unit in text.encode_utf16() {
+        for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
+            input.push(INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 {
+                ki: KEYBDINPUT { wVk: 0, wScan: unit, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+            }});
+        }
+    }
+    unsafe { SendInput(input.len() as u32, input.as_ptr(), mem::size_of::<INPUT>() as i32) == input.len() as u32 }
 }
 /// Publishes the shortcut list to the keyboard hook: every trigger key, its
 /// modifiers, and whether the feature is on at all.
@@ -432,94 +432,57 @@ fn still_eligible(info: &ReadyTranslation, focus: usize, require_menu: bool) -> 
         && (!require_menu || MENU_OPEN.load(Ordering::Acquire))
         && info.foreground != 0 && focused_window(info.foreground) == focus
 }
-fn send_unicode_text(text: &str) -> bool {
-    if text.is_empty() || text.encode_utf16().count() > 1024 { return false; }
-    // Scan-code Unicode KEYBDINPUT, not clipboard and not VK-based typing.
-    let mut input = Vec::<INPUT>::new();
-    for unit in text.encode_utf16() {
-        for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
-            input.push(INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 {
-                ki: KEYBDINPUT { wVk: 0, wScan: unit, dwFlags: flags, time: 0, dwExtraInfo: 0 },
-            }});
-        }
-    }
-    unsafe { SendInput(input.len() as u32, input.as_ptr(), mem::size_of::<INPUT>() as i32) == input.len() as u32 }
-}
-
 fn process_alt_commit() {
     let action = {
         let Ok(mut slot) = commit_slot().lock() else { return; };
         slot.take()
     };
-    let Some(mut action) = action else { return; };
+    let Some(action) = action else { return; };
     // Never react to held modifiers, additional real keyboard input, a
     // changed focus or a late translation. The injected Escape is marked
     // LLKHF_INJECTED and deliberately excluded from PHYSICAL_KEY_EVENTS.
     // Only modifiers the shortcut does not ask for veto the commit; a chord
     // like Ctrl+K legitimately keeps Ctrl down while the key is released.
-    if action.started.elapsed() > Duration::from_millis(if action.stage == 0 { 650 } else { 850 })
+    if action.started.elapsed() > ALT_COMMIT_MAX
         || action.input_generation != PHYSICAL_KEY_EVENTS.load(Ordering::Acquire)
         || modifiers_down() & !action.allowed != 0 {
         log_global("ALT_COMMIT_ABORT modifier_or_timeout");
         return;
     }
-    let valid = if action.stage == 0 {
-        still_eligible(&action.translation, action.focus, true)
-    } else {
-        ALT_OUTPUT_ENABLED.load(Ordering::Acquire)
-            && !TRANSLATION_PAUSED.load(Ordering::Acquire)
-            && CONFIG_ENABLED.load(Ordering::Acquire)
-            && focused_window(action.translation.foreground) == action.focus
-    };
+    // The candidate snapshot was validated when the key was released. Here only
+    // cheap local state is rechecked: querying the foreground thread's focus
+    // (GetGUIThreadInfo) is the one call that can stall while the IME tears
+    // itself down, and the foreground handle alone catches a window switch.
+    let info = &action.translation;
+    let valid = ALT_OUTPUT_ENABLED.load(Ordering::Acquire)
+        && !TRANSLATION_PAUSED.load(Ordering::Acquire)
+        && CONFIG_ENABLED.load(Ordering::Acquire)
+        && info.epoch == CANDIDATE_EPOCH.load(Ordering::Acquire)
+        && info.serial == TRANSLATION_SERIAL.load(Ordering::Acquire)
+        && info.foreground != 0
+        && unsafe { GetForegroundWindow() } as usize == info.foreground;
     if !valid {
         log_global("ALT_COMMIT_ABORT focus_or_candidate_changed");
         return;
     }
-    if action.stage == 0 {
-        let close_before = IME_MENU_CLOSE_SEQ.load(Ordering::Acquire);
-        // Inject only after the real LAlt has been released and the IME menu
-        // was positively known open. If Escape cannot be delivered, stop.
-        if !send_escape_key() {
-            log_global("ALT_COMMIT_ABORT escape_send_failed");
-            return;
-        }
-        action.stage = 1;
-        action.menu_close_before = close_before;
-        action.closed_since = None;
-        action.started = Instant::now();
-        log_global("ALT_COMMIT_ESCAPE_SENT");
-    } else {
-        // The actual IME panel must report MenuClosed AFTER our Escape.
-        // An absent candidate window on its own is not enough to proceed.
-        let confirmed_closed = IME_MENU_CLOSE_SEQ.load(Ordering::Acquire)
-            > action.menu_close_before && !MENU_OPEN.load(Ordering::Acquire);
-        if !confirmed_closed {
-            // Another UIA event or an older on-going composition can reopen
-            // the panel. In that case, wait briefly and fail safely.
-            action.closed_since = None;
-        } else if action.closed_since.is_none() {
-            action.closed_since = Some(Instant::now());
-        } else if action.closed_since.is_some_and(|t| t.elapsed() >= Duration::from_millis(60)) {
-            // A positive IMM composition state vetoes insertion. A missing
-            // IMM state is normal for TSF; Microsoft Pinyin's documented Esc
-            // behavior + UIA MenuClosed are our (experimental) fallback.
-            if composition_length(action.focus).is_some_and(|n| n > 0) {
-                log_global("ALT_COMMIT_ABORT composition_still_present");
-                return;
-            }
-            // Do not recheck the old epoch: a successful cancellation itself
-            // closes the IME menu and intentionally invalidates that epoch.
-            if send_unicode_text(&action.translation.text) {
-                log_global("ALT_COMMIT_TEXT_SENT");
-                clear_ready_translation();
-            } else {
-                log_global("ALT_COMMIT_ABORT sendinput_failed");
-            }
-            return;
-        }
+    // A positive IMM composition state vetoes insertion. A missing IMM state
+    // is normal for TSF, so it only ever blocks, never authorises.
+    if composition_length(action.focus).is_some_and(|n| n > 0) {
+        log_global("ALT_COMMIT_ABORT composition_still_present");
+        return;
     }
-    // Nonblocking continuation; timer revisits without busy-waiting.
-    if let Ok(mut slot) = commit_slot().lock() { *slot = Some(action); }
+    // Do not recheck the old epoch after this point: the successful
+    // cancellation itself closes the IME menu and invalidates that epoch.
+    let started = Instant::now();
+    if send_commit(&action.translation.text) {
+        // latency_us: shortcut release -> injected text. send_us: the injection
+        // itself, so a slow input queue cannot hide behind the total.
+        log_global(format!("ALT_COMMIT_TEXT_SENT latency_us={} send_us={}",
+            action.started.elapsed().as_micros(), started.elapsed().as_micros()));
+        clear_ready_translation();
+    } else {
+        log_global("ALT_COMMIT_ABORT sendinput_failed");
+    }
 }
 
 unsafe extern "system" fn alt_keyboard_callback(code: i32, wparam: usize, lparam: isize) -> isize {
@@ -561,9 +524,15 @@ unsafe extern "system" fn alt_keyboard_callback(code: i32, wparam: usize, lparam
                                     if focus != 0 && still_eligible(&snapshot, focus, true) {
                                         if let Ok(mut commit) = commit_slot().try_lock() {
                                             *commit = Some(PendingCommit { translation: snapshot,
-                                                focus, started: Instant::now(), stage: 0,
+                                                focus, started: Instant::now(),
                                                 input_generation: PHYSICAL_KEY_EVENTS.load(Ordering::Acquire),
-                                                menu_close_before: 0, closed_since: None, allowed });
+                                                allowed });
+                                            // Fire the commit on the next message, not on
+                                            // the next 25 ms animation tick.
+                                            let control = CONTROL_HWND.load(Ordering::Acquire) as HWND;
+                                            if !control.is_null() {
+                                                PostMessageW(control, WM_APP_COMMIT, 0, 0);
+                                            }
                                         }
                                     }
                                 }
@@ -2338,15 +2307,17 @@ fn on_uia_event(
                 });
             }
         } else if event == UIEventType::MenuClosed {
-            IME_MENU_CLOSE_SEQ.fetch_add(1, Ordering::AcqRel);
-                if let Ok(mut slot) = panel_cache.try_borrow_mut() { *slot = None; }
+            if let Ok(mut slot) = panel_cache.try_borrow_mut() { *slot = None; }
             // The next composition may open on a host whose handle path
             // works, so allow those lookups again from a clean slate.
             clear_panel_direct();
             HWND_READ_MISSES.store(0, Ordering::Release);
             MENU_OPEN.store(false, Ordering::Release);
             clear_ready_translation();
-            cancel_pending_unless_cancel_sent();
+            // Our own Escape closes the menu right after the commit already
+            // injected the text; by then the slot is empty, so a plain clear
+            // never discards a commit that is still in flight.
+            cancel_pending_commit();
             clear_selection_hint();
             CONFIRMED_IME_HWND.store(0, Ordering::Release);
             CONFIRMED_FOREGROUND.store(0, Ordering::Release);
@@ -3497,12 +3468,20 @@ fn main() {
                     log_global("EXIT_POSTED");
                     break;
                 }
+                WM_APP_COMMIT if msg.hwnd == control => {
+                    process_alt_commit();
+                    continue;
+                }
                 WM_APP_REFRESH if msg.hwnd == control => {
                     update_overlay(hwnd, shadow, font, dpi);
                     continue;
                 }
                 WM_TIMER if msg.wParam == TIMER_ID => {
-                    process_alt_commit();
+                    // WM_APP_COMMIT does the real work; this only sweeps a
+                    // commit whose message got swallowed.
+                    if commit_slot().lock().is_ok_and(|slot| slot.is_some()) {
+                        process_alt_commit();
+                    }
                     if last_main_health.elapsed() >= HEALTH_INTERVAL {
                         log_global(format!(
                             "MAIN_LOOP_HEARTBEAT paused={} tray_registered={}",
