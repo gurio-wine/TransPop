@@ -32,7 +32,7 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             AdjustWindowRectEx, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
             DestroyMenu, DestroyWindow, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
-            GetDlgItem, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
+            GetDlgItem, GetParent, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
             GetWindowTextW, IsWindow, IsWindowVisible, PostMessageW, RegisterClassW, SendMessageW,
             SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
             SystemParametersInfoW, TrackPopupMenu, BN_CLICKED, DM_GETDEFID, GWLP_USERDATA,
@@ -49,6 +49,7 @@ use windows_sys::Win32::{
 const CLASS: &str = "TransPopNativeSettings061";
 const WM_SETFONT: u32 = 0x0030;
 const ES_AUTOHSCROLL: u32 = 0x0080;
+const ES_CENTER: u32 = 0x0001;
 const ES_READONLY: u32 = 0x0800;
 const BS_OWNERDRAW: u32 = 0x000B;
 const ES_PASSWORD: u32 = 0x0020;
@@ -65,6 +66,8 @@ const ID_THEME: u16 = 4111;
 const ID_UPDATE_INTERVAL: u16 = 4112;
 const ID_AUTO_INSTALL: u16 = 4113;
 const ID_OPEN_REPO: u16 = 4114;
+const ID_SHORTCUT_ADD: u16 = 4115;
+const ID_AUTO_RESTART: u16 = 4116;
 // One owner-drawn button per tab, in display order.
 const ID_TAB_TRANSLATE: u16 = 4120;
 const ID_TAB_APPEARANCE: u16 = 4121;
@@ -107,6 +110,12 @@ const TAB_W: i32 = 100;
 const TAB_H: i32 = 30;
 const TAB_GAP: i32 = 6;
 const CONTENT_TOP: i32 = 150;
+// Shortcut row: fixed-width centred fields plus one + button, on its own row.
+pub const MAX_SHORTCUTS: usize = 3;
+const SHORTCUT_W: i32 = 152;
+const SHORTCUT_H: i32 = 30;
+const SHORTCUT_GAP: i32 = 6;
+const SHORTCUT_ADD_W: i32 = 30;
 const WINDOW_STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
 const WINDOW_EX_STYLE: u32 = WS_EX_APPWINDOW;
 const WM_APP_SETTINGS_SAVE: u32 = super::WM_APP + 30;
@@ -114,12 +123,14 @@ const WM_APP_SETTINGS_CANCEL: u32 = super::WM_APP + 31;
 const WM_APP_SETTINGS_PROVIDER: u32 = super::WM_APP + 32;
 const WM_APP_SETTINGS_UPDATE: u32 = super::WM_APP + 33;
 const WM_APP_SETTINGS_PAGE: u32 = super::WM_APP + 34;
+const WM_APP_SETTINGS_SHORTCUT: u32 = super::WM_APP + 35;
 
 pub const SAVE_MESSAGE: u32 = WM_APP_SETTINGS_SAVE;
 pub const CANCEL_MESSAGE: u32 = WM_APP_SETTINGS_CANCEL;
 pub const PROVIDER_MESSAGE: u32 = WM_APP_SETTINGS_PROVIDER;
 pub const UPDATE_MESSAGE: u32 = WM_APP_SETTINGS_UPDATE;
 pub const PAGE_MESSAGE: u32 = WM_APP_SETTINGS_PAGE;
+pub const SHORTCUT_MESSAGE: u32 = WM_APP_SETTINGS_SHORTCUT;
 
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
 
@@ -592,6 +603,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
             }
             1
         }
+        // Clicking the background takes focus off a shortcut row, which is how a
+        // row the user no longer wants is cleared (and then dropped).
+        WM_LBUTTONDOWN => {
+            SetFocus(hwnd);
+            0
+        }
         // No default button: Enter must never dismiss a form that saves itself.
         DM_GETDEFID => 0,
         WM_KEYDOWN if wp as u16 == VK_ESCAPE => {
@@ -626,7 +643,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
             // Owner-drawn checks do not flip themselves; mirror the click into
             // the button state, then repaint.
             if notify as u32 == BN_CLICKED
-                && matches!(id, ID_AUTOSTART | ID_AUTO_INSTALL
+                && matches!(id, ID_AUTOSTART | ID_AUTO_INSTALL | ID_AUTO_RESTART
                     | ID_AZURE_REVEAL | ID_OPENAI_REVEAL) {
                 let was_checked = button_checked(control);
                 set_button_checked(control, !was_checked);
@@ -671,6 +688,20 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
                     apply_window_theme(hwnd, &mut *theme);
                 }
                 PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0);
+                return 0;
+            }
+            // "+" appends one shortcut row. It is shown and focused by the
+            // layout pass, because a hidden field cannot take focus.
+            if notify as u32 == BN_CLICKED && id == ID_SHORTCUT_ADD {
+                let empty = SHORTCUTS.with(|rows| {
+                    let rows = rows.borrow();
+                    rows.iter().position(|(_, spec)| spec.is_empty()).map(|index| rows[index].0)
+                });
+                if empty.is_some() {
+                    CAPTURE.with(|c| { let mut c = c.borrow_mut(); c.armed = true; c.pending = None; });
+                    let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
+                    if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SHORTCUT, 0, 0); }
+                }
                 return 0;
             }
             // The project block only links out; nothing here is persisted.
@@ -718,6 +749,7 @@ pub struct ConfigFile {
     pub debounce_ms: String,
     pub alt_output_shortcut: String,
     pub auto_install: bool,
+    pub auto_restart: bool,
     pub update_interval_minutes: String,
     pub theme: String,
 }
@@ -797,19 +829,43 @@ struct Capture {
     armed: bool,
     /// Modifier held down while the field has focus, waiting for a main key.
     pending: Option<(u8, u32)>,
-    /// Latest captured spec; None means nothing was ever captured.
-    spec: Option<String>,
 }
 
 thread_local! {
     static CAPTURE: RefCell<Capture> = RefCell::new(Capture::default());
+    /// The shortcut fields in display order, each with the spec it holds. An
+    /// empty spec means the user cleared that field; the window prunes it.
+    static SHORTCUTS: RefCell<Vec<(HWND, String)>> = RefCell::new(Vec::new());
 }
 
-/// Live keyboard capture for the shortcut field. Whatever the user presses is
-/// stored as-is; pressing only a modifier and then leaving stores `none`, which
-/// is how "not set" is expressed without any extra control.
+fn set_row_spec(hwnd: HWND, spec: String) {
+    SHORTCUTS.with(|rows| {
+        if let Some((_, held)) = rows.borrow_mut().iter_mut().find(|(row, _)| *row == hwnd) {
+            *held = spec;
+        }
+    });
+}
+
+fn reset_rows(rows: Vec<(HWND, String)>) {
+    SHORTCUTS.with(|held| *held.borrow_mut() = rows);
+}
+
+/// The configured shortcuts, in display order, without the cleared ones.
+fn row_specs() -> Vec<String> {
+    SHORTCUTS.with(|rows| rows.borrow().iter()
+        .map(|(_, spec)| spec.clone())
+        .filter(|spec| !spec.is_empty() && spec != "none")
+        .collect())
+}
+
+/// Live keyboard capture for one shortcut row. Whatever the user presses is
+/// stored as-is; leaving a row without pressing a key clears it, which is how
+/// "not set" is expressed and how an extra row is dropped again.
 unsafe extern "system" fn shortcut_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize,
     _id: usize, _data: usize) -> isize {
+    // A row only edits while it was clicked on purpose, so a capture parks focus
+    // back on the dialog: the next keystroke must not silently re-bind it.
+    let dialog = GetParent(hwnd);
     match msg {
         WM_GETDLGCODE => return DLGC_WANTALLKEYS,
         WM_LBUTTONDOWN => {
@@ -849,11 +905,7 @@ unsafe extern "system" fn shortcut_proc(hwnd: HWND, msg: u32, wp: usize, lp: isi
                 return 0;
             }
             CAPTURE.with(|c| { let mut c = c.borrow_mut(); c.pending = None; c.armed = false; });
-            let spec = shortcut_spec(mods, key);
-            CAPTURE.with(|c| c.borrow_mut().spec = Some(spec.clone()));
-            set_text(hwnd, &shortcut_label(&spec));
-            let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
-            if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0); }
+            commit_row(hwnd, dialog, shortcut_spec(mods, key));
             return 0;
         }
         // Releasing the only modifier commits it: a bare Shift is a shortcut
@@ -862,11 +914,7 @@ unsafe extern "system" fn shortcut_proc(hwnd: HWND, msg: u32, wp: usize, lp: isi
             if modifier_mask(wp as u16).is_some() {
                 let pending = CAPTURE.with(|c| { let mut c = c.borrow_mut(); c.armed = false; c.pending.take() });
                 if let Some((mods, key)) = pending {
-                    let spec = shortcut_spec(mods, key);
-                    CAPTURE.with(|c| c.borrow_mut().spec = Some(spec.clone()));
-                    set_text(hwnd, &shortcut_label(&spec));
-                    let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
-                    if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0); }
+                    commit_row(hwnd, dialog, shortcut_spec(mods, key));
                 }
             }
             return 0;
@@ -879,15 +927,46 @@ unsafe extern "system" fn shortcut_proc(hwnd: HWND, msg: u32, wp: usize, lp: isi
             // user did not choose a key, which is how "off" is expressed.
             let armed = CAPTURE.with(|c| { let mut c = c.borrow_mut(); c.pending = None; c.armed });
             if armed {
-                CAPTURE.with(|c| { let mut c = c.borrow_mut(); c.armed = false; c.spec = Some("none".to_string()); });
-                set_text(hwnd, &shortcut_label("none"));
-                let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
-                if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0); }
+                CAPTURE.with(|c| c.borrow_mut().armed = false);
+                // Leaving without a key clears the row; the form then prunes it.
+                commit_row(hwnd, dialog, String::new());
             }
         }
         _ => {}
     }
     DefSubclassProc(hwnd, msg, wp, lp)
+}
+
+/// Store one captured row, park focus on the dialog so the row stops editing,
+/// and let the main loop persist the list and re-lay-out the form.
+unsafe fn commit_row(hwnd: HWND, dialog: HWND, spec: String) {
+    set_row_spec(hwnd, spec);
+    compact_rows();
+    // Park focus on the dialog: editing one shortcut must not leave the field
+    // armed, or the next keystroke would silently re-bind it.
+    if !dialog.is_null() { SetFocus(dialog); }
+    let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
+    if !main.is_null() {
+        PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0);
+        PostMessageW(main, WM_APP_SETTINGS_SHORTCUT, 0, 0);
+    }
+}
+
+/// The row list keeps one invariant: every set shortcut sits on the first rows
+/// in order and the rest are empty. Clearing a row therefore removes it, and
+/// the fields never reshuffle behind the user's back.
+unsafe fn compact_rows() {
+    let mut specs: Vec<String> = SHORTCUTS.with(|rows| rows.borrow().iter()
+        .map(|(_, spec)| spec.clone())
+        .filter(|spec| !spec.is_empty() && spec != "none")
+        .collect());
+    specs.truncate(MAX_SHORTCUTS);
+    SHORTCUTS.with(|rows| {
+        for (index, (row, held)) in rows.borrow_mut().iter_mut().enumerate() {
+            *held = specs.get(index).cloned().unwrap_or_default();
+            set_text(*row, &shortcut_label(held));
+        }
+    });
 }
 
 /// Modifier bits held down right now, ignoring the key being pressed: pressing
@@ -915,6 +994,26 @@ pub fn normalize_shortcut(spec: &str) -> String {
         Some((mods, vk)) => shortcut_spec(mods, vk),
         None => "none".to_string(),
     }
+}
+
+/// Every shortcut in a stored value, canonical and de-duplicated, in the order
+/// the user set them. A file written by an older build holds a single spec and
+/// still parses as a one-entry list.
+pub fn shortcut_list(value: &str) -> Vec<String> {
+    let mut list: Vec<String> = Vec::new();
+    for part in value.split(',') {
+        let spec = normalize_shortcut(part);
+        if spec != "none" && !list.contains(&spec) { list.push(spec); }
+    }
+    list.truncate(MAX_SHORTCUTS);
+    list
+}
+
+/// Config spelling of a list: comma-separated specs, `none` when empty.
+pub fn shortcuts_value(list: &[String]) -> String {
+    let joined = list.join(",");
+    let list = shortcut_list(&joined);
+    if list.is_empty() { "none".to_string() } else { list.join(",") }
 }
 
 /// `(modifiers, virtual key)` for a stored spec, or None when it is off.
@@ -1087,10 +1186,11 @@ impl ConfigFile {
             timeout_seconds: get("timeout_seconds", "8"),
             debounce_ms: get("debounce_ms", "300"),
             // Older configs only had a boolean; keep a disabled setting disabled.
-            alt_output_shortcut: normalize_shortcut(&get("alt_output_shortcut",
+            alt_output_shortcut: shortcuts_value(&shortcut_list(&get("alt_output_shortcut",
                 if map.get("alt_output").is_some_and(|v| !truthy(v, true)) { "none" }
-                else { DEFAULT_SHORTCUT })),
+                else { DEFAULT_SHORTCUT }))),
             auto_install: flag("auto_install", true),
+            auto_restart: flag("auto_restart", true),
             // Older files had an auto_update on/off switch instead of the
             // 仅手动 interval entry; keep a disabled switch disabled.
             update_interval_minutes: get("update_interval_minutes",
@@ -1125,13 +1225,16 @@ timeout_seconds=8\n\
 debounce_ms=300\n\
 # update_interval_minutes is the gap between background checks of GitHub\n\
 # Releases (min 15, default 30); write 0 to check only when asked. auto_install=on\n\
-# then downloads and installs a newer release after verifying the digest GitHub\n\
-# publishes for its asset, while auto_install=off only announces the release and\n\
-# waits for a click.\n\
+# then downloads a newer release after verifying the digest GitHub publishes for\n\
+# its asset, while auto_install=off only announces the release and waits for a\n\
+# click. auto_restart=off installs without relaunching; the new build runs on\n\
+# the next manual start.\n\
 auto_install=on\n\
+auto_restart=on\n\
 update_interval_minutes=30\n\
-# alt_output_shortcut is pressed once (no chord) to paste the translation\n\
-# instead of the Chinese candidate. Write none to disable it.\n\
+# alt_output_shortcut holds one or more shortcuts separated by commas; each is\n\
+# pressed once (no chord) to paste the translation instead of the Chinese\n\
+# candidate. Write none to disable it.\n\
 alt_output_shortcut=lalt\n\
 theme=system\n";
         let _ = fs::OpenOptions::new().write(true).create_new(true).open(&path)
@@ -1152,6 +1255,7 @@ pub struct SettingsValues {
     pub debounce_ms: String,
     pub alt_output_shortcut: String,
     pub auto_install: bool,
+    pub auto_restart: bool,
     pub update_interval_minutes: String,
     pub theme: String,
 }
@@ -1170,6 +1274,7 @@ impl SettingsValues {
             debounce_ms: file.debounce_ms,
             alt_output_shortcut: file.alt_output_shortcut,
             auto_install: file.auto_install,
+            auto_restart: file.auto_restart,
             update_interval_minutes: file.update_interval_minutes,
             theme: file.theme,
         }
@@ -1248,6 +1353,7 @@ impl SettingsValues {
             ("debounce_ms", values.debounce_ms.clone()),
             ("alt_output_shortcut", values.alt_output_shortcut.clone()),
             ("auto_install", if values.auto_install { "on".to_string() } else { "off".to_string() }),
+            ("auto_restart", if values.auto_restart { "on".to_string() } else { "off".to_string() }),
             ("update_interval_minutes", values.update_interval_minutes.clone()),
             ("theme", values.theme.clone()),
         ];
@@ -1340,8 +1446,10 @@ pub struct SettingsWindow {
     debounce_unit: HWND,
     autostart: HWND,
     shortcut_label: HWND,
-    shortcut_key: HWND,
+    shortcut_keys: [HWND; MAX_SHORTCUTS],
+    shortcut_add: HWND,
     auto_install: HWND,
+    auto_restart: HWND,
     update_interval: HWND,
     update_intervals: Vec<u32>,
     update_button: HWND,
@@ -1488,11 +1596,14 @@ impl SettingsWindow {
         };
         set_button_checked(autostart, previously_enabled);
 
-        // Only the install switch is left; whether to check at all is now the
-        // bottom entry of the interval list ("仅手动", minutes = 0).
-        let auto_install = create("BUTTON", "自动更新", ID_AUTO_INSTALL,
+        // Downloading and relaunching are two separate switches: a release can
+        // be staged in the background without interrupting whatever is running.
+        let auto_install = create("BUTTON", "自动下载", ID_AUTO_INSTALL,
             BS_OWNERDRAW | WS_TABSTOP);
         set_button_checked(auto_install, values.auto_install);
+        let auto_restart = create("BUTTON", "自动重启", ID_AUTO_RESTART,
+            BS_OWNERDRAW | WS_TABSTOP);
+        set_button_checked(auto_restart, values.auto_restart);
         // Interval between background checks; the current value may be one
         // the presets no longer offer, so it is kept as an extra entry.
         let current: u32 = values.update_interval_minutes.parse().unwrap_or(DEFAULT_UPDATE_INTERVAL);
@@ -1533,26 +1644,31 @@ impl SettingsWindow {
         // caption bar already closes the window.
         let shortcut_caption = create("STATIC", "输入英文", 0, 0);
         set_font(shortcut_caption, section_font);
-        // The shortcut is captured from the real keyboard: one read-only field
-        // that swallows the next key press. No list, no modifier switches.
-        let shortcut_key = create("EDIT", "", ID_SHORTCUT_KEY,
-            ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP);
-        set_text(shortcut_key, &shortcut_label(&values.alt_output_shortcut));
-        SetWindowSubclass(shortcut_key, Some(shortcut_proc), SUBCLASS_ID, 0);
-        // Seed the capture with the stored value, so unrelated switches saved
-        // from this dialog cannot clear a shortcut the user never touched.
-        CAPTURE.with(|c| {
-            let mut c = c.borrow_mut();
-            c.pending = None;
-            c.spec = Some(normalize_shortcut(&values.alt_output_shortcut));
-        });
+        // Shortcuts are captured from the real keyboard: each row is a
+        // read-only field that swallows the next key press, and the "+" button
+        // appends one. A row that ends up empty is pruned again on save.
+        let stored = shortcut_list(&values.alt_output_shortcut);
+        let mut shortcut_rows: Vec<(HWND, String)> = Vec::new();
+        let mut shortcut_keys = [ptr::null_mut(); MAX_SHORTCUTS];
+        for slot in 0..MAX_SHORTCUTS {
+            let spec = stored.get(slot).cloned().unwrap_or_default();
+            let row = create("EDIT", "", ID_SHORTCUT_KEY,
+                ES_CENTER | ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP);
+            SetWindowSubclass(row, Some(shortcut_proc), SUBCLASS_ID, 0);
+            set_text(row, &shortcut_label(&spec));
+            shortcut_keys[slot] = row;
+            shortcut_rows.push((row, spec));
+        }
+        reset_rows(shortcut_rows);
+        CAPTURE.with(|c| c.borrow_mut().pending = None);
+        let shortcut_add = create("BUTTON", "+", ID_SHORTCUT_ADD, WS_TABSTOP);
         let about_text = create("STATIC",
             "仓库：github.com/gurio-wine/TransPop\r\n许可：MIT", 0, 0);
 
         // A slightly inset caret keeps addresses off the field frame.
         let pad = scale(8);
         for edit in [azure[0].1, azure[1].1, azure[2].1, openai[0].1, openai[1].1, openai[2].1,
-                     timeout, debounce, shortcut_key] {
+                     timeout, debounce].into_iter().chain(shortcut_keys) {
             if !edit.is_null() {
                 SendMessageW(edit, EM_SETMARGINS, EC_LEFT_RIGHT_MARGINS,
                     (pad | (pad << 16)) as isize);
@@ -1565,7 +1681,7 @@ impl SettingsWindow {
         (*theme_ptr).selects = selects;
         // Borderless fields are painted by the theme, so it must know them.
         for edit in [azure[0].1, azure[1].1, azure[2].1, openai[0].1, openai[1].1, openai[2].1,
-                     timeout, debounce, shortcut_key] {
+                     timeout, debounce].into_iter().chain(shortcut_keys) {
             if !edit.is_null() { (*theme_ptr).fields.push(edit as isize); }
         }
         for tab in [tab_translate, tab_appearance, tab_system, tab_shortcut, tab_about] {
@@ -1578,8 +1694,8 @@ impl SettingsWindow {
             connection_title, connection_divider, azure, openai, azure_reveal, openai_reveal,
             behavior_title, behavior_divider, timeout_label, timeout, timeout_unit,
             debounce_label, debounce, debounce_unit, autostart,
-            shortcut_label: shortcut_caption, shortcut_key,
-            auto_install, update_interval, update_intervals: intervals,
+            shortcut_label: shortcut_caption, shortcut_keys, shortcut_add,
+            auto_install, auto_restart, update_interval, update_intervals: intervals,
             update_button, startup_title, project_title, update_title, version_label,
             interval_caption, theme_label, theme_picker,
             tabs: [tab_translate, tab_appearance, tab_system, tab_shortcut, tab_about],
@@ -1672,10 +1788,19 @@ impl SettingsWindow {
         place(self.startup_title, MARGIN_X, top, 460, 22);
         place(self.autostart, MARGIN_X, top + 28, CONTENT_W, 24);
 
-        // 快捷键 page: one field that captures whatever key is pressed, on the
-        // same label/field grid as every other row.
+        // 快捷键 page: one row per shortcut, each capturing whatever key is
+        // pressed. The "+" sits beside the last row and disappears when the
+        // list is full.
         place(self.shortcut_label, MARGIN_X, top + 4, LABEL_W, 22);
-        place(self.shortcut_key, FIELD_X, top, 260, 30);
+        let rows = self.visible_shortcuts();
+        for (index, row) in rows.iter().enumerate() {
+            place(*row, FIELD_X, top + index as i32 * (SHORTCUT_H + SHORTCUT_GAP),
+                SHORTCUT_W, SHORTCUT_H);
+        }
+        if let Some(last) = rows.len().checked_sub(1) {
+            place(self.shortcut_add, FIELD_X + SHORTCUT_W + 8,
+                top + last as i32 * (SHORTCUT_H + SHORTCUT_GAP), SHORTCUT_ADD_W, SHORTCUT_H);
+        }
 
         // About page: a project block (repo, licence, one button) and an
         // update block (version, check button, interval, install switch).
@@ -1689,6 +1814,7 @@ impl SettingsWindow {
         place(self.interval_caption, MARGIN_X, top + 216, LABEL_W, 22);
         place(self.update_interval, FIELD_X, top + 212, 160, 30);
         place(self.auto_install, MARGIN_X, top + 250, CONTENT_W, 24);
+        place(self.auto_restart, MARGIN_X, top + 278, CONTENT_W, 24);
 
         for control in [self.service_title, self.provider] { show(control, translating); }
         for (label, edit) in self.azure {
@@ -1710,13 +1836,14 @@ impl SettingsWindow {
         show(self.theme_label, appearance);
         show(self.theme_picker, appearance);
         for control in [self.autostart, self.startup_title] { show(control, system); }
-        for control in [self.shortcut_label, self.shortcut_key] {
-            show(control, shortcuts);
-        }
+        show(self.shortcut_label, shortcuts);
+        let rows = self.visible_shortcuts();
+        for row in self.shortcut_keys { show(row, shortcuts && rows.contains(&row)); }
+        show(self.shortcut_add, shortcuts && rows.len() < MAX_SHORTCUTS);
         for control in [self.project_title, self.about_text, self.open_repo,
                         self.connection_divider, self.update_title, self.version_label,
                         self.update_button, self.interval_caption, self.update_interval,
-                        self.auto_install] {
+                        self.auto_install, self.auto_restart] {
             show(control, about);
         }
 
@@ -1783,6 +1910,15 @@ impl SettingsWindow {
         }
     }
 
+    /// Shows the current shortcut rows and focuses the armed one, so "+" and
+    /// clearing a row both take effect without reopening the dialog.
+    pub unsafe fn refresh_shortcuts(&self) {
+        self.apply_layout(false);
+        if CAPTURE.with(|c| c.borrow().armed) {
+            if let Some(row) = self.visible_shortcuts().last() { SetFocus(*row); }
+        }
+    }
+
     /// Re-reads translator.conf into the widgets. Only used after a rejected
     /// value, so the form never keeps something that failed to save and then
     /// writes it again on the next keystroke.
@@ -1801,13 +1937,10 @@ impl SettingsWindow {
         set(self.timeout, &values.timeout_seconds);
         set(self.debounce, &values.debounce_ms);
         set_button_checked(self.autostart, self.autostart_checked());
-        CAPTURE.with(|c| {
-            let mut c = c.borrow_mut();
-            c.pending = None;
-            c.spec = Some(normalize_shortcut(&values.alt_output_shortcut));
-        });
-        set_text(self.shortcut_key, &shortcut_label(&values.alt_output_shortcut));
+        CAPTURE.with(|c| c.borrow_mut().pending = None);
+        self.seed_shortcuts(&shortcut_list(&values.alt_output_shortcut));
         set_button_checked(self.auto_install, values.auto_install);
+        set_button_checked(self.auto_restart, values.auto_restart);
         let current: u32 = values.update_interval_minutes.parse()
             .unwrap_or(DEFAULT_UPDATE_INTERVAL);
         if let Some(index) = self.update_intervals.iter().position(|m| *m == current) {
@@ -1846,9 +1979,9 @@ impl SettingsWindow {
             openai_key: Self::get_text(self.openai[2].1),
             timeout_seconds: Self::get_text(self.timeout),
             debounce_ms: Self::get_text(self.debounce),
-            alt_output_shortcut: CAPTURE.with(|c| c.borrow().spec.clone())
-                .unwrap_or_else(|| "none".to_string()),
+            alt_output_shortcut: shortcuts_value(&row_specs()),
             auto_install: button_checked(self.auto_install),
+            auto_restart: button_checked(self.auto_restart),
             update_interval_minutes: {
                 let index = (*self.theme).chosen_index(self.update_interval).unwrap_or(0);
                 let minutes = self.update_intervals.get(index)
@@ -1870,10 +2003,30 @@ impl SettingsWindow {
     }
     pub fn base(&self) -> &Path { &self.base }
 
+    /// Rows the form shows right now: every set shortcut plus one empty row to
+    /// type into. At least one row is always visible.
+    fn visible_shortcuts(&self) -> Vec<HWND> {
+        let filled = SHORTCUTS.with(|rows| rows.borrow().iter()
+            .filter(|(_, spec)| !spec.is_empty() && spec != "none").count());
+        self.shortcut_keys[..(filled + 1).min(MAX_SHORTCUTS)].to_vec()
+    }
+
+    /// Writes a stored shortcut list back into the row fields.
+    unsafe fn seed_shortcuts(&self, stored: &[String]) {
+        let rows: Vec<(HWND, String)> = self.shortcut_keys.iter().enumerate()
+            .map(|(index, row)| (*row, stored.get(index).cloned().unwrap_or_default()))
+            .collect();
+        reset_rows(rows);
+        for (index, row) in self.shortcut_keys.iter().enumerate() {
+            set_text(*row, &shortcut_label(stored.get(index).map(String::as_str).unwrap_or("")));
+        }
+    }
+
     pub unsafe fn close(self) {
         // Clear the paint state pointer before children are destroyed.
         SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
-        CAPTURE.with(|c| { let mut c = c.borrow_mut(); c.pending = None; c.spec = None; });
+        CAPTURE.with(|c| c.borrow_mut().pending = None);
+        reset_rows(Vec::new());
         DestroyWindow(self.hwnd);
         for font in [self.font, self.title_font, self.section_font, self.note_font] {
             if !font.is_null() { DeleteObject(font); }
@@ -2062,6 +2215,14 @@ mod tests {
         assert_eq!(shortcut_label("none"), "\u{672a}\u{8bbe}\u{7f6e}");
         assert_eq!(parse_shortcut(""), None);
         assert_eq!(parse_shortcut("f24"), Some((0, 0x87)));
+        // A list keeps order, drops repeats and junk, and caps at the row count.
+        assert_eq!(shortcut_list("lalt, Ctrl+Space , lalt, nope"),
+            vec!["lalt".to_string(), "ctrl+space".to_string()]);
+        assert_eq!(shortcut_list(""), Vec::<String>::new());
+        assert_eq!(shortcuts_value(&["lalt".to_string(), "ctrl+space".to_string()]),
+            "lalt,ctrl+space");
+        assert_eq!(shortcuts_value(&[]), "none");
+        assert_eq!(shortcuts_value(&["nope".to_string()]), "none");
         assert_eq!(normalize_theme(" Dark "), "dark");
         assert_eq!(normalize_theme("LIGHT"), "light");
         assert_eq!(normalize_theme("auto"), "system");

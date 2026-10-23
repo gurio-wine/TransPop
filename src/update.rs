@@ -292,8 +292,10 @@ fn backup_path(current: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Move the verified executable into place and start it. The caller exits.
-pub fn apply(new_exe: &Path) -> Result<(), String> {
+/// Move the verified executable into place. With `restart` the new build is
+/// started immediately and the caller exits; without it the next launch picks
+/// it up, so a scheduled update never interrupts a running session.
+pub fn apply(new_exe: &Path, restart: bool) -> Result<(), String> {
     let current = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
     let backup = backup_path(&current);
     // A leftover backup is unlocked once its process is gone.
@@ -303,6 +305,7 @@ pub fn apply(new_exe: &Path) -> Result<(), String> {
         let _ = fs::rename(&backup, &current);
         return Err(format!("install new exe: {error}"));
     }
+    if !restart { return Ok(()); }
     // The replacement must wait for this instance to release the
     // single-instance window and mutex.
     if let Err(error) = std::process::Command::new(&current).arg("--after-update").spawn() {

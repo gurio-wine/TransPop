@@ -200,13 +200,18 @@ static TRANSLATION_SERIAL: AtomicU64 = AtomicU64::new(0);
 static CONFIG_REVISION: AtomicU64 = AtomicU64::new(0);
 static CONFIG_ENABLED: AtomicBool = AtomicBool::new(false);
 static ALT_OUTPUT_ENABLED: AtomicBool = AtomicBool::new(false);
-// Virtual-key code of the one-shot shortcut that pastes the translation, or
-// 0 when the user turned it off. Modifiers are read live, so any key works.
-static ALT_OUTPUT_KEY: AtomicU32 = AtomicU32::new(0);
-// Modifier bits (settings::MOD_*) the trigger key must be pressed with.
-static ALT_OUTPUT_MODS: AtomicU32 = AtomicU32::new(0);
-// Whether a found release installs itself; checking is the interval below.
+// Virtual-key codes of the one-shot shortcuts that paste the translation; a
+// zero slot is unused. Several may be set, and any one of them fires.
+static ALT_OUTPUT_KEYS: [AtomicU32; settings::MAX_SHORTCUTS] =
+    [const { AtomicU32::new(0) }; settings::MAX_SHORTCUTS];
+// Modifier bits (settings::MOD_*) each trigger key must be pressed with.
+static ALT_OUTPUT_MODS: [AtomicU32; settings::MAX_SHORTCUTS] =
+    [const { AtomicU32::new(0) }; settings::MAX_SHORTCUTS];
+// Whether a found release downloads and installs itself; checking is the
+// interval below.
 static AUTO_INSTALL_ENABLED: AtomicBool = AtomicBool::new(true);
+// Whether an installed release relaunches TransPop, or waits for the next start.
+static AUTO_RESTART_ENABLED: AtomicBool = AtomicBool::new(true);
 // Minutes between background update checks; the settings window owns it.
 // 0 means "仅手动": no background check at all.
 static UPDATE_INTERVAL_MINUTES: AtomicU64 = AtomicU64::new(30);
@@ -274,12 +279,19 @@ struct ReadyTranslation {
     text: String, foreground: usize, epoch: u64, serial: u64,
 }
 #[derive(Default)]
-struct AltGesture { down: Option<Instant>, chord: bool }
+struct AltGesture {
+    down: Option<Instant>,
+    chord: bool,
+    /// Modifiers the matched shortcut asks for (plus its own key bit).
+    allowed: u32,
+}
 struct PendingCommit {
     translation: ReadyTranslation, focus: usize, started: Instant, stage: u8,
     input_generation: u64,
     menu_close_before: u64,
     closed_since: Option<Instant>,
+    /// Modifiers this commit's shortcut tolerates while it settles.
+    allowed: u32,
 }
 fn ready_slot() -> &'static Mutex<Option<ReadyTranslation>> {
     READY_TRANSLATION.get_or_init(|| Mutex::new(None))
@@ -359,21 +371,33 @@ fn send_escape_key() -> bool {
     ];
     unsafe { SendInput(2, keys.as_ptr(), mem::size_of::<INPUT>() as i32) == 2 }
 }
-/// Publishes one shortcut spec to the keyboard hook: the virtual key to watch
-/// and whether the feature is on at all.
-fn apply_shortcut(spec: &str) {
-    match settings::parse_shortcut(spec) {
-        Some((mods, vk)) => {
-            ALT_OUTPUT_MODS.store(mods as u32, Ordering::Release);
-            ALT_OUTPUT_KEY.store(vk, Ordering::Release);
-            ALT_OUTPUT_ENABLED.store(true, Ordering::Release);
-        }
-        None => {
-            ALT_OUTPUT_MODS.store(0, Ordering::Release);
-            ALT_OUTPUT_KEY.store(0, Ordering::Release);
-            ALT_OUTPUT_ENABLED.store(false, Ordering::Release);
+/// Publishes the shortcut list to the keyboard hook: every trigger key, its
+/// modifiers, and whether the feature is on at all.
+fn apply_shortcut(specs: &str) {
+    let list = settings::shortcut_list(specs);
+    for (slot, key) in ALT_OUTPUT_KEYS.iter().enumerate() {
+        match list.get(slot).and_then(|spec| settings::parse_shortcut(spec)) {
+            Some((mods, vk)) => {
+                ALT_OUTPUT_MODS[slot].store(mods as u32, Ordering::Release);
+                key.store(vk, Ordering::Release);
+            }
+            None => {
+                ALT_OUTPUT_MODS[slot].store(0, Ordering::Release);
+                key.store(0, Ordering::Release);
+            }
         }
     }
+    ALT_OUTPUT_ENABLED.store(!list.is_empty(), Ordering::Release);
+}
+
+/// Every configured (trigger key, modifier bits) pair.
+fn shortcuts() -> Vec<(u32, u32)> {
+    ALT_OUTPUT_KEYS.iter().zip(ALT_OUTPUT_MODS.iter())
+        .filter_map(|(key, mods)| {
+            let vk = key.load(Ordering::Relaxed);
+            (vk != 0).then(|| (vk, mods.load(Ordering::Relaxed)))
+        })
+        .collect()
 }
 
 /// The modifier bit a virtual key stands for, so the trigger itself never
@@ -433,11 +457,9 @@ fn process_alt_commit() {
     // LLKHF_INJECTED and deliberately excluded from PHYSICAL_KEY_EVENTS.
     // Only modifiers the shortcut does not ask for veto the commit; a chord
     // like Ctrl+K legitimately keeps Ctrl down while the key is released.
-    let allowed = ALT_OUTPUT_MODS.load(Ordering::Acquire)
-        | modifier_bit(ALT_OUTPUT_KEY.load(Ordering::Acquire));
     if action.started.elapsed() > Duration::from_millis(if action.stage == 0 { 650 } else { 850 })
         || action.input_generation != PHYSICAL_KEY_EVENTS.load(Ordering::Acquire)
-        || modifiers_down() & !allowed != 0 {
+        || modifiers_down() & !action.allowed != 0 {
         log_global("ALT_COMMIT_ABORT modifier_or_timeout");
         return;
     }
@@ -502,26 +524,33 @@ fn process_alt_commit() {
 
 unsafe extern "system" fn alt_keyboard_callback(code: i32, wparam: usize, lparam: isize) -> isize {
     if code >= 0 && lparam != 0 && ALT_OUTPUT_ENABLED.load(Ordering::Relaxed) {
-        let trigger = ALT_OUTPUT_KEY.load(Ordering::Relaxed);
-        if trigger == 0 { return CallNextHookEx(ptr::null_mut(), code, wparam, lparam); }
+        let configured = shortcuts();
+        if configured.is_empty() { return CallNextHookEx(ptr::null_mut(), code, wparam, lparam); }
         let event = &*(lparam as *const KBDLLHOOKSTRUCT);
         if event.flags & LLKHF_INJECTED == 0 {
             let down = wparam == WM_KEYDOWN as usize || wparam == WM_SYSKEYDOWN as usize;
             let up = wparam == WM_KEYUP as usize || wparam == WM_SYSKEYUP as usize;
             if let Ok(mut g) = ALT_GESTURE.get_or_init(|| Mutex::new(AltGesture::default())).lock() {
-                if event.vkCode == trigger
-                    || (trigger == VK_LMENU as u32 && event.vkCode == 0x12
-                        && event.flags & 0x01 == 0) {
+                // Several shortcuts can be configured; the first one whose key
+                // matches this event owns the gesture.
+                let matched = configured.into_iter().find(|(trigger, _)| {
+                    event.vkCode == *trigger
+                        || (*trigger == VK_LMENU as u32 && event.vkCode == 0x12
+                            && event.flags & 0x01 == 0)
+                });
+                if let Some((trigger, mods)) = matched {
                     if down && g.down.is_none() {
                         g.down = Some(Instant::now());
                         // A chord only fires when exactly the configured
                         // modifiers are held; anything else is a real chord.
                         let own = modifier_bit(trigger);
-                        let expected = ALT_OUTPUT_MODS.load(Ordering::Relaxed) | own;
+                        let expected = mods | own;
                         g.chord = modifiers_down() | own != expected;
+                        g.allowed = expected;
                     } else if up {
                         let eligible_tap = g.down.take().is_some_and(|t| t.elapsed() < ALT_TAP_MAX)
                             && !g.chord;
+                        let allowed = g.allowed;
                         g.chord = false;
                         if eligible_tap {
                             // The callback only stores a snapshot. All COM, IMM
@@ -534,7 +563,7 @@ unsafe extern "system" fn alt_keyboard_callback(code: i32, wparam: usize, lparam
                                             *commit = Some(PendingCommit { translation: snapshot,
                                                 focus, started: Instant::now(), stage: 0,
                                                 input_generation: PHYSICAL_KEY_EVENTS.load(Ordering::Acquire),
-                                                menu_close_before: 0, closed_since: None });
+                                                menu_close_before: 0, closed_since: None, allowed });
                                         }
                                     }
                                 }
@@ -632,6 +661,7 @@ struct TranslatorConfig {
     timeout_seconds: u64,
     debounce_ms: u64,
     auto_install: bool,
+    auto_restart: bool,
     update_interval_minutes: u64,
 }
 
@@ -658,6 +688,8 @@ impl TranslatorConfig {
                 .unwrap_or(300).clamp(100, 1000),
             auto_install: settings::truthy(
                 &env_or("TRANSPOP_AUTO_INSTALL", String::new()), file.auto_install),
+            auto_restart: settings::truthy(
+                &env_or("TRANSPOP_AUTO_RESTART", String::new()), file.auto_restart),
             // 0 = 仅手动. The retired TRANSPOP_AUTO_UPDATE=off still maps here.
             update_interval_minutes: {
                 let minutes = env_or("TRANSPOP_UPDATE_INTERVAL_MINUTES",
@@ -2384,8 +2416,8 @@ fn open_log(path: &Path) -> Option<BufWriter<File>> {
     }
 }
 
-/// Park the current log as transpop-<day>.log, appending when that day already
-/// has an archive from an earlier session.
+/// Append the current log into transpop-<day>.log, then delete it. One day has
+/// exactly one archive; a later session on the same day appends again.
 fn roll_log(path: &Path, day: &str) {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let archive = dir.join(format!("transpop-{day}.log"));
@@ -2400,6 +2432,57 @@ fn roll_log(path: &Path, day: &str) {
     }
 }
 
+/// Today's archive is only created when a day ends. If one exists while the day
+/// is still running (an earlier build archived on restart), fold it back into
+/// the live log so the date only ever appears on finished days.
+fn fold_today_archive(path: &Path, today: &str) {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let archive = dir.join(format!("transpop-{today}.log"));
+    if !archive.exists() { return; }
+    let merged = fs::OpenOptions::new().create(true).append(true).open(path)
+        .and_then(|mut target| {
+            let mut source = File::open(&archive)?;
+            std::io::copy(&mut source, &mut target).map(|_| ())
+        })
+        .and_then(|()| fs::remove_file(&archive));
+    if let Err(e) = merged {
+        eprintln!("TransPop: cannot fold {} back: {e}", archive.display());
+    }
+}
+
+/// Per-version logs and the one-off probe files older builds wrote into the
+/// data directory. They are never written again, so they are removed on start
+/// instead of piling up next to logs/.
+/// Archives older than a week are removed, so the log folder stays bounded
+/// without the user ever deleting anything. The file time is the day it was
+/// last written, which is close enough for retention.
+fn prune_old_archives(dir: &Path) {
+    const KEEP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if !name.starts_with("transpop-") || !name.ends_with(".log") { continue; }
+        let stale = entry.metadata().and_then(|meta| meta.modified())
+            .map(|stamp| stamp.elapsed().map(|age| age > KEEP).unwrap_or(false))
+            .unwrap_or(false);
+        if stale { let _ = fs::remove_file(entry.path()); }
+    }
+}
+
+fn prune_legacy_logs(base: &Path) {
+    let Ok(entries) = fs::read_dir(base) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        let legacy = name.starts_with("transpop-v")
+            || name == "diagnostics.log"
+            || name == "event-probe.log"
+            || name.starts_with("preview-v");
+        if legacy && entry.path().is_file() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn log_worker(
     rx: &Receiver<LogRecord>,
     dir: &Path,
@@ -2408,11 +2491,16 @@ fn log_worker(
     // One current log plus one archive per local day, all inside logs/. Only
     // this thread owns them, so a day change is just close, park, reopen.
     let path = dir.join("transpop.log");
+    let today = local_day(None);
     if path.exists() {
-        let stale = file_day(&path).unwrap_or_else(|| local_day(None));
-        roll_log(&path, &stale);
+        // Only a log from an earlier day gets parked. Archiving on every start
+        // split one day across transpop.log and transpop-<today>.log.
+        let stale = file_day(&path).unwrap_or_else(|| today.clone());
+        if stale != today { roll_log(&path, &stale); }
     }
-    let mut day = local_day(None);
+    fold_today_archive(&path, &today);
+    prune_old_archives(dir);
+    let mut day = today;
     // Logging is diagnostic only: this worker also relays WinEvents into probe
     // requests, so a missing log file must not stop it.
     let mut file = open_log(&path);
@@ -2806,13 +2894,21 @@ fn update_worker(base: PathBuf, manual: bool, log_tx: Sender<LogRecord>) {
             prompt.pump();
         }
     }
-    let applied = update::apply(&downloaded);
+    // A manual check always restarts: the user asked for the update and is
+    // waiting for it. A scheduled one honours the 自动重启 switch, so a build
+    // can be staged mid-session and picked up at the next start.
+    let restart = manual || AUTO_RESTART_ENABLED.load(Ordering::Acquire);
+    let applied = update::apply(&downloaded, restart);
     if let Some(prompt) = prompt.take() { unsafe { prompt.close() }; }
     match applied {
         Ok(()) => {
-            log_line(&log_tx, format!("UPDATE_APPLIED version={} restarting", release.tag));
-            let hwnd = CONTROL_HWND.load(Ordering::Acquire) as HWND;
-            if !hwnd.is_null() { unsafe { PostMessageW(hwnd, WM_APP_EXIT, 0, 0); } }
+            log_line(&log_tx, format!("UPDATE_APPLIED version={} restart={restart}", release.tag));
+            if restart {
+                let hwnd = CONTROL_HWND.load(Ordering::Acquire) as HWND;
+                if !hwnd.is_null() { unsafe { PostMessageW(hwnd, WM_APP_EXIT, 0, 0); } }
+            } else {
+                log_line(&log_tx, "UPDATE_INSTALLED_NO_RESTART");
+            }
         }
         Err(reason) => {
             log_line(&log_tx, format!("UPDATE_APPLY_FAILED {reason}"));
@@ -2929,6 +3025,7 @@ fn main() {
     let uia_probe_tx = probe_tx.clone();
     let log_dir = logdir.clone();
     thread::spawn(move || supervise_worker("log", || log_worker(&log_rx, &log_dir, &log_probe_tx)));
+    prune_legacy_logs(&base);
     // A self-update leaves the previous exe next to this one; it is the manual
     // rollback path until this process proves it reaches its message loop.
     if let Some(backup) = update::stale_backup() {
@@ -2952,6 +3049,7 @@ fn main() {
         apply_shortcut(&shortcut);
     }
     AUTO_INSTALL_ENABLED.store(config.auto_install, Ordering::Release);
+    AUTO_RESTART_ENABLED.store(config.auto_restart, Ordering::Release);
     UPDATE_INTERVAL_MINUTES.store(config.update_interval_minutes, Ordering::Release);
     let configuration_status = config.readiness();
     CONFIG_ENABLED.store(configuration_status.is_ok(), Ordering::Release);
@@ -3182,6 +3280,12 @@ fn main() {
                     }
                     continue;
                 }
+                settings::SHORTCUT_MESSAGE if msg.hwnd == control => {
+                    if let Some(ref settings_ui) = settings_window {
+                        settings_ui.refresh_shortcuts();
+                    }
+                    continue;
+                }
                 settings::UPDATE_MESSAGE if msg.hwnd == control => {
                     log_global("UPDATE_CHECK_MANUAL");
                     let update_base = base.clone();
@@ -3216,6 +3320,7 @@ fn main() {
                                 apply_shortcut(&values.alt_output_shortcut);
                                 let shortcut_on = ALT_OUTPUT_ENABLED.load(Ordering::Acquire);
                                 AUTO_INSTALL_ENABLED.store(values.auto_install, Ordering::Release);
+                                AUTO_RESTART_ENABLED.store(values.auto_restart, Ordering::Release);
                                 let was_manual = UPDATE_INTERVAL_MINUTES
                                     .load(Ordering::Acquire) == 0;
                                 let chosen_interval = match values.update_interval_minutes
@@ -3246,8 +3351,8 @@ fn main() {
                                 }
                                 log_global(format!("SETTINGS_SAVED provider={}", values.provider));
                                 log_global(format!(
-                                    "UPDATE_SETTING auto_install={} interval_minutes={chosen_interval}",
-                                    values.auto_install));
+                                    "UPDATE_SETTING auto_install={} auto_restart={} interval_minutes={chosen_interval}",
+                                    values.auto_install, values.auto_restart));
                                 // Leaving 仅手动 for a real interval: check once soon
                                 // instead of waiting a full interval from now.
                                 if chosen_interval != 0 && was_manual {
