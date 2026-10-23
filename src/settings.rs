@@ -8,11 +8,11 @@ use windows_sys::Win32::{
     Graphics::{
         Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE},
         Gdi::{
-            BeginPaint, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
+            BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject,
             DrawTextW, EndPaint, FillRect, GetDC, GetMonitorInfoW, GetStockObject, GetSysColor,
             GetTextMetricsW,
             InvalidateRect, MonitorFromPoint, MonitorFromWindow, Polyline, RedrawWindow, ReleaseDC,
-            RoundRect, SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn,
+            RoundRect, SelectObject, SetBkColor, SetBkMode, SetTextColor,
             COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT, DT_CALCRECT, DT_CENTER,
             DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, MONITORINFO,
             MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, PAINTSTRUCT, RDW_ALLCHILDREN,
@@ -126,7 +126,6 @@ const SHORTCUT_ADD_W: i32 = 30;
 /// Width shared by the two numeric fields, so their unit labels align too.
 const SHORT_FIELD_W: i32 = 90;
 /// Corner radius of the frame itself, in logical pixels.
-const WINDOW_RADIUS: i32 = 10;
 /// What a clicked row shows until a key is pressed.
 const SHORTCUT_HINT: &str = "请设置按键";
 const WINDOW_STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
@@ -426,16 +425,6 @@ unsafe fn fill_round(hdc: HDC, rect: &RECT, brush: HBRUSH, radius: i32) {
     RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, diameter, diameter);
     if !old_pen.is_null() { SelectObject(hdc, old_pen); }
     if !old_brush.is_null() { SelectObject(hdc, old_brush); }
-}
-
-/// Clips a child window to a rounded region. The native EDIT paints its own
-/// square corners, so the only way to round it is to cut its window shape.
-unsafe fn round_window(hwnd: HWND, width: i32, height: i32, diameter: i32) {
-    if hwnd.is_null() { return; }
-    let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
-    if region.is_null() { return; }
-    // After success Windows owns the region; delete only on failure.
-    if SetWindowRgn(hwnd, region, 1) == 0 { DeleteObject(region); }
 }
 
 /// Outlines a rounded rectangle with a hairline of the given colour.
@@ -2150,9 +2139,6 @@ impl SettingsWindow {
         let (x, y) = self.placement(width, height, center);
         SetWindowPos(self.hwnd, ptr::null_mut(), x, y, width, height,
             SWP_NOZORDER | SWP_NOACTIVATE);
-        // Windows 10 has no rounded frame, so the frame is cut to the same
-        // radius as the controls inside it.
-        round_window(self.hwnd, width, height, s(WINDOW_RADIUS) * 2);
         // The plate list was rebuilt: erase whatever the previous page painted.
         InvalidateRect(self.hwnd, ptr::null(), 1);
     }
