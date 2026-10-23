@@ -6,7 +6,7 @@ use std::{cell::RefCell, collections::HashMap, fs, io::Write, mem, path::{Path, 
 use windows_sys::Win32::{
     Foundation::{HWND, POINT, RECT},
     Graphics::{
-        Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE},
+        Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND},
         Gdi::{
             BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject,
             DrawTextW, EndPaint, FillRect, GetDC, GetMonitorInfoW, GetStockObject, GetSysColor,
@@ -712,6 +712,11 @@ unsafe fn apply_window_theme(hwnd: HWND, theme: &mut UiTheme) {
         (&dark as *const u32).cast(), 4) != 0 {
         let _ = DwmSetWindowAttribute(hwnd, 19, (&dark as *const u32).cast(), 4);
     }
+    // Windows 11 rounds the frame itself; the call fails harmlessly on Windows
+    // 10, which keeps the plain square frame there.
+    let round: i32 = DWMWCP_ROUND;
+    let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+        (&round as *const i32).cast(), 4);
     // The non-client area ignores runtime attribute flips until the window is
     // re-shown, so a live switch costs one flicker.
     if changed && IsWindowVisible(hwnd) != 0 {
