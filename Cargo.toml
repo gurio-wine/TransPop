@@ -1,8 +1,8 @@
 [package]
 name = "transpop"
-version = "0.17.2"
+version = "0.18.0"
 edition = "2021"
-description = "Translate the highlighted Chinese IME candidate to English in real time on Windows"
+description = "Translate the highlighted IME candidate in real time on Windows"
 license = "MIT"
 repository = "https://github.com/gurio-wine/TransPop"
 publish = false
