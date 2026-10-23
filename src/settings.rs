@@ -8,13 +8,15 @@ use windows_sys::Win32::{
     Graphics::{
         Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE},
         Gdi::{
-            CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawFocusRect, DrawTextW,
-            FillRect, FrameRect, GetMonitorInfoW, GetStockObject, GetSysColor, InvalidateRect,
-            MonitorFromPoint, MonitorFromWindow, Polyline, RedrawWindow, SelectObject,
-            SetBkColor, SetBkMode, SetTextColor, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_WINDOW,
-            COLOR_WINDOWTEXT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH,
-            HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST, RDW_ALLCHILDREN, RDW_ERASE,
-            RDW_INVALIDATE,
+            BeginPaint, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
+            DrawTextW, EndPaint, FillRect, GetDC, GetMonitorInfoW, GetStockObject, GetSysColor,
+            GetTextMetricsW,
+            InvalidateRect, MonitorFromPoint, MonitorFromWindow, Polyline, RedrawWindow, ReleaseDC,
+            RoundRect, SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn,
+            COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT, DT_CALCRECT, DT_CENTER,
+            DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, MONITORINFO,
+            MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, PAINTSTRUCT, RDW_ALLCHILDREN,
+            RDW_ERASE, RDW_INVALIDATE, TEXTMETRICW,
         },
     },
     System::{
@@ -23,7 +25,8 @@ use windows_sys::Win32::{
     },
     UI::{
         Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
-        Controls::{SetWindowTheme, DRAWITEMSTRUCT, ODS_FOCUS},
+        Controls::{SetWindowTheme, DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_SELECTED,
+            ODT_MENU},
         Shell::{DefSubclassProc, SetWindowSubclass, ShellExecuteW},
         Input::KeyboardAndMouse::{
             GetKeyState, MapVirtualKeyW, SetFocus, MAPVK_VSC_TO_VK_EX, VK_CONTROL,
@@ -35,12 +38,14 @@ use windows_sys::Win32::{
             DestroyMenu, DestroyWindow, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
             GetDlgItem, GetParent, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
             GetWindowTextW, IsWindow, IsWindowVisible, PostMessageW, RegisterClassW, SendMessageW,
-            SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-            SystemParametersInfoW, TrackPopupMenu, BN_CLICKED, DM_GETDEFID, GWLP_USERDATA,
-            MF_CHECKED, MF_STRING, SPI_GETHIGHCONTRAST, SW_HIDE, SW_SHOW, SW_SHOWNA,
+            SetForegroundWindow, SetMenuInfo, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+            ShowWindow, SystemParametersInfoW, TrackPopupMenu, BN_CLICKED, DM_GETDEFID,
+            GWLP_USERDATA, MENUINFO, MF_OWNERDRAW, MIM_BACKGROUND,
+            SPI_GETHIGHCONTRAST, SW_HIDE, SW_SHOW, SW_SHOWNA,
             SW_SHOWNORMAL, SWP_NOACTIVATE,
             SWP_NOZORDER, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN, WM_CHAR,
-            WM_CLOSE, WM_COMMAND, WM_DRAWITEM, WM_GETFONT, WM_KEYUP, WM_KILLFOCUS,
+            WM_CLOSE, WM_COMMAND, WM_DRAWITEM, WM_GETFONT, WM_KEYUP, WM_KILLFOCUS, WM_MEASUREITEM,
+            WM_PAINT,
             WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_CAPTION, WS_CHILD,
             WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
         },
@@ -109,12 +114,19 @@ const TAB_W: i32 = 100;
 const TAB_H: i32 = 30;
 const TAB_GAP: i32 = 6;
 const CONTENT_TOP: i32 = 150;
+// One size and one corner radius for every interactive control, so fields,
+// selectors and buttons line up instead of each page inventing its own.
+const CONTROL_H: i32 = 30;
+const RADIUS: i32 = 6;
 // Shortcut row: fixed-width centred fields plus one + button, on its own row.
 pub const MAX_SHORTCUTS: usize = 3;
 const SHORTCUT_W: i32 = 152;
-const SHORTCUT_H: i32 = 30;
 const SHORTCUT_GAP: i32 = 6;
 const SHORTCUT_ADD_W: i32 = 30;
+/// Width shared by the two numeric fields, so their unit labels align too.
+const SHORT_FIELD_W: i32 = 90;
+/// Corner radius of the frame itself, in logical pixels.
+const WINDOW_RADIUS: i32 = 10;
 /// What a clicked row shows until a key is pressed.
 const SHORTCUT_HINT: &str = "请设置按键";
 const WINDOW_STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
@@ -254,6 +266,11 @@ struct UiTheme {
     /// area across a hide/show cycle, so a real change is tracked.
     frame_dark: bool,
     dpi: i32,
+    /// The form font, shared by every painted control and the popup rows.
+    font: HFONT,
+    /// Height of one line of that font, in device pixels: a native field is
+    /// shrunk to exactly this so its text sits in the middle of its plate.
+    line_h: i32,
     colors: Colors,
     bg_brush: HBRUSH,
     field_brush: HBRUSH,
@@ -265,9 +282,18 @@ struct UiTheme {
     lines: Vec<isize>,
     /// Read-only edits, painted with the field fill like live ones.
     fields: Vec<isize>,
+    /// Rounded plates painted under those fields, in client coordinates.
+    plates: Vec<(isize, RECT)>,
+    /// Labels of the popup a selector is showing right now, its choice, and
+    /// the width Windows should give the popup.
+    menu_items: Vec<String>,
+    menu_current: usize,
+    menu_width: i32,
     /// Owner-drawn shortcut rows, and the "+" that appends one.
     shortcut_rows: Vec<isize>,
     shortcut_plus: isize,
+    /// Plain owner-drawn buttons, painted like a field with centred text.
+    buttons: Vec<isize>,
     /// Flat selectors: one text row plus a chevron, menu on click.
     selects: Vec<Select>,
     /// Owner-drawn tab buttons, and which page is showing.
@@ -276,11 +302,18 @@ struct UiTheme {
 }
 
 impl UiTheme {
+    /// Logical pixels to device pixels, the one conversion the form uses.
+    fn scale(&self, value: i32) -> i32 {
+        value * self.dpi / 96
+    }
+
     unsafe fn create(palette: Palette, dpi: i32) -> Self {
         let mut theme = Self {
             dark: palette == Palette::Dark,
             frame_dark: palette == Palette::Dark,
             dpi,
+            font: ptr::null_mut(),
+            line_h: 0,
             colors: palette.colors(),
             bg_brush: ptr::null_mut(),
             field_brush: ptr::null_mut(),
@@ -289,8 +322,13 @@ impl UiTheme {
             notes: Vec::new(),
             lines: Vec::new(),
             fields: Vec::new(),
+            plates: Vec::new(),
+            menu_items: Vec::new(),
+            menu_current: 0,
+            menu_width: 0,
             shortcut_rows: Vec::new(),
             shortcut_plus: 0,
+            buttons: Vec::new(),
             selects: Vec::new(),
             tabs: Vec::new(),
             page: 0,
@@ -378,6 +416,41 @@ unsafe fn set_button_checked(control: HWND, checked: bool) {
     InvalidateRect(control, ptr::null(), 0);
 }
 
+/// Fills a rectangle with rounded corners. GDI has no filled round-rect
+/// primitive, so the stock null pen turns RoundRect into a pure fill.
+unsafe fn fill_round(hdc: HDC, rect: &RECT, brush: HBRUSH, radius: i32) {
+    if brush.is_null() { return; }
+    let old_brush = SelectObject(hdc, brush);
+    let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+    let diameter = radius.max(0) * 2;
+    RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, diameter, diameter);
+    if !old_pen.is_null() { SelectObject(hdc, old_pen); }
+    if !old_brush.is_null() { SelectObject(hdc, old_brush); }
+}
+
+/// Clips a child window to a rounded region. The native EDIT paints its own
+/// square corners, so the only way to round it is to cut its window shape.
+unsafe fn round_window(hwnd: HWND, width: i32, height: i32, diameter: i32) {
+    if hwnd.is_null() { return; }
+    let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
+    if region.is_null() { return; }
+    // After success Windows owns the region; delete only on failure.
+    if SetWindowRgn(hwnd, region, 1) == 0 { DeleteObject(region); }
+}
+
+/// Outlines a rounded rectangle with a hairline of the given colour.
+unsafe fn ring_round(hdc: HDC, rect: &RECT, colour: u32, radius: i32, width: i32) {
+    let pen = CreatePen(PS_SOLID, width.max(1), colour);
+    if pen.is_null() { return; }
+    let old_pen = SelectObject(hdc, pen);
+    let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    let diameter = radius.max(0) * 2;
+    RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, diameter, diameter);
+    if !old_brush.is_null() { SelectObject(hdc, old_brush); }
+    if !old_pen.is_null() { SelectObject(hdc, old_pen); }
+    DeleteObject(pen);
+}
+
 unsafe fn draw_checkbox(item: &DRAWITEMSTRUCT, theme: &UiTheme) {
     let s = |value: i32| value * theme.dpi / 96;
     let hdc = item.hDC;
@@ -388,7 +461,7 @@ unsafe fn draw_checkbox(item: &DRAWITEMSTRUCT, theme: &UiTheme) {
     let glyph = RECT { left, top, right: left + size, bottom: top + size };
     let checked = button_checked(item.hwndItem);
     if checked {
-        FillRect(hdc, &glyph, theme.accent_brush);
+        fill_round(hdc, &glyph, theme.accent_brush, s(3));
         let pen = CreatePen(PS_SOLID, s(2).max(1), theme.colors.bg);
         if !pen.is_null() {
             let old = SelectObject(hdc, pen);
@@ -402,11 +475,8 @@ unsafe fn draw_checkbox(item: &DRAWITEMSTRUCT, theme: &UiTheme) {
             DeleteObject(pen);
         }
     } else {
-        let border = CreateSolidBrush(theme.colors.secondary);
-        if !border.is_null() {
-            FrameRect(hdc, &glyph, border);
-            DeleteObject(border);
-        }
+        // A ring, not a box: no border anywhere else in the form either.
+        ring_round(hdc, &glyph, theme.colors.secondary, s(3), s(1));
     }
     let mut text = [0u16; 256];
     let len = GetWindowTextW(item.hwndItem, text.as_mut_ptr(), text.len() as i32).max(0) as usize;
@@ -423,7 +493,6 @@ unsafe fn draw_checkbox(item: &DRAWITEMSTRUCT, theme: &UiTheme) {
     DrawTextW(hdc, text.as_ptr(), len as i32, &mut area,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     if !old_font.is_null() { SelectObject(hdc, old_font); }
-    if item.itemState & ODS_FOCUS != 0 { DrawFocusRect(hdc, &item.rcItem); }
 }
 
 /// Owner-drawn shortcut row: field fill, the label centred both ways, and a
@@ -433,7 +502,8 @@ unsafe fn draw_checkbox(item: &DRAWITEMSTRUCT, theme: &UiTheme) {
 unsafe fn draw_shortcut(item: &DRAWITEMSTRUCT, theme: &UiTheme, plus: bool) {
     let s = |value: i32| value * theme.dpi / 96;
     let hdc = item.hDC;
-    FillRect(hdc, &item.rcItem, theme.field_brush);
+    FillRect(hdc, &item.rcItem, theme.bg_brush);
+    fill_round(hdc, &item.rcItem, theme.field_brush, s(RADIUS));
     if plus {
         let cx = (item.rcItem.left + item.rcItem.right) / 2;
         let cy = (item.rcItem.top + item.rcItem.bottom) / 2;
@@ -463,14 +533,6 @@ unsafe fn draw_shortcut(item: &DRAWITEMSTRUCT, theme: &UiTheme, plus: bool) {
             if !old_font.is_null() { SelectObject(hdc, old_font); }
         }
     }
-    if item.itemState & ODS_FOCUS != 0 {
-        let mut focus = item.rcItem;
-        focus.left += s(2);
-        focus.right -= s(2);
-        focus.top += s(2);
-        focus.bottom -= s(2);
-        DrawFocusRect(hdc, &focus);
-    }
 }
 
 /// Owner-drawn tab: a filled card for the page that is showing and plain text
@@ -483,17 +545,8 @@ unsafe fn draw_tab(item: &DRAWITEMSTRUCT, theme: &UiTheme, index: usize) {
     FillRect(hdc, &item.rcItem, theme.bg_brush);
     let mut area = item.rcItem;
     if active {
-        let mut card = item.rcItem;
-        card.bottom -= s(2);
-        FillRect(hdc, &card, theme.field_brush);
-        // Underline the active tab against the page background.
-        let underline = RECT {
-            left: item.rcItem.left,
-            top: item.rcItem.bottom - s(2),
-            right: item.rcItem.right,
-            bottom: item.rcItem.bottom,
-        };
-        FillRect(hdc, &underline, theme.accent_brush);
+        // A filled card, like the controls: colour alone marks the page.
+        fill_round(hdc, &item.rcItem, theme.field_brush, s(RADIUS));
     }
     let mut text = [0u16; 64];
     let len = GetWindowTextW(item.hwndItem, text.as_mut_ptr(), text.len() as i32).max(0) as usize;
@@ -504,21 +557,15 @@ unsafe fn draw_tab(item: &DRAWITEMSTRUCT, theme: &UiTheme, index: usize) {
     DrawTextW(hdc, text.as_ptr(), len as i32, &mut area,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     if !old_font.is_null() { SelectObject(hdc, old_font); }
-    if item.itemState & ODS_FOCUS != 0 {
-        let mut focus = item.rcItem;
-        focus.left += s(2);
-        focus.right -= s(2);
-        DrawFocusRect(hdc, &focus);
-    }
 }
-
 
 /// Flat selector: the current choice on a plain fill with a chevron on the
 /// right, so it reads as a value rather than as a text field.
 unsafe fn draw_select(item: &DRAWITEMSTRUCT, theme: &UiTheme) {
     let s = |value: i32| value * theme.dpi / 96;
     let hdc = item.hDC;
-    FillRect(hdc, &item.rcItem, theme.field_brush);
+    FillRect(hdc, &item.rcItem, theme.bg_brush);
+    fill_round(hdc, &item.rcItem, theme.field_brush, s(RADIUS));
     let mut text = [0u16; 256];
     let len = GetWindowTextW(item.hwndItem, text.as_mut_ptr(), text.len() as i32).max(0) as usize;
     let font = SendMessageW(item.hwndItem, WM_GETFONT, 0, 0) as HFONT;
@@ -550,26 +597,85 @@ unsafe fn draw_select(item: &DRAWITEMSTRUCT, theme: &UiTheme) {
         DeleteObject(pen);
     }
     if !old_font.is_null() { SelectObject(hdc, old_font); }
-    if item.itemState & ODS_FOCUS != 0 {
-        let mut focus = item.rcItem;
-        focus.left += s(2);
-        focus.right -= s(2);
-        DrawFocusRect(hdc, &focus);
-    }
 }
 
-/// Pops the native menu under a flat selector and returns the picked option.
+/// Owner-drawn plain button: a rounded field-coloured slab with the label
+/// centred both ways, so it matches the selectors instead of wearing the
+/// stock 3D frame. A pressed button darkens to the line colour.
+unsafe fn draw_button(item: &DRAWITEMSTRUCT, theme: &UiTheme) {
+    let s = |value: i32| value * theme.dpi / 96;
+    let hdc = item.hDC;
+    FillRect(hdc, &item.rcItem, theme.bg_brush);
+    let brush = if item.itemState & ODS_SELECTED != 0 {
+        theme.line_brush
+    } else {
+        theme.field_brush
+    };
+    fill_round(hdc, &item.rcItem, brush, s(RADIUS));
+    let mut text = [0u16; 128];
+    let len = GetWindowTextW(item.hwndItem, text.as_mut_ptr(), text.len() as i32).max(0) as usize;
+    let font = SendMessageW(item.hwndItem, WM_GETFONT, 0, 0) as HFONT;
+    let old_font = if font.is_null() { ptr::null_mut() } else { SelectObject(hdc, font) };
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, theme.colors.text);
+    let mut area = item.rcItem;
+    DrawTextW(hdc, text.as_ptr(), len as i32, &mut area,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if !old_font.is_null() { SelectObject(hdc, old_font); }
+}
+
+/// Owner-drawn popup row: the stock menu paints a grey check gutter and a hard
+/// square highlight that do not match the flat form, so every row is drawn
+/// here. The current choice is marked by the accent colour, the hot row by a
+/// rounded field fill.
+unsafe fn draw_menu(item: &DRAWITEMSTRUCT, theme: &UiTheme) {
+    let s = |value: i32| value * theme.dpi / 96;
+    let hdc = item.hDC;
+    FillRect(hdc, &item.rcItem, theme.bg_brush);
+    let index = item.itemData;
+    if item.itemState & ODS_SELECTED != 0 {
+        let mut row = item.rcItem;
+        row.top += s(1);
+        row.bottom -= s(1);
+        fill_round(hdc, &row, theme.field_brush, s(4));
+    }
+    let Some(label) = theme.menu_items.get(index) else { return; };
+    let text = wide(label);
+    let font = theme.font;
+    let old_font = if font.is_null() { ptr::null_mut() } else { SelectObject(hdc, font) };
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, if index == theme.menu_current { theme.colors.accent } else { theme.colors.text });
+    let mut area = RECT {
+        left: item.rcItem.left + s(12),
+        top: item.rcItem.top,
+        right: item.rcItem.right - s(12),
+        bottom: item.rcItem.bottom,
+    };
+    DrawTextW(hdc, text.as_ptr(), text.len() as i32 - 1, &mut area,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if !old_font.is_null() { SelectObject(hdc, old_font); }
+}
+
+/// Pops the themed menu under a flat selector and returns the picked option.
 /// A dismissed menu yields None, so the stored choice stays as it was.
-unsafe fn pick_option(hwnd: HWND, control: HWND, theme: &UiTheme) -> Option<(usize, String)> {
+unsafe fn pick_option(hwnd: HWND, control: HWND, theme: &mut UiTheme) -> Option<(usize, String)> {
     let (current, items) = theme.selection(control)?;
     let menu = CreatePopupMenu();
     if menu.is_null() { return None; }
-    let mut labels: Vec<Vec<u16>> = Vec::with_capacity(items.len());
-    for (index, item) in items.iter().enumerate() {
-        let label = wide(item);
-        let flags = if index == current { MF_STRING | MF_CHECKED } else { MF_STRING };
-        AppendMenuW(menu, flags, index + 1, label.as_ptr());
-        labels.push(label);
+    // The rows are painted from these labels, so they must be reachable from
+    // the window procedure while the menu is up.
+    theme.menu_items = items.clone();
+    theme.menu_current = current;
+    theme.menu_width = menu_width(control, theme, &items);
+    let mut info: MENUINFO = mem::zeroed();
+    info.cbSize = mem::size_of::<MENUINFO>() as u32;
+    info.fMask = MIM_BACKGROUND;
+    info.hbrBack = theme.bg_brush;
+    SetMenuInfo(menu, &info);
+    // The command id is the option number and itemData is the option index:
+    // the row painter needs the index, the menu only reports the id.
+    for index in 0..items.len() {
+        AppendMenuW(menu, MF_OWNERDRAW, index + 1, index as usize as *const u16);
     }
     let mut rect: RECT = mem::zeroed();
     GetWindowRect(control, &mut rect);
@@ -577,8 +683,33 @@ unsafe fn pick_option(hwnd: HWND, control: HWND, theme: &UiTheme) -> Option<(usi
         TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
         rect.left, rect.bottom, 0, hwnd, ptr::null());
     DestroyMenu(menu);
+    theme.menu_items.clear();
+    theme.menu_width = 0;
     if chosen == 0 { return None; }
     items.get(chosen as usize - 1).map(|label| (chosen as usize - 1, label.clone()))
+}
+
+/// Width of the popup: the widest label plus padding, never narrower than the
+/// control it drops from, so the menu lines up with the field above it.
+unsafe fn menu_width(control: HWND, theme: &UiTheme, items: &[String]) -> i32 {
+    let s = |value: i32| value * theme.dpi / 96;
+    let mut widest = 0;
+    let hdc = GetDC(control);
+    if !hdc.is_null() {
+        let old_font = if theme.font.is_null() { ptr::null_mut() } else { SelectObject(hdc, theme.font) };
+        for item in items {
+            let text = wide(item);
+            let mut area = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            DrawTextW(hdc, text.as_ptr(), text.len() as i32 - 1, &mut area,
+                DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+            widest = widest.max(area.right);
+        }
+        if !old_font.is_null() { SelectObject(hdc, old_font); }
+        ReleaseDC(control, hdc);
+    }
+    let mut rect: RECT = mem::zeroed();
+    GetWindowRect(control, &mut rect);
+    (widest + s(24)).max(rect.right - rect.left)
 }
 
 /// Applies the palette to the frame and every child control. Runs on open and
@@ -617,7 +748,7 @@ unsafe fn apply_window_theme(hwnd: HWND, theme: &mut UiTheme) {
 }
 
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
-    let theme = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const UiTheme;
+    let theme = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut UiTheme;
     match msg {
         WM_ERASEBKGND => {
             // The class brush is only a fallback: repaint with the theme colour.
@@ -644,10 +775,22 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
             SetTextColor(wp as _, (*theme).colors.text);
             (*theme).field_brush as isize
         }
+        // Rows of a selector popup: painted here so the menu matches the form.
+        WM_MEASUREITEM => {
+            if theme.is_null() { return DefWindowProcW(hwnd, msg, wp, lp); }
+            let item = &mut *(lp as *mut MEASUREITEMSTRUCT);
+            if item.CtlType != ODT_MENU { return DefWindowProcW(hwnd, msg, wp, lp); }
+            let s = |value: i32| value * (*theme).dpi / 96;
+            item.itemWidth = (*theme).menu_width.max(0) as u32;
+            item.itemHeight = s(CONTROL_H) as u32;
+            1
+        }
         WM_DRAWITEM => {
             if theme.is_null() { return DefWindowProcW(hwnd, msg, wp, lp); }
             let item = &*(lp as *const DRAWITEMSTRUCT);
-            if let Some(index) = (*theme).tab_index(item.hwndItem) {
+            if item.CtlType == ODT_MENU {
+                draw_menu(item, &*theme);
+            } else if let Some(index) = (*theme).tab_index(item.hwndItem) {
                 draw_tab(item, &*theme, index);
             } else if (*theme).shortcut_rows.contains(&(item.hwndItem as isize)) {
                 draw_shortcut(item, &*theme, false);
@@ -655,15 +798,49 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
                 draw_shortcut(item, &*theme, true);
             } else if (*theme).select_position(item.hwndItem).is_some() {
                 draw_select(item, &*theme);
+            } else if (*theme).buttons.contains(&(item.hwndItem as isize)) {
+                draw_button(item, &*theme);
             } else {
                 draw_checkbox(item, &*theme);
             }
             1
         }
+        WM_PAINT => {
+            // A single-line edit centres its text only inside its own short
+            // format rectangle, so the rounded field is painted by the form and
+            // the edit sits on top of it, centred by geometry.
+            if !theme.is_null() && !(*theme).plates.is_empty() {
+                let mut paint: PAINTSTRUCT = mem::zeroed();
+                let hdc = BeginPaint(hwnd, &mut paint);
+                for (field, plate) in &(*theme).plates {
+                    if IsWindowVisible(*field as HWND) == 0 { continue; }
+                    FillRect(hdc, plate, (*theme).bg_brush);
+                    fill_round(hdc, plate, (*theme).field_brush, (*theme).scale(RADIUS));
+                }
+                EndPaint(hwnd, &paint);
+                0
+            } else {
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+        }
         // Clicking the background takes focus off a shortcut row, which is how a
         // row the user no longer wants is cleared (and then dropped).
         WM_LBUTTONDOWN => {
-            SetFocus(hwnd);
+            // The edit is one line tall inside a taller plate, so a click on
+            // the plate's own padding must still land in the edit.
+            let point = POINT { x: (lp as i16) as i32, y: ((lp >> 16) as i16) as i32 };
+            let mut target = hwnd;
+            if !theme.is_null() {
+                for (field, plate) in &(*theme).plates {
+                    if point.x >= plate.left && point.x < plate.right
+                        && point.y >= plate.top && point.y < plate.bottom
+                        && IsWindowVisible(*field as HWND) != 0 {
+                        target = *field as HWND;
+                        break;
+                    }
+                }
+            }
+            SetFocus(target);
             0
         }
         // No default button: Enter must never dismiss a form that saves itself.
@@ -726,7 +903,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
             if notify as u32 == BN_CLICKED
                 && matches!(id, ID_PROVIDER | ID_THEME | ID_UPDATE_INTERVAL) {
                 if theme.is_null() { return 0; }
-                let picked = pick_option(hwnd, control, &*theme);
+                let picked = pick_option(hwnd, control, &mut *theme);
                 let Some((index, label)) = picked else { return 0 };
                 let theme = theme as *mut UiTheme;
                 (*theme).set_selection(control, index);
@@ -1567,6 +1744,17 @@ impl SettingsWindow {
         let title_font = CreateFontW(-scale(20), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, font_face.as_ptr());
         let section_font = CreateFontW(-scale(14), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, font_face.as_ptr());
         let note_font = CreateFontW(-scale(12), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, font_face.as_ptr());
+        // The form needs the font metrics: an edit cannot centre its own text
+        // vertically, so it is sized to one line and centred by the layout.
+        (*theme_ptr).font = font;
+        let dc = GetDC(hwnd);
+        if !dc.is_null() {
+            let old = SelectObject(dc, font);
+            let mut metrics: TEXTMETRICW = mem::zeroed();
+            if GetTextMetricsW(dc, &mut metrics) != 0 { (*theme_ptr).line_h = metrics.tmHeight; }
+            SelectObject(dc, old);
+            ReleaseDC(hwnd, dc);
+        }
         // No coordinates here on purpose: layout() owns every position and size.
         let create = |kind: &str, text: &str, id: u16, style: u32| -> HWND {
             let c = wide(kind); let t = wide(text);
@@ -1692,13 +1880,13 @@ impl SettingsWindow {
             BS_OWNERDRAW | WS_TABSTOP);
         selects.push(Select { hwnd: update_interval as isize, items: interval_items,
             index: interval_pos });
-        let update_button = create("BUTTON", "检查更新", ID_UPDATE, WS_TABSTOP);
+        let update_button = create("BUTTON", "检查更新", ID_UPDATE, BS_OWNERDRAW | WS_TABSTOP);
         let startup_title = create("STATIC", "启动", 0, 0);
         set_font(startup_title, section_font);
         // About page: a project block and an update block, nothing else.
         let project_title = create("STATIC", "项目", 0, 0);
         set_font(project_title, section_font);
-        let open_repo = create("BUTTON", "打开仓库", ID_OPEN_REPO, WS_TABSTOP);
+        let open_repo = create("BUTTON", "打开仓库", ID_OPEN_REPO, BS_OWNERDRAW | WS_TABSTOP);
         let update_title = create("STATIC", "更新", 0, 0);
         set_font(update_title, section_font);
         let version_label = create("STATIC", &format!("当前版本 v{}", super::VERSION), 0, 0);
@@ -1755,6 +1943,11 @@ impl SettingsWindow {
                      timeout, debounce] {
             if !edit.is_null() { (*theme_ptr).fields.push(edit as isize); }
         }
+        // Plain owner-drawn buttons: the two action buttons and the two
+        // "显示" toggles beside the key fields.
+        for button in [update_button, open_repo, azure_reveal, openai_reveal] {
+            (*theme_ptr).buttons.push(button as isize);
+        }
         for row in shortcut_keys { (*theme_ptr).shortcut_rows.push(row as isize); }
         (*theme_ptr).shortcut_plus = shortcut_add as isize;
         for tab in [tab_translate, tab_appearance, tab_system, tab_shortcut, tab_about] {
@@ -1792,11 +1985,32 @@ impl SettingsWindow {
     /// selected provider, so switching providers only needs a new layout pass.
     unsafe fn layout(&self) -> i32 {
         let s = |value: i32| value * self.dpi / 96;
-        let place = |control: HWND, x: i32, y: i32, width: i32, height: i32| {
-            if !control.is_null() {
-                SetWindowPos(control, ptr::null_mut(), s(x), s(y), s(width), s(height),
+        // layout() only reads the window, but the plate list it rebuilds lives
+        // in the paint state, so it is reached through a raw pointer.
+        let theme = &*self.theme as *const UiTheme as *mut UiTheme;
+        (*theme).plates.clear();
+        let plates = &mut (*theme).plates;
+        let mut place = |control: HWND, x: i32, y: i32, width: i32, height: i32| {
+            if control.is_null() { return; }
+            if (*self.theme).fields.contains(&(control as isize)) {
+                // A field is a painted rounded plate with a one-line edit
+                // floating on it: the edit cannot round its own corners and
+                // cannot move its text down, so both are done by geometry.
+                let line = (*self.theme).line_h.max(1);
+                let plate = RECT {
+                    left: s(x),
+                    top: s(y),
+                    right: s(x + width),
+                    bottom: s(y + CONTROL_H),
+                };
+                plates.push((control as isize, plate));
+                let inset = (s(CONTROL_H) - line) / 2;
+                SetWindowPos(control, ptr::null_mut(), s(x), s(y) + inset, s(width), line,
                     SWP_NOZORDER | SWP_NOACTIVATE);
+                return;
             }
+            SetWindowPos(control, ptr::null_mut(), s(x), s(y), s(width), s(height),
+                SWP_NOZORDER | SWP_NOACTIVATE);
         };
         let show = |control: HWND, visible: bool| {
             if !control.is_null() {
@@ -1828,7 +2042,7 @@ impl SettingsWindow {
         // Translation page. The credential block only exists for providers that
         // need one, so 翻译行为 slides up instead of leaving a hole.
         place(self.service_title, MARGIN_X, top, 460, 22);
-        place(self.provider, MARGIN_X, top + 28, CONTENT_W, 30);
+        place(self.provider, MARGIN_X, top + 28, CONTENT_W, CONTROL_H);
         let mut y = top + 74;
         place(self.connection_title, MARGIN_X, y, 460, 22);
         let rows = if selected == 1 { &self.azure } else { &self.openai };
@@ -1837,25 +2051,26 @@ impl SettingsWindow {
             let row_y = y + 28 + row as i32 * 36;
             place(*label, MARGIN_X, row_y + 4, LABEL_W, 22);
             let width = if row == 2 { SECRET_W } else { FIELD_W };
-            place(*edit, FIELD_X, row_y, width, 28);
-            if row == 2 { place(reveal, 485, row_y + 3, 61, 22); }
+            place(*edit, FIELD_X, row_y, width, CONTROL_H);
+            if row == 2 { place(reveal, 485, row_y + 4, 61, CONTROL_H - 8); }
         }
         if advanced { y += 28 + 2 * 36 + 28; }
         place(self.behavior_divider, MARGIN_X, y, CONTENT_W, 1);
         y += 18;
         place(self.behavior_title, MARGIN_X, y, 460, 22);
         y += 32;
+        // Both numeric fields share one width, so their unit labels line up.
         place(self.timeout_label, MARGIN_X, y + 4, LABEL_W, 22);
-        place(self.timeout, FIELD_X, y, 90, 28);
-        place(self.timeout_unit, FIELD_X + 98, y + 4, 140, 22);
+        place(self.timeout, FIELD_X, y, SHORT_FIELD_W, CONTROL_H);
+        place(self.timeout_unit, FIELD_X + SHORT_FIELD_W + 8, y + 4, 140, 22);
         y += 36;
         place(self.debounce_label, MARGIN_X, y + 4, LABEL_W, 22);
-        place(self.debounce, FIELD_X, y, 84, 28);
-        place(self.debounce_unit, FIELD_X + 92, y + 4, 60, 22);
+        place(self.debounce, FIELD_X, y, SHORT_FIELD_W, CONTROL_H);
+        place(self.debounce_unit, FIELD_X + SHORT_FIELD_W + 8, y + 4, 60, 22);
 
         // Appearance page.
         place(self.theme_label, MARGIN_X, top, 460, 22);
-        place(self.theme_picker, MARGIN_X, top + 28, 220, 30);
+        place(self.theme_picker, MARGIN_X, top + 28, CONTENT_W, CONTROL_H);
 
         // System page: startup only; updates live on 关于.
         place(self.startup_title, MARGIN_X, top, 460, 22);
@@ -1867,25 +2082,25 @@ impl SettingsWindow {
         place(self.shortcut_label, MARGIN_X, top + 4, LABEL_W, 22);
         let rows = self.visible_shortcuts();
         for (index, row) in rows.iter().enumerate() {
-            place(*row, FIELD_X, top + index as i32 * (SHORTCUT_H + SHORTCUT_GAP),
-                SHORTCUT_W, SHORTCUT_H);
+            place(*row, FIELD_X, top + index as i32 * (CONTROL_H + SHORTCUT_GAP),
+                SHORTCUT_W, CONTROL_H);
         }
         if let Some(last) = rows.len().checked_sub(1) {
             place(self.shortcut_add, FIELD_X + SHORTCUT_W + 8,
-                top + last as i32 * (SHORTCUT_H + SHORTCUT_GAP), SHORTCUT_ADD_W, SHORTCUT_H);
+                top + last as i32 * (CONTROL_H + SHORTCUT_GAP), SHORTCUT_ADD_W, CONTROL_H);
         }
 
         // About page: a project block (repo, licence, one button) and an
         // update block (version, check button, interval, install switch).
         place(self.project_title, MARGIN_X, top, 460, 22);
         place(self.about_text, MARGIN_X, top + 28, CONTENT_W, 56);
-        place(self.open_repo, MARGIN_X, top + 90, 112, 30);
+        place(self.open_repo, MARGIN_X, top + 90, 112, CONTROL_H);
         place(self.connection_divider, MARGIN_X, top + 138, CONTENT_W, 1);
         place(self.update_title, MARGIN_X, top + 156, 460, 22);
         place(self.version_label, MARGIN_X, top + 184, 200, 22);
-        place(self.update_button, MARGIN_X, top + 212, 112, 30);
+        place(self.update_button, MARGIN_X, top + 212, 112, CONTROL_H);
         place(self.interval_caption, MARGIN_X, top + 252, LABEL_W, 22);
-        place(self.update_interval, FIELD_X, top + 248, 160, 30);
+        place(self.update_interval, FIELD_X, top + 248, 160, CONTROL_H);
         place(self.auto_install, MARGIN_X, top + 286, CONTENT_W, 24);
         place(self.auto_restart, MARGIN_X, top + 314, CONTENT_W, 24);
 
@@ -1935,6 +2150,11 @@ impl SettingsWindow {
         let (x, y) = self.placement(width, height, center);
         SetWindowPos(self.hwnd, ptr::null_mut(), x, y, width, height,
             SWP_NOZORDER | SWP_NOACTIVATE);
+        // Windows 10 has no rounded frame, so the frame is cut to the same
+        // radius as the controls inside it.
+        round_window(self.hwnd, width, height, s(WINDOW_RADIUS) * 2);
+        // The plate list was rebuilt: erase whatever the previous page painted.
+        InvalidateRect(self.hwnd, ptr::null(), 1);
     }
 
     unsafe fn placement(&self, width: i32, height: i32, center: bool) -> (i32, i32) {
@@ -1978,6 +2198,9 @@ impl SettingsWindow {
         let theme = self.theme.as_ref() as *const UiTheme as *mut UiTheme;
         unsafe { (*theme).page = page; }
         self.layout();
+        // The plates of the page just left are still painted, and the new
+        // page's fields are hidden, so the whole client is erased and repainted.
+        InvalidateRect(self.hwnd, ptr::null(), 1);
         for tab in self.tabs {
             if !tab.is_null() { InvalidateRect(tab, ptr::null(), 0); }
         }

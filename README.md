@@ -21,6 +21,8 @@ cargo build --release
 
 - 托盘图标：左键暂停 / 恢复，右键菜单可打开设置、检查更新、暂停或退出
 - 设置窗口分五个标签：翻译 / 外观 / 系统 / 快捷键 / 关于，改动即改即存，没有保存按钮，关掉窗口也不会丢
+- 同类控件共用一套样式预设：统一高度、统一圆角，不用边框，只靠底色区分
+- 输入框、下拉列表、窗口边框都是圆角；下拉展开的选项列表与窗口内控件同一套配色，没有勾选栏和聚焦描边
 - 快捷键：`Ctrl+Alt+Q` 退出
 - 命令行：`--settings`、`--pause`、`--resume`、`--quit`
 
@@ -35,10 +37,11 @@ cargo build --release
 | `debounce_ms` | 翻译防抖，100–1000 毫秒 |
 | `alt_output_shortcut` | 轻按即输入英文的快捷键，默认 `lalt`；可写 `ctrl+shift+k` 这类组合键，写 `none` 关闭；可设多个，用逗号分隔（最多 3 个） |
 
-设置窗口「快捷键」页的每个框点一下就会清空并显示「请设置按键」，接着按下的键即为快捷键，录入后自动失焦，要改必须再点一次。点「+」新增一个框；点窗口空白处清空该框，清空的框会被删掉，已设的快捷键不会少于一个。
 | `auto_install` | `on`（默认）时发现新版本直接后台下载安装，`off` 时只弹窗询问 |
 | `auto_restart` | `on`（默认）时安装完自动重启到新版本；`off` 时只替换文件，下次启动生效 |
 | `update_interval_minutes` | 后台检查间隔，单位分钟，最小 15，默认 30；写 `0` 表示仅手动检查 |
+
+设置窗口「快捷键」页的每个框点一下就会清空并显示「请设置按键」，接着按下的键即为快捷键，录入后自动失焦，要改必须再点一次。点「+」新增一个框；点窗口空白处清空该框，清空的框会被删掉，已设的快捷键不会少于一个。
 
 也可以用环境变量覆盖（仅运行时生效，不会写回文件）：`TRANSPOP_PROVIDER`、`TRANSPOP_AZURE_KEY`、`TRANSPOP_AZURE_URL`、`TRANSPOP_AZURE_REGION`、`TRANSPOP_OPENAI_KEY`、`TRANSPOP_OPENAI_URL`、`TRANSPOP_OPENAI_MODEL`、`TRANSPOP_AUTO_INSTALL`、`TRANSPOP_AUTO_RESTART`、`TRANSPOP_UPDATE_INTERVAL_MINUTES`。旧版的 `TRANSPOP_AUTO_UPDATE=off` 仍被识别，等同于「仅手动」。
 
