@@ -26,7 +26,8 @@ use windows_sys::Win32::{
         Controls::{SetWindowTheme, DRAWITEMSTRUCT, ODS_FOCUS},
         Shell::{DefSubclassProc, SetWindowSubclass, ShellExecuteW},
         Input::KeyboardAndMouse::{
-            GetKeyState, MapVirtualKeyW, SetFocus, MAPVK_VSC_TO_VK_EX, VK_CONTROL, VK_ESCAPE,
+            GetKeyState, MapVirtualKeyW, SetFocus, MAPVK_VSC_TO_VK_EX, VK_CONTROL,
+            VK_ESCAPE,
             VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_TAB,
         },
         WindowsAndMessaging::{
@@ -49,8 +50,6 @@ use windows_sys::Win32::{
 const CLASS: &str = "TransPopNativeSettings061";
 const WM_SETFONT: u32 = 0x0030;
 const ES_AUTOHSCROLL: u32 = 0x0080;
-const ES_CENTER: u32 = 0x0001;
-const ES_READONLY: u32 = 0x0800;
 const BS_OWNERDRAW: u32 = 0x000B;
 const ES_PASSWORD: u32 = 0x0020;
 const ID_PROVIDER: u16 = 4100;
@@ -116,6 +115,8 @@ const SHORTCUT_W: i32 = 152;
 const SHORTCUT_H: i32 = 30;
 const SHORTCUT_GAP: i32 = 6;
 const SHORTCUT_ADD_W: i32 = 30;
+/// What a clicked row shows until a key is pressed.
+const SHORTCUT_HINT: &str = "请设置按键";
 const WINDOW_STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
 const WINDOW_EX_STYLE: u32 = WS_EX_APPWINDOW;
 const WM_APP_SETTINGS_SAVE: u32 = super::WM_APP + 30;
@@ -264,6 +265,9 @@ struct UiTheme {
     lines: Vec<isize>,
     /// Read-only edits, painted with the field fill like live ones.
     fields: Vec<isize>,
+    /// Owner-drawn shortcut rows, and the "+" that appends one.
+    shortcut_rows: Vec<isize>,
+    shortcut_plus: isize,
     /// Flat selectors: one text row plus a chevron, menu on click.
     selects: Vec<Select>,
     /// Owner-drawn tab buttons, and which page is showing.
@@ -285,6 +289,8 @@ impl UiTheme {
             notes: Vec::new(),
             lines: Vec::new(),
             fields: Vec::new(),
+            shortcut_rows: Vec::new(),
+            shortcut_plus: 0,
             selects: Vec::new(),
             tabs: Vec::new(),
             page: 0,
@@ -418,6 +424,53 @@ unsafe fn draw_checkbox(item: &DRAWITEMSTRUCT, theme: &UiTheme) {
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     if !old_font.is_null() { SelectObject(hdc, old_font); }
     if item.itemState & ODS_FOCUS != 0 { DrawFocusRect(hdc, &item.rcItem); }
+}
+
+/// Owner-drawn shortcut row: field fill, the label centred both ways, and a
+/// focus ring. An EDIT cannot centre its text vertically and always shows a
+/// caret, so the row is a BS_OWNERDRAW button painted here instead. The "+"
+/// shares this painter and gets a glyph centred in its own square.
+unsafe fn draw_shortcut(item: &DRAWITEMSTRUCT, theme: &UiTheme, plus: bool) {
+    let s = |value: i32| value * theme.dpi / 96;
+    let hdc = item.hDC;
+    FillRect(hdc, &item.rcItem, theme.field_brush);
+    if plus {
+        let cx = (item.rcItem.left + item.rcItem.right) / 2;
+        let cy = (item.rcItem.top + item.rcItem.bottom) / 2;
+        let arm = s(6);
+        let pen = CreatePen(PS_SOLID, s(1).max(1), theme.colors.text);
+        if !pen.is_null() {
+            let old = SelectObject(hdc, pen);
+            let horizontal = [POINT { x: cx - arm, y: cy }, POINT { x: cx + arm, y: cy }];
+            let vertical = [POINT { x: cx, y: cy - arm }, POINT { x: cx, y: cy + arm }];
+            Polyline(hdc, horizontal.as_ptr(), 2);
+            Polyline(hdc, vertical.as_ptr(), 2);
+            SelectObject(hdc, old);
+            DeleteObject(pen);
+        }
+    } else {
+        let mut text = [0u16; 256];
+        let len = GetWindowTextW(item.hwndItem, text.as_mut_ptr(), text.len() as i32).max(0) as usize;
+        if len > 0 {
+            let font = SendMessageW(item.hwndItem, WM_GETFONT, 0, 0) as HFONT;
+            let old_font = if font.is_null() { ptr::null_mut() } else { SelectObject(hdc, font) };
+            SetBkMode(hdc, TRANSPARENT);
+            let hint = String::from_utf16_lossy(&text[..len]) == SHORTCUT_HINT;
+            SetTextColor(hdc, if hint { theme.colors.secondary } else { theme.colors.text });
+            let mut area = item.rcItem;
+            DrawTextW(hdc, text.as_ptr(), len as i32, &mut area,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            if !old_font.is_null() { SelectObject(hdc, old_font); }
+        }
+    }
+    if item.itemState & ODS_FOCUS != 0 {
+        let mut focus = item.rcItem;
+        focus.left += s(2);
+        focus.right -= s(2);
+        focus.top += s(2);
+        focus.bottom -= s(2);
+        DrawFocusRect(hdc, &focus);
+    }
 }
 
 /// Owner-drawn tab: a filled card for the page that is showing and plain text
@@ -596,6 +649,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
             let item = &*(lp as *const DRAWITEMSTRUCT);
             if let Some(index) = (*theme).tab_index(item.hwndItem) {
                 draw_tab(item, &*theme, index);
+            } else if (*theme).shortcut_rows.contains(&(item.hwndItem as isize)) {
+                draw_shortcut(item, &*theme, false);
+            } else if item.hwndItem as isize == (*theme).shortcut_plus {
+                draw_shortcut(item, &*theme, true);
             } else if (*theme).select_position(item.hwndItem).is_some() {
                 draw_select(item, &*theme);
             } else {
@@ -690,18 +747,17 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
                 PostMessageW(main, WM_APP_SETTINGS_SAVE, 0, 0);
                 return 0;
             }
-            // "+" appends one shortcut row. It is shown and focused by the
-            // layout pass, because a hidden field cannot take focus.
+            // "+" reveals one more row and arms it. It is shown and focused by
+            // the layout pass, because a hidden field cannot take focus.
             if notify as u32 == BN_CLICKED && id == ID_SHORTCUT_ADD {
-                let empty = SHORTCUTS.with(|rows| {
-                    let rows = rows.borrow();
-                    rows.iter().position(|(_, spec)| spec.is_empty()).map(|index| rows[index].0)
+                CAPTURE.with(|c| {
+                    let mut c = c.borrow_mut();
+                    c.armed = true;
+                    c.extra = true;
+                    c.pending = None;
                 });
-                if empty.is_some() {
-                    CAPTURE.with(|c| { let mut c = c.borrow_mut(); c.armed = true; c.pending = None; });
-                    let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
-                    if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SHORTCUT, 0, 0); }
-                }
+                let main = super::CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire) as HWND;
+                if !main.is_null() { PostMessageW(main, WM_APP_SETTINGS_SHORTCUT, 0, 0); }
                 return 0;
             }
             // The project block only links out; nothing here is persisted.
@@ -827,6 +883,9 @@ unsafe fn side_of(vk: u16, scan: u32) -> u16 {
 struct Capture {
     /// A click armed the field; leaving it without a completed key means off.
     armed: bool,
+    /// "+" added a row that is still waiting for its key, so it must stay
+    /// visible until the capture ends. Rows are otherwise exactly the set ones.
+    extra: bool,
     /// Modifier held down while the field has focus, waiting for a main key.
     pending: Option<(u8, u32)>,
 }
@@ -869,9 +928,11 @@ unsafe extern "system" fn shortcut_proc(hwnd: HWND, msg: u32, wp: usize, lp: isi
     match msg {
         WM_GETDLGCODE => return DLGC_WANTALLKEYS,
         WM_LBUTTONDOWN => {
-            // A click arms the field; the key that follows is the shortcut.
+            // A click arms the field and clears what it held: the key that
+            // follows is the shortcut, so the old one must not linger.
             SetFocus(hwnd);
             CAPTURE.with(|c| { let mut c = c.borrow_mut(); c.armed = true; c.pending = None; });
+            set_text(hwnd, SHORTCUT_HINT);
             return 0;
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
@@ -941,6 +1002,7 @@ unsafe extern "system" fn shortcut_proc(hwnd: HWND, msg: u32, wp: usize, lp: isi
 /// and let the main loop persist the list and re-lay-out the form.
 unsafe fn commit_row(hwnd: HWND, dialog: HWND, spec: String) {
     set_row_spec(hwnd, spec);
+    CAPTURE.with(|c| c.borrow_mut().extra = false);
     compact_rows();
     // Park focus on the dialog: editing one shortcut must not leave the field
     // armed, or the next keystroke would silently re-bind it.
@@ -964,7 +1026,7 @@ unsafe fn compact_rows() {
     SHORTCUTS.with(|rows| {
         for (index, (row, held)) in rows.borrow_mut().iter_mut().enumerate() {
             *held = specs.get(index).cloned().unwrap_or_default();
-            set_text(*row, &shortcut_label(held));
+            set_text(*row, &row_text(held));
         }
     });
 }
@@ -985,6 +1047,8 @@ unsafe fn set_text(control: HWND, text: &str) {
     if control.is_null() { return; }
     let text = wide(text);
     SetWindowTextW(control, text.as_ptr());
+    // Owner-drawn rows paint their own text, so a text change is a repaint.
+    InvalidateRect(control, ptr::null(), 0);
 }
 
 /// Canonical spelling of a shortcut. Anything unreadable becomes `none`, which
@@ -1063,6 +1127,14 @@ pub fn shortcut_spec(mods: u8, vk: u32) -> String {
     if mods & MOD_WIN != 0 { parts.push("win"); }
     parts.push(key);
     parts.join("+")
+}
+
+/// What a row shows: the shortcut, or the prompt while it waits for a key.
+pub fn row_text(spec: &str) -> String {
+    match parse_shortcut(spec) {
+        Some(_) => shortcut_label(spec),
+        None => SHORTCUT_HINT.to_string(),
+    }
 }
 
 /// Human label for the settings window; the config file keeps the spec.
@@ -1652,23 +1724,22 @@ impl SettingsWindow {
         let mut shortcut_keys = [ptr::null_mut(); MAX_SHORTCUTS];
         for slot in 0..MAX_SHORTCUTS {
             let spec = stored.get(slot).cloned().unwrap_or_default();
-            let row = create("EDIT", "", ID_SHORTCUT_KEY,
-                ES_CENTER | ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP);
+            let row = create("BUTTON", "", ID_SHORTCUT_KEY, BS_OWNERDRAW | WS_TABSTOP);
             SetWindowSubclass(row, Some(shortcut_proc), SUBCLASS_ID, 0);
-            set_text(row, &shortcut_label(&spec));
+            set_text(row, &row_text(&spec));
             shortcut_keys[slot] = row;
             shortcut_rows.push((row, spec));
         }
         reset_rows(shortcut_rows);
         CAPTURE.with(|c| c.borrow_mut().pending = None);
-        let shortcut_add = create("BUTTON", "+", ID_SHORTCUT_ADD, WS_TABSTOP);
+        let shortcut_add = create("BUTTON", "", ID_SHORTCUT_ADD, BS_OWNERDRAW | WS_TABSTOP);
         let about_text = create("STATIC",
             "仓库：github.com/gurio-wine/TransPop\r\n许可：MIT", 0, 0);
 
         // A slightly inset caret keeps addresses off the field frame.
         let pad = scale(8);
         for edit in [azure[0].1, azure[1].1, azure[2].1, openai[0].1, openai[1].1, openai[2].1,
-                     timeout, debounce].into_iter().chain(shortcut_keys) {
+                     timeout, debounce] {
             if !edit.is_null() {
                 SendMessageW(edit, EM_SETMARGINS, EC_LEFT_RIGHT_MARGINS,
                     (pad | (pad << 16)) as isize);
@@ -1681,9 +1752,11 @@ impl SettingsWindow {
         (*theme_ptr).selects = selects;
         // Borderless fields are painted by the theme, so it must know them.
         for edit in [azure[0].1, azure[1].1, azure[2].1, openai[0].1, openai[1].1, openai[2].1,
-                     timeout, debounce].into_iter().chain(shortcut_keys) {
+                     timeout, debounce] {
             if !edit.is_null() { (*theme_ptr).fields.push(edit as isize); }
         }
+        for row in shortcut_keys { (*theme_ptr).shortcut_rows.push(row as isize); }
+        (*theme_ptr).shortcut_plus = shortcut_add as isize;
         for tab in [tab_translate, tab_appearance, tab_system, tab_shortcut, tab_about] {
             (*theme_ptr).tabs.push(tab as isize);
         }
@@ -1810,11 +1883,11 @@ impl SettingsWindow {
         place(self.connection_divider, MARGIN_X, top + 138, CONTENT_W, 1);
         place(self.update_title, MARGIN_X, top + 156, 460, 22);
         place(self.version_label, MARGIN_X, top + 184, 200, 22);
-        place(self.update_button, MARGIN_X + 200, top + 180, 112, 30);
-        place(self.interval_caption, MARGIN_X, top + 216, LABEL_W, 22);
-        place(self.update_interval, FIELD_X, top + 212, 160, 30);
-        place(self.auto_install, MARGIN_X, top + 250, CONTENT_W, 24);
-        place(self.auto_restart, MARGIN_X, top + 278, CONTENT_W, 24);
+        place(self.update_button, MARGIN_X, top + 212, 112, 30);
+        place(self.interval_caption, MARGIN_X, top + 252, LABEL_W, 22);
+        place(self.update_interval, FIELD_X, top + 248, 160, 30);
+        place(self.auto_install, MARGIN_X, top + 286, CONTENT_W, 24);
+        place(self.auto_restart, MARGIN_X, top + 314, CONTENT_W, 24);
 
         for control in [self.service_title, self.provider] { show(control, translating); }
         for (label, edit) in self.azure {
@@ -2003,12 +2076,14 @@ impl SettingsWindow {
     }
     pub fn base(&self) -> &Path { &self.base }
 
-    /// Rows the form shows right now: every set shortcut plus one empty row to
-    /// type into. At least one row is always visible.
+    /// Rows the form shows right now: the set shortcuts, plus one row while "+"
+    /// is waiting for its key. Never empty, and never more than the row count.
     fn visible_shortcuts(&self) -> Vec<HWND> {
         let filled = SHORTCUTS.with(|rows| rows.borrow().iter()
             .filter(|(_, spec)| !spec.is_empty() && spec != "none").count());
-        self.shortcut_keys[..(filled + 1).min(MAX_SHORTCUTS)].to_vec()
+        let extra = if CAPTURE.with(|c| c.borrow().extra) { 1 } else { 0 };
+        let shown = (filled + extra).max(1).min(MAX_SHORTCUTS);
+        self.shortcut_keys[..shown].to_vec()
     }
 
     /// Writes a stored shortcut list back into the row fields.
@@ -2018,7 +2093,7 @@ impl SettingsWindow {
             .collect();
         reset_rows(rows);
         for (index, row) in self.shortcut_keys.iter().enumerate() {
-            set_text(*row, &shortcut_label(stored.get(index).map(String::as_str).unwrap_or("")));
+            set_text(*row, &row_text(stored.get(index).map(String::as_str).unwrap_or("")));
         }
     }
 
